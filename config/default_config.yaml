@@ -1,0 +1,197 @@
+# config/default_config.yaml
+# Configuration par défaut du Music Data Extractor
+
+# Gestion des sessions
+sessions:
+  auto_save_interval: 60  # Sauvegarde automatique toutes les 60 secondes
+  max_sessions: 10        # Maximum 10 sessions simultanées
+  cleanup_after_days: 30  # Nettoyage des sessions après 30 jours
+
+# Extraction des crédits
+credits:
+  expand_all_credits: true    # Développer tous les crédits sur Genius
+  wait_after_expand: 2        # Attendre 2s après expansion
+  max_retries: 3              # Maximum 3 tentatives par page
+  custom_patterns_file: "credit_mappings.yaml"
+
+# Résolution des albums
+albums:
+  prefer_spotify: true        # Préférer Spotify pour les infos d'albums
+  fallback_to_discogs: true   # Utiliser Discogs en fallback
+  detect_singles: true        # Détecter automatiquement les singles
+  min_tracks_for_album: 4     # Minimum 4 tracks pour considérer comme album
+
+# Validation qualité
+quality:
+  check_missing_bpm: true           # Vérifier BPM manquants
+  check_missing_producer: true      # Vérifier producteurs manquants
+  check_suspicious_duration: true   # Vérifier durées suspectes
+  min_duration_seconds: 30          # Durée minimum (30s)
+  max_duration_seconds: 1800        # Durée maximum (30min)
+
+# Configuration Selenium
+selenium:
+  headless: true              # Mode sans interface
+  timeout: 30                 # Timeout de 30s
+  retry_failed_pages: 2       # 2 tentatives par page ratée
+  screenshot_on_error: true   # Screenshot en cas d'erreur
+  browser: "chrome"           # Navigateur par défaut
+
+# Performance
+performance:
+  batch_size: 10              # Traiter par lots de 10 tracks
+  concurrent_extractions: 3   # Maximum 3 extractions simultanées
+  cache_expire_days: 7        # Cache valide 7 jours
+  max_memory_mb: 512          # Limite mémoire 512MB
+
+# Rate limiting par API
+rate_limits:
+  genius:
+    requests_per_minute: 30
+    requests_per_hour: 1000
+  spotify:
+    requests_per_minute: 100
+    requests_per_hour: 3000
+  discogs:
+    requests_per_minute: 60
+    requests_per_hour: 1000
+
+# Logging
+logging:
+  level: "INFO"               # Niveau de log
+  file_rotation: true         # Rotation des fichiers de log
+  max_file_size_mb: 10        # Taille max par fichier
+  backup_count: 5             # Nombre de backups
+
+---
+
+# config/credit_mappings.yaml
+# Mappings intelligents pour l'extraction des crédits (focus rap/hip-hop)
+
+# Patterns pour les crédits d'instruments
+instrument_patterns:
+  saxophone:
+    - "saxophone"
+    - "sax"
+    - "tenor sax"
+    - "alto sax"
+    - "soprano sax"
+    - "baryton sax"
+  
+  guitar:
+    - "guitar"
+    - "guitare"
+    - "electric guitar"
+    - "acoustic guitar"
+    - "bass guitar"
+    - "basse"
+    - "bass"
+  
+  piano:
+    - "piano"
+    - "keyboards"
+    - "clavier"
+    - "keys"
+    - "synth"
+    - "synthesizer"
+  
+  drums:
+    - "drums"
+    - "batterie"
+    - "percussion"
+    - "kick"
+    - "snare"
+    - "hi-hat"
+  
+  vocals_additional:
+    - "choir"
+    - "chœur"
+    - "backing vocals"
+    - "background vocals"
+    - "additional vocals"
+    - "ad-libs"
+    - "ad libs"
+
+# Patterns pour les rôles (spécifiques rap/hip-hop)
+role_patterns:
+  producer:
+    - "produced by"
+    - "producer"
+    - "prod by"
+    - "prod."
+    - "produit par"
+    - "production"
+    - "beats by"
+    - "beat by"
+  
+  mixing_engineer:
+    - "mixed by"
+    - "mix"
+    - "mixage"
+    - "mixing"
+    - "mix engineer"
+  
+  mastering_engineer:
+    - "mastered by"
+    - "master"
+    - "mastering"
+    - "master engineer"
+  
+  featuring:
+    - "feat."
+    - "feat"
+    - "featuring"
+    - "ft."
+    - "ft"
+    - "avec"
+    - "with"
+  
+  composer:
+    - "composed by"
+    - "composer"
+    - "composition"
+    - "written by"
+    - "songwriting"
+  
+  sample_source:
+    - "sample"
+    - "samples"
+    - "interpolation"
+    - "interpolates"
+    - "contains elements"
+    - "based on"
+
+# Patterns spécifiques hip-hop
+hiphop_specific:
+  dj:
+    - "dj"
+    - "deejay"
+    - "disc jockey"
+    - "turntables"
+    - "scratch"
+  
+  executive_producer:
+    - "executive producer"
+    - "exec producer"
+    - "executive production"
+  
+  vocal_producer:
+    - "vocal producer"
+    - "vocal production"
+    - "vocals produced by"
+
+# Nettoyage des noms
+name_cleaning:
+  remove_prefixes:
+    - "by "
+    - "par "
+  
+  remove_suffixes:
+    - " (uncredited)"
+    - " [uncredited]"
+  
+  replace_patterns:
+    - from: "&"
+      to: "and"
+    - from: " feat. "
+      to: " featuring "
