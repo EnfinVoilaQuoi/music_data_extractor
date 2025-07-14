@@ -1,0 +1,12 @@
+# requirements_streamlit.txt
+# Dépendances supplémentaires pour l'interface Streamlit
+
+# Interface web
+streamlit>=1.28.0
+
+# Visualisations
+plotly>=5.17.0
+pandas>=2.0.0
+
+# Utilitaires pour l'interface
+pillow>=10.0.0  # Pour le traitement d'images

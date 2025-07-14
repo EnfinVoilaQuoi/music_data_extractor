@@ -28,6 +28,7 @@ class CreditType(Enum):
     EXECUTIVE_PRODUCER = "executive_producer"
     CO_PRODUCER = "co_producer"
     ADDITIONAL_PRODUCTION = "additional_production"
+    VOCAL_PRODUCER = "vocal_producer"
     
     # Instruments
     GUITAR = "guitar"
@@ -38,6 +39,8 @@ class CreditType(Enum):
     SAXOPHONE = "saxophone"
     TRUMPET = "trumpet"
     VIOLIN = "violin"
+    STRINGS = "strings"
+    BRASS = "brass"
     
     # Technique
     MIXING = "mixing"
@@ -49,12 +52,20 @@ class CreditType(Enum):
     LEAD_VOCALS = "lead_vocals"
     BACKING_VOCALS = "backing_vocals"
     RAP = "rap"
+    HOOK = "hook"
+    CHORUS = "chorus"
     FEATURING = "featuring"
+    AD_LIBS = "ad_libs"
     
     # Composition
     SONGWRITER = "songwriter"
     COMPOSER = "composer"
     LYRICIST = "lyricist"
+    
+    # Hip-hop spécifique
+    DJ = "dj"
+    SCRATCH = "scratch"
+    TURNTABLES = "turntables"
     
     # Autre
     SAMPLE = "sample"
@@ -81,6 +92,8 @@ class ExtractionStatus(Enum):
 class DataSource(Enum):
     """Sources de données supportées"""
     GENIUS = "genius"
+    GENIUS_API = "genius_api"
+    GENIUS_WEB = "genius_web"
     SPOTIFY = "spotify"
     DISCOGS = "discogs"
     LASTFM = "lastfm"
@@ -89,6 +102,17 @@ class DataSource(Enum):
     RAPEDIA = "rapedia"
     WEB_SCRAPING = "web_scraping"
     MANUAL = "manual"
+
+class ExtractorType(Enum):
+    """Types d'extracteurs disponibles"""
+    GENIUS = "genius"
+    SPOTIFY = "spotify"
+    DISCOGS = "discogs"
+    LASTFM = "lastfm"
+    SONGBPM = "songbpm"
+    TUNEBAT = "tunebat"
+    RAPEDIA = "rapedia"
+    CREDIT_EXTRACTOR = "credit_extractor"
 
 class Genre(Enum):
     """Genres musicaux supportés (focus rap/hip-hop)"""
@@ -103,6 +127,8 @@ class Genre(Enum):
     FRENCH_RAP = "french_rap"
     JAZZ_RAP = "jazz_rap"
     EXPERIMENTAL_HIP_HOP = "experimental_hip_hop"
+    AFRO_TRAP = "afro_trap"
+    DRILL_FR = "drill_fr"
     OTHER = "other"
 
 class QualityLevel(Enum):
@@ -120,3 +146,30 @@ class ExportFormat(Enum):
     EXCEL = "excel"
     HTML = "html"
     XML = "xml"
+    PDF = "pdf"
+
+class DataQuality(Enum):
+    """Niveaux de qualité des données extraites"""
+    VERIFIED = "verified"      # Données vérifiées manuellement
+    HIGH = "high"             # Confiance élevée (source primaire)
+    MEDIUM = "medium"         # Confiance moyenne (source secondaire)
+    LOW = "low"              # Confiance faible (scraping/estimation)
+    UNKNOWN = "unknown"       # Qualité inconnue
+
+class ProcessingStep(Enum):
+    """Étapes du pipeline de traitement"""
+    DISCOVERY = "discovery"
+    EXTRACTION = "extraction"
+    CLEANING = "cleaning"
+    VALIDATION = "validation"
+    ENRICHMENT = "enrichment"
+    DEDUPLICATION = "deduplication"
+    EXPORT = "export"
+    COMPLETED = "completed"
+
+class ScraperType(Enum):
+    """Types de scrapers web"""
+    SELENIUM = "selenium"
+    REQUESTS = "requests"
+    BEAUTIFULSOUP = "beautifulsoup"
+    API = "api"
