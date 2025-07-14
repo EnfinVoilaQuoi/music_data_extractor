@@ -1,4 +1,4 @@
-# core/database.py
+# core/database.py - Version corrigée
 import sqlite3
 import json
 from pathlib import Path
@@ -6,9 +6,9 @@ from typing import List, Optional, Dict, Any, Union
 from datetime import datetime
 from contextlib import contextmanager
 
-from config.settings import settings
-from models.entities import Artist, Album, Track, Credit, Session, QualityReport
-from models.enums import AlbumType, CreditCategory, SessionStatus, DataSource
+from ..config.settings import settings  # CORRECTION: import relatif
+from ..models.entities import Artist, Album, Track, Credit, Session, QualityReport  # CORRECTION: import relatif
+from ..models.enums import AlbumType, CreditCategory, SessionStatus, DataSource  # CORRECTION: import relatif
 
 class Database:
     """Gestionnaire de base de données SQLite avec migrations"""
@@ -349,7 +349,7 @@ class Database:
                 artist.genius_id,
                 artist.spotify_id,
                 artist.discogs_id,
-                artist.genre,
+                artist.genre.value if artist.genre else None,
                 artist.country,
                 artist.active_years
             ))
@@ -365,13 +365,14 @@ class Database:
             row = cursor.fetchone()
             
             if row:
+                from ..models.enums import Genre  # Import local pour éviter les cycles
                 return Artist(
                     id=row['id'],
                     name=row['name'],
                     genius_id=row['genius_id'],
                     spotify_id=row['spotify_id'],
                     discogs_id=row['discogs_id'],
-                    genre=row['genre'],
+                    genre=Genre(row['genre']) if row['genre'] else None,
                     country=row['country'],
                     active_years=row['active_years'],
                     created_at=datetime.fromisoformat(row['created_at']) if row['created_at'] else None
@@ -418,8 +419,8 @@ class Database:
             ))
             track_id = cursor.lastrowid
             
-            # Ajouter les features
-            for feature in track.features:
+            # Ajouter les features - CORRECTION: utiliser featuring_artists
+            for feature in track.featuring_artists:
                 conn.execute("""
                     INSERT INTO track_features (track_id, featured_artist)
                     VALUES (?, ?)
@@ -440,7 +441,7 @@ class Database:
                 track = self._row_to_track(row)
                 # Charger les crédits et features
                 track.credits = self.get_credits_by_track_id(track.id)
-                track.features = self.get_features_by_track_id(track.id)
+                track.featuring_artists = self.get_features_by_track_id(track.id)
                 return track
         return None
     
@@ -456,7 +457,7 @@ class Database:
             for row in cursor.fetchall():
                 track = self._row_to_track(row)
                 track.credits = self.get_credits_by_track_id(track.id)
-                track.features = self.get_features_by_track_id(track.id)
+                track.featuring_artists = self.get_features_by_track_id(track.id)
                 tracks.append(track)
             
             return tracks
@@ -480,6 +481,7 @@ class Database:
     
     def _row_to_track(self, row) -> Track:
         """Convertit une ligne de base en objet Track"""
+        from ..models.enums import ExtractionStatus, DataSource  # Import local
         return Track(
             id=row['id'],
             title=row['title'],
@@ -512,10 +514,10 @@ class Database:
             """, (
                 credit.track_id,
                 credit.credit_category.value if credit.credit_category else None,
-                credit.credit_type,
+                credit.credit_type.value if credit.credit_type else None,
                 credit.person_name,
-                credit.instrument_detail,
-                credit.source.value if credit.source else None
+                credit.instrument,  # CORRECTION: utiliser instrument au lieu de instrument_detail
+                credit.data_source.value if credit.data_source else None  # CORRECTION: data_source au lieu de source
             ))
             return cursor.lastrowid
     
@@ -529,14 +531,15 @@ class Database:
             
             credits = []
             for row in cursor.fetchall():
+                from ..models.enums import CreditCategory, CreditType, DataSource  # Import local
                 credits.append(Credit(
                     id=row['id'],
                     track_id=row['track_id'],
                     credit_category=CreditCategory(row['credit_category']) if row['credit_category'] else None,
-                    credit_type=row['credit_type'],
+                    credit_type=CreditType(row['credit_type']) if row['credit_type'] else CreditType.OTHER,
                     person_name=row['person_name'],
-                    instrument_detail=row['instrument_detail'],
-                    source=DataSource(row['source']) if row['source'] else None
+                    instrument=row['instrument_detail'],  # Mapping du nom de colonne
+                    data_source=DataSource(row['source']) if row['source'] else DataSource.MANUAL
                 ))
             
             return credits

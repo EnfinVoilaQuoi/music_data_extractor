@@ -1,4 +1,4 @@
-# core/cache.py
+# core/cache.py - Version corrigée
 import hashlib
 import json
 from datetime import datetime, timedelta
@@ -6,8 +6,8 @@ from typing import Any, Optional, Dict, Callable, List
 from functools import wraps
 import fnmatch
 
-from config.settings import settings
-from core.database import Database
+from ..config.settings import settings  # CORRECTION: import relatif
+from .database import Database  # CORRECTION: import relatif
 
 class CacheManager:
     """Gestionnaire de cache intelligent avec expiration automatique"""

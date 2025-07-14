@@ -640,6 +640,19 @@ class QualityReport:
         # Calculer le niveau de qualité basé sur le score
         self.quality_level = self._determine_quality_level()
 
+    def _determine_quality_level(self) -> QualityLevel:
+        """Détermine le niveau de qualité basé sur le score"""
+        if self.quality_score >= 90:
+            return QualityLevel.EXCELLENT
+        elif self.quality_score >= 75:
+            return QualityLevel.GOOD
+        elif self.quality_score >= 50:
+            return QualityLevel.AVERAGE
+        elif self.quality_score >= 25:
+            return QualityLevel.POOR
+        else:
+            return QualityLevel.VERY_POOR
+
     def add_issue(self, issue: str):
         """Ajoute un problème détecté"""
         if issue not in self.issues:
@@ -674,18 +687,15 @@ class QualityReport:
         self.quality_score = max(0.0, min(100.0, base_score))
         return self.quality_score
 
-    def get_quality_level(self) -> str:
+    def get_quality_level_text(self) -> str:
         """Retourne le niveau de qualité sous forme de texte"""
-        if self.quality_score >= 90:
-            return "Excellent"
-        elif self.quality_score >= 75:
-            return "Bon"
-        elif self.quality_score >= 50:
-            return "Moyen"
-        elif self.quality_score >= 25:
-            return "Faible"
-        else:
-            return "Très faible"
+        return {
+            QualityLevel.EXCELLENT: "Excellent",
+            QualityLevel.GOOD: "Bon",
+            QualityLevel.AVERAGE: "Moyen",
+            QualityLevel.POOR: "Faible",
+            QualityLevel.VERY_POOR: "Très faible"
+        }.get(self.quality_level, "Inconnu")
 
     def to_dict(self) -> Dict[str, Any]:
         """Convertit l'entité en dictionnaire pour l'export"""
@@ -693,69 +703,15 @@ class QualityReport:
             'id': self.id,
             'track_id': self.track_id,
             'quality_score': self.quality_score,
-            'quality_level': self.get_quality_level(),
+            'quality_level': self.quality_level.value,
+            'quality_level_text': self.get_quality_level_text(),
             'issues': self.issues,
             'has_producer': self.has_producer,
             'has_bpm': self.has_bpm,
             'has_duration': self.has_duration,
             'has_valid_duration': self.has_valid_duration,
             'has_album_info': self.has_album_info,
+            'has_lyrics': self.has_lyrics,
+            'has_credits': self.has_credits,
             'checked_at': self.checked_at.isoformat() if self.checked_at else None
-        }
-
-@dataclass
-class ExtractionResult:
-    """Résultat d'une extraction"""
-    success: bool = False
-    data: Optional[Dict[str, Any]] = None
-    source: Optional[DataSource] = None
-    error_message: Optional[str] = None
-    extracted_at: Optional[datetime] = None
-    
-    # Métriques
-    processing_time_seconds: float = 0.0
-    retry_count: int = 0
-    
-    # Métadonnées spécifiques
-    items_extracted: int = 0
-    items_failed: int = 0
-
-    def __post_init__(self):
-        """Initialisation post-création"""
-        if self.extracted_at is None:
-            self.extracted_at = datetime.now()
-
-    def mark_success(self, data: Dict[str, Any], items_count: int = 0):
-        """Marque l'extraction comme réussie"""
-        self.success = True
-        self.data = data
-        self.items_extracted = items_count
-        self.extracted_at = datetime.now()
-
-    def mark_failure(self, error_message: str):
-        """Marque l'extraction comme échouée"""
-        self.success = False
-        self.error_message = error_message
-        self.extracted_at = datetime.now()
-
-    def get_success_rate(self) -> float:
-        """Calcule le taux de succès"""
-        total_items = self.items_extracted + self.items_failed
-        if total_items == 0:
-            return 0.0
-        return (self.items_extracted / total_items) * 100
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convertit l'entité en dictionnaire pour l'export"""
-        return {
-            'success': self.success,
-            'source': self.source.value if self.source else None,
-            'error_message': self.error_message,
-            'extracted_at': self.extracted_at.isoformat() if self.extracted_at else None,
-            'processing_time_seconds': self.processing_time_seconds,
-            'retry_count': self.retry_count,
-            'items_extracted': self.items_extracted,
-            'items_failed': self.items_failed,
-            'success_rate': self.get_success_rate(),
-            'data': self.data
         }

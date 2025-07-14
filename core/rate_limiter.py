@@ -1,18 +1,33 @@
-# core/rate_limiter.py
+# core/rate_limiter.py - Version corrigée
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
-from typing import Dict, Optional, Callable
+from typing import Dict, Optional, Callable, List
 from functools import wraps
 import threading
 
-from config.settings import settings
+from ..config.settings import settings  # CORRECTION: import relatif
 
 class RateLimiter:
     """Gestionnaire de limitations de taux pour les APIs"""
     
-    def __init__(self):
+    def __init__(self, requests_per_period: int = 60, period_seconds: int = 60):
+        """
+        CORRECTION: Constructeur avec paramètres par défaut pour compatibilité
+        avec base_extractor.py
+        """
+        # Charger les limites depuis la config ou utiliser les paramètres
         self.api_limits = self._load_rate_limits()
+        
+        # Si des paramètres sont fournis, créer une limite personnalisée
+        if requests_per_period != 60 or period_seconds != 60:
+            self.custom_limit = {
+                'requests_per_minute': requests_per_period if period_seconds == 60 else int(requests_per_period * 60 / period_seconds),
+                'requests_per_hour': requests_per_period * 3600 // period_seconds
+            }
+        else:
+            self.custom_limit = None
+        
         self.request_history: Dict[str, deque] = defaultdict(lambda: deque())
         self.lock = threading.Lock()
     
@@ -41,15 +56,20 @@ class RateLimiter:
             }
         })
     
-    def can_make_request(self, api_name: str) -> bool:
+    def can_make_request(self, api_name: str = 'default') -> bool:
         """Vérifie si une requête peut être faite maintenant"""
-        if api_name not in self.api_limits:
+        # Utiliser la limite personnalisée si définie, sinon la limite de l'API
+        if self.custom_limit and api_name == 'default':
+            limits = self.custom_limit
+        else:
+            limits = self.api_limits.get(api_name, self.custom_limit or {})
+        
+        if not limits:
             return True
         
         with self.lock:
             now = datetime.now()
             history = self.request_history[api_name]
-            limits = self.api_limits[api_name]
             
             # Nettoyer l'historique ancien
             self._cleanup_history(history, now)
@@ -70,9 +90,15 @@ class RateLimiter:
             
             return True
     
-    def wait_if_needed(self, api_name: str) -> float:
+    def wait_if_needed(self, api_name: str = 'default') -> float:
         """Attend si nécessaire avant de faire une requête. Retourne le temps d'attente."""
-        if api_name not in self.api_limits:
+        # Utiliser la limite personnalisée si définie
+        if self.custom_limit and api_name == 'default':
+            limits = self.custom_limit
+        else:
+            limits = self.api_limits.get(api_name, self.custom_limit or {})
+        
+        if not limits:
             return 0.0
         
         start_time = time.time()
@@ -84,7 +110,7 @@ class RateLimiter:
         
         return time.time() - start_time
     
-    def record_request(self, api_name: str):
+    def record_request(self, api_name: str = 'default'):
         """Enregistre qu'une requête a été faite"""
         with self.lock:
             self.request_history[api_name].append(datetime.now())
@@ -98,10 +124,14 @@ class RateLimiter:
     
     def _calculate_sleep_time(self, api_name: str) -> float:
         """Calcule le temps d'attente optimal"""
-        if api_name not in self.api_limits:
+        if self.custom_limit and api_name == 'default':
+            limits = self.custom_limit
+        else:
+            limits = self.api_limits.get(api_name, self.custom_limit or {})
+        
+        if not limits:
             return 0.0
         
-        limits = self.api_limits[api_name]
         history = self.request_history[api_name]
         now = datetime.now()
         
@@ -120,15 +150,19 @@ class RateLimiter:
         # Temps d'attente par défaut
         return 1.0
     
-    def get_status(self, api_name: str) -> Dict[str, any]:
+    def get_status(self, api_name: str = 'default') -> Dict[str, any]:
         """Récupère le statut actuel des limites pour une API"""
-        if api_name not in self.api_limits:
+        if self.custom_limit and api_name == 'default':
+            limits = self.custom_limit
+        else:
+            limits = self.api_limits.get(api_name, self.custom_limit or {})
+        
+        if not limits:
             return {'status': 'no_limits'}
         
         with self.lock:
             now = datetime.now()
             history = self.request_history[api_name]
-            limits = self.api_limits[api_name]
             
             self._cleanup_history(history, now)
             
@@ -176,8 +210,8 @@ class RateLimiter:
 class AdaptiveRateLimiter(RateLimiter):
     """Rate limiter adaptatif qui ajuste automatiquement les limites"""
     
-    def __init__(self):
-        super().__init__()
+    def __init__(self, requests_per_period: int = 60, period_seconds: int = 60):
+        super().__init__(requests_per_period, period_seconds)
         self.error_history: Dict[str, deque] = defaultdict(lambda: deque())
         self.success_rates: Dict[str, float] = defaultdict(lambda: 1.0)
         self.adaptive_multipliers: Dict[str, float] = defaultdict(lambda: 1.0)
@@ -206,7 +240,12 @@ class AdaptiveRateLimiter(RateLimiter):
     
     def _get_adaptive_limit(self, api_name: str, limit_type: str) -> int:
         """Calcule la limite adaptative"""
-        base_limit = self.api_limits.get(api_name, {}).get(limit_type, 0)
+        if self.custom_limit and api_name == 'default':
+            limits = self.custom_limit
+        else:
+            limits = self.api_limits.get(api_name, self.custom_limit or {})
+        
+        base_limit = limits.get(limit_type, 0)
         if base_limit == 0:
             return 0
         
@@ -214,9 +253,14 @@ class AdaptiveRateLimiter(RateLimiter):
         adaptive_limit = int(base_limit * multiplier)
         return max(1, adaptive_limit)  # Au moins 1 requête
     
-    def can_make_request(self, api_name: str) -> bool:
+    def can_make_request(self, api_name: str = 'default') -> bool:
         """Version adaptative de can_make_request"""
-        if api_name not in self.api_limits:
+        if self.custom_limit and api_name == 'default':
+            limits = self.custom_limit
+        else:
+            limits = self.api_limits.get(api_name, self.custom_limit or {})
+        
+        if not limits:
             return True
         
         with self.lock:

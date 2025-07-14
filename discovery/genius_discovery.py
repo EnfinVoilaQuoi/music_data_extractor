@@ -1,4 +1,4 @@
-# discovery/genius_discovery.py
+# discovery/genius_discovery.py - Version corrigée avec imports relatifs
 import logging
 from typing import List, Dict, Any, Optional, Set
 from dataclasses import dataclass
@@ -9,14 +9,14 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# CORRECTIONS MAJEURES: Imports relatifs corrects
 from ..config.settings import settings
 from ..models.entities import Track, Artist
 from ..models.enums import DataSource, QualityLevel
-from ..core.exceptions import DiscoveryError, RateLimitError, ValidationError
+from ..core.exceptions import APIError, APIRateLimitError, DataValidationError  # Utiliser les exceptions définies
 from ..core.cache import CacheManager
 from ..core.rate_limiter import RateLimiter
 from ..utils.text_utils import clean_artist_name, normalize_title
-
 
 @dataclass
 class DiscoveryResult:
@@ -32,7 +32,6 @@ class DiscoveryResult:
         if self.tracks is None:
             self.tracks = []
         self.total_found = len(self.tracks)
-
 
 class GeniusDiscovery:
     """
@@ -51,7 +50,7 @@ class GeniusDiscovery:
         # Configuration API
         self.api_key = settings.genius_api_key
         if not self.api_key:
-            raise DiscoveryError("Clé API Genius manquante")
+            raise APIError("Clé API Genius manquante")  # Utiliser APIError au lieu de DiscoveryError
         
         self.base_url = "https://api.genius.com"
         self.headers = {
@@ -62,7 +61,7 @@ class GeniusDiscovery:
         # Composants
         self.cache_manager = CacheManager()
         self.rate_limiter = RateLimiter(
-            requests_per_period=settings.get('api.genius.rate_limit', 60),
+            requests_per_period=settings.get('rate_limits.genius.requests_per_minute', 30),
             period_seconds=60
         )
         
@@ -177,7 +176,7 @@ class GeniusDiscovery:
         
         try:
             # Recherche via API
-            self.rate_limiter.wait_if_needed()
+            self.rate_limiter.wait_if_needed('genius')
             
             params = {
                 'q': artist_name,
@@ -193,7 +192,7 @@ class GeniusDiscovery:
             self.stats['api_calls'] += 1
             
             if response.status_code == 429:
-                raise RateLimitError("Rate limit Genius atteint")
+                raise APIRateLimitError("genius")  # Utiliser APIRateLimitError
             
             response.raise_for_status()
             data = response.json()
@@ -209,7 +208,7 @@ class GeniusDiscovery:
             
         except requests.exceptions.RequestException as e:
             self.logger.error(f"Erreur API lors de la recherche d'artiste: {e}")
-            raise DiscoveryError(f"Erreur de recherche d'artiste: {e}")
+            raise APIError(f"Erreur de recherche d'artiste: {e}")  # Utiliser APIError
     
     def _find_best_artist_match(self, hits: List[Dict], target_name: str) -> Optional[Dict[str, Any]]:
         """
@@ -296,7 +295,7 @@ class GeniusDiscovery:
         
         try:
             while len(all_songs) < max_tracks:
-                self.rate_limiter.wait_if_needed()
+                self.rate_limiter.wait_if_needed('genius')
                 
                 params = {
                     'page': page,
@@ -313,7 +312,7 @@ class GeniusDiscovery:
                 self.stats['api_calls'] += 1
                 
                 if response.status_code == 429:
-                    raise RateLimitError("Rate limit Genius atteint")
+                    raise APIRateLimitError("genius")
                 
                 response.raise_for_status()
                 data = response.json()
@@ -339,7 +338,7 @@ class GeniusDiscovery:
             
         except requests.exceptions.RequestException as e:
             self.logger.error(f"Erreur API lors de la récupération des morceaux: {e}")
-            raise DiscoveryError(f"Erreur de récupération des morceaux: {e}")
+            raise APIError(f"Erreur de récupération des morceaux: {e}")
     
     def _filter_and_clean_tracks(self, tracks: List[Dict], artist_name: str) -> List[Dict[str, Any]]:
         """
