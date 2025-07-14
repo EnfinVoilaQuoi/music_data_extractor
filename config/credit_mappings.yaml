@@ -1,0 +1,344 @@
+# config/credit_mappings.yaml
+# Mappings intelligents pour l'extraction des crédits (focus rap/hip-hop)
+
+# Patterns pour les crédits d'instruments
+instrument_patterns:
+  saxophone:
+    - "saxophone"
+    - "sax"
+    - "tenor sax"
+    - "alto sax"
+    - "soprano sax"
+    - "baryton sax"
+    - "baritone sax"
+  
+  guitar:
+    - "guitar"
+    - "guitare"
+    - "electric guitar"
+    - "acoustic guitar"
+    - "bass guitar"
+    - "basse"
+    - "bass"
+    - "electric bass"
+    - "acoustic bass"
+  
+  piano:
+    - "piano"
+    - "keyboards"
+    - "clavier"
+    - "keys"
+    - "synth"
+    - "synthesizer"
+    - "electric piano"
+    - "grand piano"
+    - "upright piano"
+  
+  drums:
+    - "drums"
+    - "batterie"
+    - "percussion"
+    - "kick"
+    - "snare"
+    - "hi-hat"
+    - "cymbals"
+    - "drum kit"
+    - "drum programming"
+    - "drum machine"
+  
+  strings:
+    - "violin"
+    - "violon"
+    - "viola"
+    - "cello"
+    - "violoncelle"
+    - "double bass"
+    - "contrebasse"
+    - "strings"
+    - "string section"
+  
+  brass:
+    - "trumpet"
+    - "trompette"
+    - "trombone"
+    - "horn"
+    - "cor"
+    - "brass section"
+    - "brass"
+  
+  vocals_additional:
+    - "choir"
+    - "chœur"
+    - "backing vocals"
+    - "background vocals"
+    - "additional vocals"
+    - "ad-libs"
+    - "ad libs"
+    - "harmonies"
+    - "vocal harmonies"
+
+# Patterns pour les rôles (spécifiques rap/hip-hop)
+role_patterns:
+  producer:
+    - "produced by"
+    - "producer"
+    - "prod by"
+    - "prod."
+    - "produit par"
+    - "production"
+    - "beats by"
+    - "beat by"
+    - "executive producer"
+    - "co-producer"
+    - "additional production"
+    - "vocal production"
+  
+  mixing_engineer:
+    - "mixed by"
+    - "mix"
+    - "mixage"
+    - "mixing"
+    - "mix engineer"
+    - "mixing engineer"
+    - "engineer"
+    - "engineered by"
+  
+  mastering_engineer:
+    - "mastered by"
+    - "master"
+    - "mastering"
+    - "master engineer"
+    - "mastering engineer"
+  
+  recording_engineer:
+    - "recorded by"
+    - "recording"
+    - "recording engineer"
+    - "studio engineer"
+    - "tracking engineer"
+  
+  featuring:
+    - "feat."
+    - "feat"
+    - "featuring"
+    - "ft."
+    - "ft"
+    - "avec"
+    - "with"
+    - "guest vocals"
+  
+  composer:
+    - "composed by"
+    - "composer"
+    - "composition"
+    - "written by"
+    - "songwriting"
+    - "songwriter"
+    - "lyrics by"
+    - "lyricist"
+    - "music by"
+  
+  sample_source:
+    - "sample"
+    - "samples"
+    - "interpolation"
+    - "interpolates"
+    - "contains elements"
+    - "based on"
+    - "contains sample"
+    - "incorporates"
+
+# Patterns spécifiques hip-hop
+hiphop_specific:
+  dj:
+    - "dj"
+    - "deejay"
+    - "disc jockey"
+    - "turntables"
+    - "scratch"
+    - "scratches"
+    - "cuts"
+  
+  executive_producer:
+    - "executive producer"
+    - "exec producer"
+    - "executive production"
+    - "a&r"
+  
+  vocal_producer:
+    - "vocal producer"
+    - "vocal production"
+    - "vocals produced by"
+    - "vocal arrangement"
+  
+  rap_vocals:
+    - "rap"
+    - "rap vocals"
+    - "rapping"
+    - "verses"
+    - "verse"
+    - "bars"
+  
+  hook_vocals:
+    - "hook"
+    - "chorus"
+    - "refrain"
+    - "bridge"
+
+# Nettoyage des noms
+name_cleaning:
+  remove_prefixes:
+    - "by "
+    - "par "
+    - "prod. by "
+    - "produced by "
+    - "mixed by "
+    - "mastered by "
+    - "written by "
+    - "feat. "
+    - "featuring "
+  
+  remove_suffixes:
+    - " (uncredited)"
+    - " [uncredited]"
+    - " (additional)"
+    - " [additional]"
+    - " (co-)"
+    - " [co-]"
+  
+  replace_patterns:
+    - from: "&"
+      to: "and"
+    - from: " feat. "
+      to: " featuring "
+    - from: " ft. "
+      to: " featuring "
+    - from: "w/"
+      to: "with"
+
+# Patterns de normalisation des rôles
+role_normalization:
+  # Production
+  "prod": "producer"
+  "production": "producer"
+  "produced by": "producer"
+  "beats by": "producer"
+  "beat by": "producer"
+  "executive prod": "executive_producer"
+  "exec producer": "executive_producer"
+  "co-producer": "co_producer"
+  "additional prod": "additional_production"
+  "vocal prod": "vocal_producer"
+  
+  # Engineering
+  "mix": "mixing"
+  "mixed by": "mixing"
+  "mix engineer": "mixing_engineer"
+  "master": "mastering"
+  "mastered by": "mastering"
+  "master engineer": "mastering_engineer"
+  "engineer": "recording_engineer"
+  "engineered by": "recording_engineer"
+  "rec": "recording"
+  "recorded by": "recording"
+  
+  # Composition
+  "songwriter": "songwriter"
+  "written by": "songwriter"
+  "lyrics by": "lyricist"
+  "music by": "composer"
+  "composed by": "composer"
+  "composition": "composer"
+  
+  # Vocals
+  "feat": "featuring"
+  "featuring": "featuring"
+  "ft": "featuring"
+  "vocals": "lead_vocals"
+  "lead vocal": "lead_vocals"
+  "backing vocal": "backing_vocals"
+  "background vocals": "backing_vocals"
+  "ad-libs": "backing_vocals"
+  "harmonies": "backing_vocals"
+  
+  # Instruments spécifiques
+  "keys": "piano"
+  "synth": "piano"
+  "bass": "bass_guitar"
+  "drums": "drums"
+  "percussion": "drums"
+
+# Détection automatique du type de crédit
+auto_detection:
+  production_keywords:
+    - "prod"
+    - "beat"
+    - "production"
+    - "executive"
+  
+  instrument_keywords:
+    - "guitar"
+    - "piano"
+    - "drums"
+    - "bass"
+    - "sax"
+    - "violin"
+    - "trumpet"
+  
+  technical_keywords:
+    - "mix"
+    - "master"
+    - "engineer"
+    - "record"
+    - "studio"
+  
+  vocal_keywords:
+    - "vocal"
+    - "rap"
+    - "sing"
+    - "chorus"
+    - "hook"
+    - "verse"
+  
+  composition_keywords:
+    - "writ"
+    - "compos"
+    - "lyric"
+    - "song"
+
+# Patterns d'exclusion (pour éviter les faux positifs)
+exclusion_patterns:
+  - "unknown"
+  - "n/a"
+  - "not available"
+  - "tba"
+  - "to be announced"
+  - "various"
+  - "multiple"
+  - "see credits"
+  - "full credits"
+  - "additional credits"
+
+# Configuration pour l'extraction intelligente
+extraction_config:
+  # Priorité des sources (1 = plus haute priorité)
+  source_priority:
+    genius_web: 1
+    genius_api: 2
+    spotify: 3
+    discogs: 4
+    lastfm: 5
+    manual: 6
+  
+  # Seuils de confiance
+  confidence_thresholds:
+    high: 0.9
+    medium: 0.7
+    low: 0.5
+  
+  # Validation des crédits
+  validation:
+    min_name_length: 2
+    max_name_length: 100
+    required_roles: ["producer"]
+    optional_roles: ["mixing", "mastering", "featuring"]
