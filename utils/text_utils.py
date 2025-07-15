@@ -1,184 +1,176 @@
 # utils/text_utils.py
 import re
 import unicodedata
-from typing import Optional, List, Dict, Set
-import logging
-
-logger = logging.getLogger(__name__)
+from typing import List, Optional, Set
+from difflib import SequenceMatcher
 
 
-def clean_artist_name(name: str) -> str:
+def normalize_text(text: str) -> str:
     """
-    Nettoie et normalise un nom d'artiste.
+    Normalise un texte pour la comparaison et la recherche.
     
     Args:
-        name: Nom d'artiste brut
+        text: Texte à normaliser
         
     Returns:
-        Nom d'artiste nettoyé
+        Texte normalisé
     """
-    if not name:
+    if not text:
         return ""
     
-    # Suppression des espaces en début/fin
-    name = name.strip()
+    # Convertir en minuscules
+    text = text.lower()
     
-    # Normalisation Unicode (supprime les accents pour la comparaison)
-    name = unicodedata.normalize('NFKD', name)
+    # Supprimer les accents
+    text = remove_accents(text)
     
-    # Suppression des caractères de contrôle
-    name = ''.join(char for char in name if not unicodedata.category(char).startswith('C'))
+    # Supprimer les caractères spéciaux mais garder les espaces et tirets
+    text = re.sub(r'[^\w\s\-]', '', text)
     
-    # Remplacement des espaces multiples par un seul
-    name = re.sub(r'\s+', ' ', name)
+    # Normaliser les espaces multiples
+    text = re.sub(r'\s+', ' ', text)
     
-    # Suppression des parenthèses avec contenu générique
-    patterns_to_remove = [
-        r'\s*\(Official.*?\)',  # (Official Artist)
-        r'\s*\(Verified.*?\)',  # (Verified)
-        r'\s*\[Official.*?\]',  # [Official Artist]
-        r'\s*\[Verified.*?\]',  # [Verified]
-    ]
+    # Supprimer les espaces en début/fin
+    text = text.strip()
     
-    for pattern in patterns_to_remove:
-        name = re.sub(pattern, '', name, flags=re.IGNORECASE)
-    
-    return name.strip()
+    return text
 
 
-def normalize_title(title: str) -> str:
+def remove_accents(text: str) -> str:
     """
-    Normalise un titre de morceau pour la détection de doublons.
+    Supprime les accents d'un texte.
     
     Args:
-        title: Titre brut
+        text: Texte avec accents
         
     Returns:
-        Titre normalisé
+        Texte sans accents
     """
-    if not title:
+    if not text:
         return ""
     
-    # Conversion en minuscules
-    title = title.lower().strip()
+    # Normalisation NFD puis suppression des caractères de combinaison
+    nfd = unicodedata.normalize('NFD', text)
+    without_accents = ''.join(char for char in nfd if unicodedata.category(char) != 'Mn')
     
-    # Suppression des featuring/feat/ft
-    feat_patterns = [
-        r'\s*\(feat\.?\s+[^)]+\)',
-        r'\s*\(featuring\s+[^)]+\)',
-        r'\s*\(ft\.?\s+[^)]+\)',
-        r'\s*feat\.?\s+.*$',
-        r'\s*featuring\s+.*$',
-        r'\s*ft\.?\s+.*$',
-    ]
-    
-    for pattern in feat_patterns:
-        title = re.sub(pattern, '', title, flags=re.IGNORECASE)
-    
-    # Suppression des versions/remix/remaster
-    version_patterns = [
-        r'\s*\(.*?version.*?\)',
-        r'\s*\(.*?remix.*?\)',
-        r'\s*\(.*?remaster.*?\)',
-        r'\s*\(.*?edit.*?\)',
-        r'\s*\(live.*?\)',
-        r'\s*\(acoustic.*?\)',
-        r'\s*\(instrumental.*?\)',
-        r'\s*\(clean.*?\)',
-        r'\s*\(explicit.*?\)',
-    ]
-    
-    for pattern in version_patterns:
-        title = re.sub(pattern, '', title, flags=re.IGNORECASE)
-    
-    # Suppression de la ponctuation non significative
-    title = re.sub(r'[^\w\s]', '', title)
-    
-    # Remplacement des espaces multiples
-    title = re.sub(r'\s+', ' ', title)
-    
-    return title.strip()
+    return without_accents
 
 
-def extract_featured_artists_from_title(title: str) -> tuple[str, List[str]]:
+def calculate_similarity(text1: str, text2: str) -> float:
     """
-    Extrait les artistes invités du titre d'un morceau.
+    Calcule la similarité entre deux textes (0-1).
     
     Args:
-        title: Titre complet avec featuring
+        text1: Premier texte
+        text2: Deuxième texte
         
     Returns:
-        tuple: (titre_nettoyé, liste_artistes_invités)
+        Score de similarité entre 0 et 1
     """
-    original_title = title.strip()
-    featured_artists = []
+    if not text1 or not text2:
+        return 0.0
+    
+    # Normaliser les deux textes
+    norm1 = normalize_text(text1)
+    norm2 = normalize_text(text2)
+    
+    if norm1 == norm2:
+        return 1.0
+    
+    # Utiliser SequenceMatcher pour calculer la similarité
+    matcher = SequenceMatcher(None, norm1, norm2)
+    return matcher.ratio()
+
+
+def extract_featuring_artists(title: str) -> tuple[str, List[str]]:
+    """
+    Extrait les artistes en featuring d'un titre de morceau.
+    
+    Args:
+        title: Titre du morceau
+        
+    Returns:
+        Tuple (titre_nettoyé, liste_des_featuring)
+    """
+    featuring_artists = []
     
     # Patterns pour détecter les featuring
-    feat_patterns = [
-        r'\s*\(feat\.?\s+([^)]+)\)',
-        r'\s*\(featuring\s+([^)]+)\)',
-        r'\s*\(ft\.?\s+([^)]+)\)',
-        r'\s*feat\.?\s+(.+)$',
-        r'\s*featuring\s+(.+)$',
-        r'\s*ft\.?\s+(.+)$',
+    featuring_patterns = [
+        r'\(feat\.?\s+([^)]+)\)',
+        r'\(ft\.?\s+([^)]+)\)',
+        r'\(featuring\s+([^)]+)\)',
+        r'\sfeat\.?\s+([^(\[]+)',
+        r'\sft\.?\s+([^(\[]+)',
+        r'\sfeaturing\s+([^(\[]+)'
     ]
     
     clean_title = title
     
-    for pattern in feat_patterns:
-        match = re.search(pattern, title, flags=re.IGNORECASE)
-        if match:
-            # Extraction des artistes
-            artists_str = match.group(1)
-            artists = parse_artist_list(artists_str)
-            featured_artists.extend(artists)
+    for pattern in featuring_patterns:
+        matches = re.finditer(pattern, title, re.IGNORECASE)
+        for match in matches:
+            # Extraire les artistes
+            artists_str = match.group(1).strip()
             
-            # Suppression du featuring du titre
-            clean_title = re.sub(pattern, '', title, flags=re.IGNORECASE).strip()
-            break
+            # Séparer les artistes multiples
+            artists = split_multiple_artists(artists_str)
+            featuring_artists.extend(artists)
+            
+            # Supprimer le featuring du titre
+            clean_title = clean_title.replace(match.group(0), '').strip()
     
-    # Déduplication des artistes
-    featured_artists = list(dict.fromkeys(featured_artists))  # Préserve l'ordre
+    # Nettoyer le titre final
+    clean_title = re.sub(r'\s+', ' ', clean_title).strip()
     
-    return clean_title, featured_artists
+    # Supprimer les doublons en gardant l'ordre
+    unique_featuring = []
+    for artist in featuring_artists:
+        if artist and artist not in unique_featuring:
+            unique_featuring.append(artist)
+    
+    return clean_title, unique_featuring
 
 
-def parse_artist_list(artists_str: str) -> List[str]:
+def split_multiple_artists(artists_str: str) -> List[str]:
     """
-    Parse une chaîne contenant plusieurs artistes.
+    Sépare une chaîne contenant plusieurs artistes.
     
     Args:
-        artists_str: Chaîne avec les artistes (ex: "Artist1, Artist2 & Artist3")
+        artists_str: Chaîne d'artistes séparés
         
     Returns:
-        Liste des noms d'artistes
+        Liste des artistes individuels
     """
     if not artists_str:
         return []
     
-    # Séparateurs communs
-    separators = [',', '&', 'and', '+', 'x', '×']
+    # Patterns de séparation
+    separators = [' & ', ' and ', ', ', ' x ', ' X ', ' feat. ', ' ft. ']
     
-    # Remplacement des séparateurs par des virgules
-    for sep in separators:
-        if sep in ['and']:
-            artists_str = re.sub(f' {sep} ', ',', artists_str, flags=re.IGNORECASE)
-        else:
-            artists_str = artists_str.replace(sep, ',')
+    artists = [artists_str]
     
-    # Division et nettoyage
-    artists = [artist.strip() for artist in artists_str.split(',')]
-    artists = [artist for artist in artists if artist and len(artist) > 1]
+    for separator in separators:
+        new_artists = []
+        for artist in artists:
+            new_artists.extend(artist.split(separator))
+        artists = new_artists
     
-    return artists
+    # Nettoyer chaque artiste
+    cleaned_artists = []
+    for artist in artists:
+        cleaned = artist.strip()
+        if cleaned and len(cleaned) > 1:  # Éviter les initiales isolées
+            cleaned_artists.append(cleaned)
+    
+    return cleaned_artists
 
 
-def clean_album_title(title: str) -> str:
+def clean_track_title(title: str) -> str:
     """
-    Nettoie un titre d'album.
+    Nettoie un titre de morceau en supprimant les éléments parasites.
     
     Args:
-        title: Titre d'album brut
+        title: Titre brut
         
     Returns:
         Titre nettoyé
@@ -186,190 +178,177 @@ def clean_album_title(title: str) -> str:
     if not title:
         return ""
     
-    title = title.strip()
+    # Supprimer les featuring (ils seront gérés séparément)
+    clean_title, _ = extract_featuring_artists(title)
     
-    # Suppression des éditions spéciales
-    edition_patterns = [
-        r'\s*\(Deluxe.*?\)',
-        r'\s*\(Extended.*?\)',
-        r'\s*\(Special.*?\)',
-        r'\s*\(Limited.*?\)',
-        r'\s*\(Collector.*?\)',
-        r'\s*\(Anniversary.*?\)',
-        r'\s*\(Remaster.*?\)',
-        r'\s*\(Re-?issue.*?\)',
+    # Supprimer les indicateurs de version/remix courants
+    version_patterns = [
+        r'\(explicit\)',
+        r'\(clean\)',
+        r'\(radio edit\)',
+        r'\(instrumental\)',
+        r'\(acapella\)',
+        r'\(bonus track\)',
+        r'\(deluxe\)',
+        r'\(remastered\)',
+        r'\(live\)',
+        r'\[explicit\]',
+        r'\[clean\]',
+        r'\[radio edit\]'
     ]
     
-    for pattern in edition_patterns:
-        title = re.sub(pattern, '', title, flags=re.IGNORECASE)
+    for pattern in version_patterns:
+        clean_title = re.sub(pattern, '', clean_title, flags=re.IGNORECASE)
     
-    return title.strip()
+    # Nettoyer les espaces
+    clean_title = re.sub(r'\s+', ' ', clean_title).strip()
+    
+    return clean_title
 
 
-def detect_language(text: str) -> str:
+def clean_artist_name(name: str) -> str:
     """
-    Détecte la langue d'un texte (français/anglais principalement).
+    Nettoie un nom d'artiste.
     
     Args:
-        text: Texte à analyser
+        name: Nom brut
         
     Returns:
-        Code de langue ('fr', 'en', 'unknown')
+        Nom nettoyé
+    """
+    if not name:
+        return ""
+    
+    # Supprimer les préfixes courants
+    prefixes = ['by ', 'prod. by ', 'produced by ', 'feat. ', 'ft. ']
+    
+    clean_name = name.strip()
+    
+    for prefix in prefixes:
+        if clean_name.lower().startswith(prefix):
+            clean_name = clean_name[len(prefix):].strip()
+    
+    # Supprimer les suffixes
+    suffixes = [' (uncredited)', ' (prod)', ' (producer)']
+    
+    for suffix in suffixes:
+        if clean_name.lower().endswith(suffix):
+            clean_name = clean_name[:-len(suffix)].strip()
+    
+    return clean_name
+
+
+def extract_bpm_from_text(text: str) -> Optional[int]:
+    """
+    Extrait le BPM d'un texte.
+    
+    Args:
+        text: Texte contenant potentiellement un BPM
+        
+    Returns:
+        BPM extrait ou None
     """
     if not text:
-        return 'unknown'
-    
-    text_lower = text.lower()
-    
-    # Mots français communs
-    french_words = {
-        'le', 'la', 'les', 'de', 'du', 'des', 'et', 'est', 'avec', 'dans', 
-        'pour', 'sur', 'par', 'une', 'un', 'ce', 'cette', 'qui', 'que',
-        'où', 'quand', 'comment', 'pourquoi', 'tout', 'tous', 'toute',
-        'être', 'avoir', 'faire', 'dire', 'aller', 'voir', 'savoir'
-    }
-    
-    # Mots anglais communs
-    english_words = {
-        'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of',
-        'with', 'by', 'from', 'up', 'about', 'into', 'through', 'during',
-        'before', 'after', 'above', 'below', 'between', 'among', 'this',
-        'that', 'these', 'those', 'what', 'where', 'when', 'why', 'how'
-    }
-    
-    words = re.findall(r'\b\w+\b', text_lower)
-    
-    if not words:
-        return 'unknown'
-    
-    french_score = sum(1 for word in words if word in french_words)
-    english_score = sum(1 for word in words if word in english_words)
-    
-    if french_score > english_score and french_score > 0:
-        return 'fr'
-    elif english_score > french_score and english_score > 0:
-        return 'en'
-    else:
-        return 'unknown'
-
-
-def similarity_ratio(str1: str, str2: str) -> float:
-    """
-    Calcule un ratio de similarité entre deux chaînes.
-    
-    Args:
-        str1, str2: Chaînes à comparer
-        
-    Returns:
-        Ratio de similarité entre 0 et 1
-    """
-    if not str1 or not str2:
-        return 0.0
-    
-    str1 = str1.lower().strip()
-    str2 = str2.lower().strip()
-    
-    if str1 == str2:
-        return 1.0
-    
-    # Algorithme simple basé sur les caractères communs
-    len1, len2 = len(str1), len(str2)
-    max_len = max(len1, len2)
-    
-    if max_len == 0:
-        return 1.0
-    
-    # Comptage des caractères communs
-    common_chars = 0
-    str2_chars = list(str2)
-    
-    for char in str1:
-        if char in str2_chars:
-            str2_chars.remove(char)
-            common_chars += 1
-    
-    return common_chars / max_len
-
-
-def extract_year_from_date(date_str: str) -> Optional[int]:
-    """
-    Extrait l'année d'une chaîne de date.
-    
-    Args:
-        date_str: Chaîne contenant une date
-        
-    Returns:
-        Année extraite ou None
-    """
-    if not date_str:
         return None
     
-    # Recherche d'une année (4 chiffres)
-    year_match = re.search(r'\b(19|20)\d{2}\b', str(date_str))
+    # Patterns pour détecter le BPM
+    bpm_patterns = [
+        r'(\d{2,3})\s*bpm',
+        r'(\d{2,3})\s*beats?\s*per\s*minute',
+        r'tempo:?\s*(\d{2,3})',
+        r'(\d{2,3})\s*beats'
+    ]
     
-    if year_match:
-        try:
-            return int(year_match.group(0))
-        except ValueError:
-            pass
+    for pattern in bpm_patterns:
+        match = re.search(pattern, text.lower())
+        if match:
+            bpm = int(match.group(1))
+            # Validation basique du BPM
+            if 40 <= bpm <= 300:
+                return bpm
     
     return None
 
 
-def clean_credit_role(role: str) -> str:
+def extract_duration_from_text(text: str) -> Optional[int]:
     """
-    Nettoie et normalise un rôle de crédit.
+    Extrait la durée en secondes d'un texte.
     
     Args:
-        role: Rôle brut
+        text: Texte contenant une durée (ex: "3:45", "2m 30s")
         
     Returns:
-        Rôle nettoyé et normalisé
+        Durée en secondes ou None
     """
-    if not role:
-        return ""
+    if not text:
+        return None
     
-    role = role.strip().lower()
+    # Pattern MM:SS
+    mmss_match = re.search(r'(\d{1,2}):(\d{2})', text)
+    if mmss_match:
+        minutes = int(mmss_match.group(1))
+        seconds = int(mmss_match.group(2))
+        return minutes * 60 + seconds
     
-    # Mappings de normalisation
-    role_mappings = {
-        'prod': 'producer',
-        'production': 'producer',
-        'produced by': 'producer',
-        'executive prod': 'executive_producer',
-        'exec producer': 'executive_producer',
-        'co-producer': 'co_producer',
-        'additional prod': 'additional_production',
-        'mix': 'mixing',
-        'mixed by': 'mixing',
-        'master': 'mastering',
-        'mastered by': 'mastering',
-        'engineer': 'engineering',
-        'engineered by': 'engineering',
-        'rec': 'recording',
-        'recorded by': 'recording',
-        'songwriter': 'songwriter',
-        'written by': 'songwriter',
-        'composer': 'composer',
-        'composed by': 'composer',
-        'feat': 'featuring',
-        'featuring': 'featuring',
-        'ft': 'featuring',
-        'vocals': 'lead_vocals',
-        'lead vocal': 'lead_vocals',
-        'backing vocal': 'backing_vocals',
-        'background vocals': 'backing_vocals',
-    }
+    # Pattern HH:MM:SS
+    hhmmss_match = re.search(r'(\d{1,2}):(\d{2}):(\d{2})', text)
+    if hhmmss_match:
+        hours = int(hhmmss_match.group(1))
+        minutes = int(hhmmss_match.group(2))
+        seconds = int(hhmmss_match.group(3))
+        return hours * 3600 + minutes * 60 + seconds
     
-    # Application des mappings
-    normalized_role = role_mappings.get(role, role)
+    # Pattern "Xm Ys"
+    ms_match = re.search(r'(\d+)m\s*(\d+)s', text)
+    if ms_match:
+        minutes = int(ms_match.group(1))
+        seconds = int(ms_match.group(2))
+        return minutes * 60 + seconds
     
-    # Nettoyage final
-    normalized_role = re.sub(r'[^\w_]', '_', normalized_role)
-    normalized_role = re.sub(r'_+', '_', normalized_role)
-    normalized_role = normalized_role.strip('_')
+    # Pattern "X minutes Y seconds"
+    full_match = re.search(r'(\d+)\s*minutes?\s*(\d+)\s*seconds?', text)
+    if full_match:
+        minutes = int(full_match.group(1))
+        seconds = int(full_match.group(2))
+        return minutes * 60 + seconds
     
-    return normalized_role
+    return None
+
+
+def is_similar_album_title(title1: str, title2: str, threshold: float = 0.85) -> bool:
+    """
+    Vérifie si deux titres d'albums sont similaires.
+    
+    Args:
+        title1: Premier titre
+        title2: Deuxième titre
+        threshold: Seuil de similarité
+        
+    Returns:
+        True si les titres sont similaires
+    """
+    return calculate_similarity(title1, title2) >= threshold
+
+
+def extract_year_from_text(text: str) -> Optional[int]:
+    """
+    Extrait une année d'un texte.
+    
+    Args:
+        text: Texte contenant potentiellement une année
+        
+    Returns:
+        Année extraite ou None
+    """
+    if not text:
+        return None
+    
+    # Chercher une année entre 1900 et 2030
+    year_match = re.search(r'\b(19\d{2}|20[0-3]\d)\b', text)
+    if year_match:
+        return int(year_match.group(1))
+    
+    return None
 
 
 def truncate_text(text: str, max_length: int = 100, suffix: str = "...") -> str:
@@ -390,79 +369,56 @@ def truncate_text(text: str, max_length: int = 100, suffix: str = "...") -> str:
     return text[:max_length - len(suffix)] + suffix
 
 
-def validate_artist_name(name: str) -> bool:
+def contains_explicit_content_markers(text: str) -> bool:
     """
-    Valide qu'un nom d'artiste est acceptable.
+    Vérifie si un texte contient des marqueurs de contenu explicite.
     
     Args:
-        name: Nom à valider
+        text: Texte à vérifier
         
     Returns:
-        True si valide
+        True si contient des marqueurs explicites
     """
-    if not name or len(name.strip()) < 2:
-        return False
-    
-    # Patterns à rejeter
-    invalid_patterns = [
-        r'^unknown\s*artist',
-        r'^various\s*artists?',
-        r'^compilation',
-        r'^soundtrack',
-        r'^\[.*\]$',  # Noms entre crochets uniquement
-        r'^\d+$',     # Nombres uniquement
+    explicit_markers = [
+        'explicit', 'parental advisory', 'nsfw', 'mature content',
+        'adult content', 'strong language', 'uncensored'
     ]
     
-    name_lower = name.lower().strip()
-    
-    for pattern in invalid_patterns:
-        if re.match(pattern, name_lower):
-            return False
-    
-    return True
+    text_lower = text.lower()
+    return any(marker in text_lower for marker in explicit_markers)
 
 
-def format_duration(duration_ms: Optional[int]) -> str:
+def generate_search_variants(text: str) -> List[str]:
     """
-    Formate une durée en millisecondes en format MM:SS.
+    Génère des variantes de recherche pour un texte.
     
     Args:
-        duration_ms: Durée en millisecondes
+        text: Texte original
         
     Returns:
-        Durée formatée (ex: "3:45")
+        Liste des variantes de recherche
     """
-    if not duration_ms or duration_ms <= 0:
-        return "0:00"
+    variants = [text]
     
-    total_seconds = duration_ms // 1000
-    minutes = total_seconds // 60
-    seconds = total_seconds % 60
+    # Version normalisée
+    normalized = normalize_text(text)
+    if normalized and normalized != text:
+        variants.append(normalized)
     
-    return f"{minutes}:{seconds:02d}"
-
-
-def parse_duration(duration_str: str) -> Optional[int]:
-    """
-    Parse une durée au format "MM:SS" vers millisecondes.
+    # Version sans accents
+    no_accents = remove_accents(text)
+    if no_accents and no_accents != text:
+        variants.append(no_accents)
     
-    Args:
-        duration_str: Durée au format texte
-        
-    Returns:
-        Durée en millisecondes ou None
-    """
-    if not duration_str:
-        return None
+    # Version sans caractères spéciaux
+    no_special = re.sub(r'[^\w\s]', '', text)
+    if no_special and no_special != text:
+        variants.append(no_special)
     
-    # Pattern MM:SS ou M:SS
-    match = re.match(r'^(\d{1,2}):(\d{2})$', duration_str.strip())
+    # Supprimer les doublons en gardant l'ordre
+    unique_variants = []
+    for variant in variants:
+        if variant and variant not in unique_variants:
+            unique_variants.append(variant)
     
-    if match:
-        minutes = int(match.group(1))
-        seconds = int(match.group(2))
-        
-        if seconds < 60:  # Validation
-            return (minutes * 60 + seconds) * 1000
-    
-    return None
+    return unique_variants

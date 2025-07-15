@@ -1,4 +1,4 @@
-# core/database.py - Version corrigée
+# core/database.py - Version corrigée et complétée
 import sqlite3
 import json
 from pathlib import Path
@@ -6,9 +6,9 @@ from typing import List, Optional, Dict, Any, Union
 from datetime import datetime
 from contextlib import contextmanager
 
-from ..config.settings import settings  # CORRECTION: import relatif
-from ..models.entities import Artist, Album, Track, Credit, Session, QualityReport  # CORRECTION: import relatif
-from ..models.enums import AlbumType, CreditCategory, SessionStatus, DataSource  # CORRECTION: import relatif
+from ..config.settings import settings
+from ..models.entities import Artist, Album, Track, Credit, Session, QualityReport
+from ..models.enums import AlbumType, CreditCategory, SessionStatus, DataSource
 
 class Database:
     """Gestionnaire de base de données SQLite avec migrations"""
@@ -125,20 +125,25 @@ class Database:
             )
         """)
         
-        # Table des albums
+        # Table des albums - VERSION COMPLÈTE
         conn.execute("""
             CREATE TABLE IF NOT EXISTS albums (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 title TEXT NOT NULL,
                 artist_id INTEGER,
                 release_date TEXT,
+                release_year INTEGER,
                 album_type TEXT DEFAULT 'album',
                 genre TEXT,
+                label TEXT,
                 spotify_id TEXT,
                 discogs_id INTEGER,
+                genius_id TEXT,
                 track_count INTEGER,
                 total_duration INTEGER, -- en secondes
+                cover_url TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (artist_id) REFERENCES artists (id)
             )
         """)
@@ -389,6 +394,114 @@ class Database:
             return new_artist
         return artist
     
+    # ==================== ALBUMS ====================
+    
+    def create_album(self, album: Album) -> int:
+        """Crée un nouvel album"""
+        with self.get_connection() as conn:
+            cursor = conn.execute("""
+                INSERT INTO albums (
+                    title, artist_id, release_date, release_year, album_type,
+                    genre, label, spotify_id, discogs_id, genius_id,
+                    track_count, total_duration, cover_url
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                album.title,
+                album.artist_id,
+                album.release_date,
+                album.release_year,
+                album.album_type.value if album.album_type else None,
+                album.genre,
+                album.label,
+                album.spotify_id,
+                album.discogs_id,
+                album.genius_id,
+                album.track_count,
+                album.total_duration,
+                album.cover_url
+            ))
+            return cursor.lastrowid
+    
+    def get_album_by_id(self, album_id: int) -> Optional[Album]:
+        """Récupère un album par son ID"""
+        with self.get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM albums WHERE id = ?",
+                (album_id,)
+            )
+            row = cursor.fetchone()
+            
+            if row:
+                return self._row_to_album(row)
+        return None
+    
+    def get_album_by_title_and_artist(self, title: str, artist_id: int) -> Optional[Album]:
+        """Récupère un album par titre et artiste"""
+        with self.get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM albums WHERE title = ? AND artist_id = ?",
+                (title, artist_id)
+            )
+            row = cursor.fetchone()
+            
+            if row:
+                return self._row_to_album(row)
+        return None
+    
+    def get_albums_by_artist_id(self, artist_id: int) -> List[Album]:
+        """Récupère tous les albums d'un artiste"""
+        with self.get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM albums WHERE artist_id = ? ORDER BY release_year DESC, title",
+                (artist_id,)
+            )
+            
+            albums = []
+            for row in cursor.fetchall():
+                albums.append(self._row_to_album(row))
+            
+            return albums
+    
+    def update_album(self, album: Album):
+        """Met à jour un album"""
+        with self.get_connection() as conn:
+            conn.execute("""
+                UPDATE albums SET
+                    title = ?, release_date = ?, release_year = ?, album_type = ?,
+                    genre = ?, label = ?, spotify_id = ?, discogs_id = ?,
+                    track_count = ?, total_duration = ?, cover_url = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (
+                album.title, album.release_date, album.release_year,
+                album.album_type.value if album.album_type else None,
+                album.genre, album.label, album.spotify_id, album.discogs_id,
+                album.track_count, album.total_duration, album.cover_url,
+                album.id
+            ))
+    
+    def _row_to_album(self, row) -> Album:
+        """Convertit une ligne de base en objet Album"""
+        from ..models.enums import AlbumType  # Import local
+        return Album(
+            id=row['id'],
+            title=row['title'],
+            artist_id=row['artist_id'],
+            release_date=row['release_date'],
+            release_year=row['release_year'],
+            album_type=AlbumType(row['album_type']) if row['album_type'] else None,
+            genre=row['genre'],
+            label=row['label'],
+            spotify_id=row['spotify_id'],
+            discogs_id=row['discogs_id'],
+            genius_id=row['genius_id'],
+            track_count=row['track_count'],
+            total_duration=row['total_duration'],
+            cover_url=row['cover_url'],
+            created_at=datetime.fromisoformat(row['created_at']) if row['created_at'] else None,
+            updated_at=datetime.fromisoformat(row['updated_at']) if row['updated_at'] else None
+        )
+    
     # ==================== TRACKS ====================
     
     def create_track(self, track: Track) -> int:
@@ -419,7 +532,7 @@ class Database:
             ))
             track_id = cursor.lastrowid
             
-            # Ajouter les features - CORRECTION: utiliser featuring_artists
+            # Ajouter les features
             for feature in track.featuring_artists:
                 conn.execute("""
                     INSERT INTO track_features (track_id, featured_artist)
@@ -516,8 +629,8 @@ class Database:
                 credit.credit_category.value if credit.credit_category else None,
                 credit.credit_type.value if credit.credit_type else None,
                 credit.person_name,
-                credit.instrument,  # CORRECTION: utiliser instrument au lieu de instrument_detail
-                credit.data_source.value if credit.data_source else None  # CORRECTION: data_source au lieu de source
+                credit.instrument,
+                credit.data_source.value if credit.data_source else None
             ))
             return cursor.lastrowid
     
