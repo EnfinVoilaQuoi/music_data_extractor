@@ -346,42 +346,58 @@ def get_exception_hierarchy() -> Dict[str, list]:
     """Retourne la hiérarchie des exceptions pour debug/documentation"""
     return {
         "MusicDataExtractorError": [
-            "APIError": [
-                "APIRateLimitError",
-                "APIAuthenticationError", 
-                "APIQuotaExceededError",
-                "APIResponseError"
-            ],
-            "ScrapingError": [
-                "PageNotFoundError",
-                "ElementNotFoundError",
-                "SeleniumError"
-            ],
-            "DatabaseError": [
-                "DatabaseConnectionError",
-                "DatabaseIntegrityError"
-            ],
-            "DataError": [
-                "DataValidationError",
-                "DuplicateDataError",
-                "MissingDataError"
-            ],
-            "ExtractionError": [
-                "ArtistNotFoundError",
-                "TrackNotFoundError",
-                "CreditExtractionError"
-            ],
-            "CacheError": [
-                "CacheExpiredError",
-                "CacheCorruptedError"
-            ],
-            "SessionError": [
-                "SessionNotFoundError",
-                "SessionCorruptedError"
-            ],
-            "ExportError": [
-                "ExportFormatError",
-                "ExportPermissionError"
-            ]
+            {
+                "APIError": [
+                    "APIRateLimitError",
+                    "APIAuthenticationError", 
+                    "APIQuotaExceededError",
+                    "APIResponseError"
+                ]
+            },
+            {
+                "ScrapingError": [
+                    "PageNotFoundError",
+                    "ElementNotFoundError",
+                    "SeleniumError"
+                ]
+            },
+            {
+                "DatabaseError": [
+                    "DatabaseConnectionError",
+                    "DatabaseIntegrityError"
+                ]
+            },
+            {
+                "DataError": [
+                    "DataValidationError",
+                    "DuplicateDataError",
+                    "MissingDataError"
+                ]
+            },
+            {
+                "ExtractionError": [
+                    "ArtistNotFoundError",
+                    "TrackNotFoundError",
+                    "CreditExtractionError"
+                ]
+            },
+            {
+                "CacheError": [
+                    "CacheExpiredError",
+                    "CacheCorruptedError"
+                ]
+            },
+            {
+                "SessionError": [
+                    "SessionNotFoundError",
+                    "SessionCorruptedError"
+                ]
+            },
+            {
+                "ExportError": [
+                    "ExportFormatError",
+                    "ExportPermissionError"
+                ]
+            }
         ]
     }

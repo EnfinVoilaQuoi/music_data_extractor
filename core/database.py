@@ -6,9 +6,9 @@ from typing import List, Optional, Dict, Any, Union
 from datetime import datetime
 from contextlib import contextmanager
 
-from ..config.settings import settings
-from ..models.entities import Artist, Album, Track, Credit, Session, QualityReport
-from ..models.enums import AlbumType, CreditCategory, SessionStatus, DataSource
+from config.settings import settings
+from models.entities import Artist, Album, Track, Credit, Session, QualityReport
+from models.enums import AlbumType, CreditCategory, SessionStatus, DataSource
 
 class Database:
     """Gestionnaire de base de données SQLite avec migrations"""

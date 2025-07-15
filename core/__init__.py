@@ -1,40 +1,9 @@
 # core/__init__.py
 """Modules core du projet - base de données, cache, sessions"""
 
-import logging
-
-# Liste des exports disponibles
 __all__ = []
 
-# Import de la base de données
-try:
-    from .database import Database
-    __all__.append('Database')
-except ImportError as e:
-    logging.getLogger(__name__).warning(f"Impossible d'importer Database: {e}")
-
-# Import du cache
-try:
-    from .cache import CacheManager, SmartCache, CacheStats
-    __all__.extend(['CacheManager', 'SmartCache', 'CacheStats'])
-except ImportError as e:
-    logging.getLogger(__name__).warning(f"Impossible d'importer les modules de cache: {e}")
-
-# Import du rate limiter
-try:
-    from .rate_limiter import RateLimiter, AdaptiveRateLimiter
-    __all__.extend(['RateLimiter', 'AdaptiveRateLimiter'])
-except ImportError as e:
-    logging.getLogger(__name__).warning(f"Impossible d'importer les rate limiters: {e}")
-
-# Import du gestionnaire de sessions
-try:
-    from .session_manager import SessionManager, get_session_manager
-    __all__.extend(['SessionManager', 'get_session_manager'])
-except ImportError as e:
-    logging.getLogger(__name__).warning(f"Impossible d'importer le session manager: {e}")
-
-# Import des exceptions
+# Import des exceptions en premier (pas de dépendances)
 try:
     from .exceptions import (
         MusicDataExtractorError,
@@ -62,5 +31,39 @@ try:
         'SessionError',
         'ExportError'
     ])
+    print("✅ Core exceptions importées")
 except ImportError as e:
-    logging.getLogger(__name__).warning(f"Impossible d'importer les exceptions: {e}")
+    print(f"⚠️ Erreur import exceptions: {e}")
+
+# Import des autres modules core
+try:
+    from .database import Database
+    __all__.append('Database')
+    print("✅ Database importé")
+except ImportError as e:
+    print(f"⚠️ Erreur import Database: {e}")
+
+try:
+    from .cache import CacheManager
+    __all__.append('CacheManager')
+    print("✅ CacheManager importé")
+except ImportError as e:
+    print(f"⚠️ Erreur import CacheManager: {e}")
+
+try:
+    from .rate_limiter import RateLimiter
+    __all__.append('RateLimiter')
+    print("✅ RateLimiter importé")
+except ImportError as e:
+    print(f"⚠️ Erreur import RateLimiter: {e}")
+
+try:
+    from .session_manager import SessionManager, get_session_manager
+    __all__.extend(['SessionManager', 'get_session_manager'])
+    print("✅ SessionManager importé")
+except ImportError as e:
+    print(f"⚠️ Erreur import SessionManager: {e}")
+
+def get_available_core_modules():
+    """Retourne la liste des modules core disponibles"""
+    return __all__

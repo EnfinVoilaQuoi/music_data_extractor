@@ -8,9 +8,9 @@ from typing import Optional, Dict, Any, List, Callable
 from pathlib import Path
 
 from config.settings import settings
-from core.database import Database
 from models.entities import Session
-from models.enums import SessionStatus
+from models.enums import SessionStatus  
+from core.database import Database
 
 class SessionManager:
     """Gestionnaire des sessions de travail avec sauvegarde automatique"""

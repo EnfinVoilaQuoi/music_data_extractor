@@ -43,6 +43,9 @@ class Settings:
         except FileNotFoundError:
             print(f"Fichier de config non trouvé: {self.config_file}")
             return self._get_default_config()
+        except Exception as e:
+            print(f"Erreur lors du chargement de la config: {e}")
+            return self._get_default_config()
     
     def _get_default_config(self) -> Dict[str, Any]:
         """Configuration par défaut si le fichier n'existe pas"""
@@ -74,13 +77,34 @@ class Settings:
                 "headless": True,
                 "timeout": 30,
                 "retry_failed_pages": 2,
-                "screenshot_on_error": True
+                "screenshot_on_error": True,
+                "browser": "chrome"
             },
             "performance": {
                 "batch_size": 10,
                 "concurrent_extractions": 3,
                 "cache_expire_days": 7,
                 "max_memory_mb": 512
+            },
+            "rate_limits": {
+                "genius": {
+                    "requests_per_minute": 30,
+                    "requests_per_hour": 1000
+                },
+                "spotify": {
+                    "requests_per_minute": 100,
+                    "requests_per_hour": 3000
+                },
+                "discogs": {
+                    "requests_per_minute": 60,
+                    "requests_per_hour": 1000
+                }
+            },
+            "logging": {
+                "level": "INFO",
+                "file_rotation": True,
+                "max_file_size_mb": 10,
+                "backup_count": 5
             }
         }
     

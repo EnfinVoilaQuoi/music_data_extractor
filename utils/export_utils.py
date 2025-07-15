@@ -13,10 +13,10 @@ try:
 except ImportError:
     PANDAS_AVAILABLE = False
 
-from ..config.settings import settings  # CORRECTION: Import relatif correct
-from ..models.entities import Artist, Track, Album, Credit  # CORRECTION: Import relatif correct
-from ..models.enums import ExportFormat  # CORRECTION: Import relatif correct
-from ..core.exceptions import ExportError, ExportPermissionError, ExportFormatError  # CORRECTION: Import relatif correct
+from config.settings import settings
+from models.entities import Artist, Track, Album, Credit
+from models.enums import ExportFormat
+from core.exceptions import ExportError, ExportPermissionError, ExportFormatError
 
 class ExportManager:
     """

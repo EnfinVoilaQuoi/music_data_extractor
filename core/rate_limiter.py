@@ -6,7 +6,7 @@ from typing import Dict, Optional, Callable, List
 from functools import wraps
 import threading
 
-from ..config.settings import settings  # CORRECTION: import relatif
+from config.settings import settings
 
 class RateLimiter:
     """Gestionnaire de limitations de taux pour les APIs"""
