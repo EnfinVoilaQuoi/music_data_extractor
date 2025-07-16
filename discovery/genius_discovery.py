@@ -1,9 +1,12 @@
-# discovery/genius_discovery.py - Version complète corrigée
+# discovery/genius_discovery.py - Version DEBUG avec correction timezone
 import logging
+import traceback
 from typing import List, Dict, Any, Optional, Set
 from dataclasses import dataclass
 import time
+import re
 from urllib.parse import quote
+from datetime import datetime, timezone
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -46,12 +49,7 @@ class DiscoveryResult:
 class GeniusDiscovery:
     """
     Découverte de morceaux via l'API Genius.
-    
-    Responsabilités :
-    - Recherche d'artistes sur Genius
-    - Découverte de tous leurs morceaux
-    - Extraction des métadonnées de base
-    - Filtrage et validation des résultats
+    Version DEBUG avec gestion d'erreur ultra-robuste et logs détaillés
     """
     
     def __init__(self):
@@ -75,15 +73,37 @@ class GeniusDiscovery:
         self.cache_manager = CacheManager() if CacheManager else None
         self.rate_limiter = RateLimiter(30, 60) if RateLimiter else None
         
+        # Patterns pour SIGNALER (pas filtrer) les battles et freestyles suspects
+        self.warning_patterns = [
+            # Patterns très spécifiques uniquement
+            r'\brap[\s\-]*contenders?\s+(?:battle|vs|versus)\b',
+            r'\brentre\s+dans\s+le\s+cercle\s+(?:battle|vs|versus)\b',
+            r'\bgr[üu]nt\s+(?:battle|vs|versus|freestyle)\b',
+            r'\bbattle\s+(?:rap|hip[\s\-]*hop)\s+(?:vs|versus)\b',
+            r'\brap2france\s+(?:battle|vs|versus)\b',
+            r'\bmusicast\s+(?:battle|freestyle)\b',
+            r'\bdim\s+dak\s+freestyle\b',
+            r'\b(?:eliminatoire|demi[\s\-]*finale|finale)\s+(?:battle|rap)\b',
+            r'\btournoi\s+(?:rap|battle)\b',
+        ]
+        
+        # Compiler les patterns pour performance
+        self.compiled_warning_patterns = [
+            re.compile(pattern, re.IGNORECASE | re.UNICODE)
+            for pattern in self.warning_patterns
+        ]
+        
         # Statistiques
         self.stats = {
             'api_calls': 0,
             'cache_hits': 0,
             'artists_found': 0,
-            'tracks_discovered': 0
+            'tracks_discovered': 0,
+            'tracks_flagged': 0,
+            'errors': 0
         }
         
-        self.logger.info("GeniusDiscovery initialisé avec cache" if self.cache_manager else "GeniusDiscovery initialisé sans cache")
+        self.logger.info("🔍 GeniusDiscovery DEBUG initialisé - logs détaillés activés")
     
     def _create_session(self) -> requests.Session:
         """Crée une session HTTP avec retry automatique"""
@@ -101,151 +121,223 @@ class GeniusDiscovery:
         
         return session
     
-    def discover_artist_tracks(self, artist_name: str, max_tracks: int = 100) -> DiscoveryResult:
-        """
-        Découvre les morceaux d'un artiste sur Genius
-        
-        Args:
-            artist_name: Nom de l'artiste à rechercher
-            max_tracks: Nombre maximum de morceaux à récupérer
-            
-        Returns:
-            DiscoveryResult avec les morceaux trouvés
-        """
+    def _safe_get(self, data: Dict[str, Any], *keys, default=None):
+        """Accès sécurisé aux données imbriquées avec logs debug"""
         try:
-            self.logger.info(f"🔍 Découverte de {artist_name} sur Genius (max {max_tracks} tracks)")
+            current = data
+            path = []
             
-            # Nettoyer le nom de l'artiste
-            clean_name = clean_artist_name(artist_name)
-            self.logger.info(f"Nom nettoyé: '{clean_name}'")
-            
-            # Rechercher l'artiste
-            artist_info = self._search_artist(clean_name)
-            if not artist_info:
-                # Essayer avec le nom original si différent
-                if clean_name != artist_name:
-                    self.logger.info(f"Tentative avec le nom original: '{artist_name}'")
-                    artist_info = self._search_artist(artist_name)
+            for key in keys:
+                path.append(str(key))
+                if not isinstance(current, dict):
+                    self.logger.debug(f"🔍 Accès échec: {' -> '.join(path[:-1])} n'est pas un dict, type: {type(current)}")
+                    return default
                 
-                if not artist_info:
-                    self.logger.warning(f"❌ Artiste '{artist_name}' non trouvé sur Genius")
-                    return DiscoveryResult(
-                        success=False,
-                        error=f"Artiste '{artist_name}' non trouvé sur Genius"
-                    )
+                if key not in current:
+                    self.logger.debug(f"🔍 Clé manquante: {' -> '.join(path)}")
+                    return default
+                
+                current = current[key]
             
-            self.logger.info(f"✅ Artiste trouvé: {artist_info.get('name')} (ID: {artist_info.get('id')})")
-            
-            # Découvrir les morceaux
-            tracks = self._get_artist_songs(artist_info['id'], max_tracks)
-            
-            # Calculer le score de qualité
-            quality_score = self._calculate_quality_score(tracks)
-            
-            result = DiscoveryResult(
-                success=True,
-                tracks=tracks,
-                total_found=len(tracks),
-                source="genius",
-                quality_score=quality_score
-            )
-            
-            self.stats['tracks_discovered'] += len(tracks)
-            self.logger.info(f"🎵 Découverte terminée: {len(tracks)} morceaux trouvés pour {artist_name}")
-            
-            return result
+            self.logger.debug(f"🔍 Accès réussi: {' -> '.join(path)} = {str(current)[:100]}")
+            return current
             
         except Exception as e:
-            self.logger.error(f"❌ Erreur lors de la découverte de {artist_name}: {e}")
+            self.logger.error(f"🔍 Erreur accès données: {' -> '.join(path)} - {e}")
+            return default
+    
+    def _check_battle_warning(self, title: str, artist_name: str = "", album_name: str = "") -> tuple[bool, str]:
+        """Vérifie si un morceau est potentiellement un battle/freestyle SANS le filtrer"""
+        try:
+            combined_text = f"{title} {artist_name} {album_name}".lower()
+            
+            for pattern in self.compiled_warning_patterns:
+                if pattern.search(combined_text):
+                    reason = f"Pattern détecté: {pattern.pattern}"
+                    self.logger.debug(f"⚠️ Morceau SUSPECT: '{title}' - {reason}")
+                    return True, reason
+            
+            return False, ""
+            
+        except Exception as e:
+            self.logger.error(f"🔍 Erreur vérification battle: {e}")
+            return False, f"Erreur vérification: {e}"
+    
+    def discover_artist_tracks(self, artist_name: str, max_tracks: int = 100) -> DiscoveryResult:
+        """Découvre les morceaux d'un artiste avec DEBUG ultra-détaillé"""
+        try:
+            self.logger.info(f"🔍 DEBUG: Début découverte pour '{artist_name}' (max: {max_tracks})")
+            
+            # Étape 1: Rechercher l'artiste
+            self.logger.info("🔍 DEBUG: Étape 1 - Recherche artiste...")
+            artist_data = self._search_artist_debug(artist_name)
+            
+            if not artist_data:
+                error_msg = f"Artiste '{artist_name}' non trouvé sur Genius"
+                self.logger.error(f"🔍 DEBUG: {error_msg}")
+                return DiscoveryResult(success=False, error=error_msg)
+            
+            artist_id = self._safe_get(artist_data, 'id')
+            if not artist_id:
+                error_msg = "ID artiste manquant dans la réponse"
+                self.logger.error(f"🔍 DEBUG: {error_msg}")
+                return DiscoveryResult(success=False, error=error_msg)
+            
+            self.logger.info(f"🔍 DEBUG: Artiste trouvé - ID: {artist_id}, Nom: {self._safe_get(artist_data, 'name', 'N/A')}")
+            
+            # Étape 2: Récupérer les morceaux
+            self.logger.info("🔍 DEBUG: Étape 2 - Récupération morceaux...")
+            songs = self._get_artist_songs_debug(artist_id, max_tracks)
+            
+            self.logger.info(f"🔍 DEBUG: {len(songs)} morceaux bruts récupérés")
+            
+            # Étape 3: Traiter les morceaux
+            self.logger.info("🔍 DEBUG: Étape 3 - Traitement morceaux...")
+            processed_tracks = []
+            suspect_count = 0
+            
+            for i, song_data in enumerate(songs):
+                try:
+                    self.logger.debug(f"🔍 DEBUG: Traitement morceau {i+1}/{len(songs)}")
+                    
+                    # Traiter les données
+                    track_data = self._process_song_data_debug(song_data, artist_name)
+                    
+                    # Vérifier si suspect (sans filtrer)
+                    is_suspect, warning_reason = self._check_battle_warning(
+                        track_data.get('title', ''),
+                        track_data.get('artist_name', ''),
+                        track_data.get('album_name', '')
+                    )
+                    
+                    # Ajouter métadonnées d'avertissement
+                    track_data['battle_warning'] = is_suspect
+                    track_data['warning_reason'] = warning_reason if is_suspect else None
+                    
+                    if is_suspect:
+                        suspect_count += 1
+                        self.logger.info(f"⚠️ Morceau SUSPECT conservé: '{track_data.get('title')}' - {warning_reason}")
+                    
+                    processed_tracks.append(track_data)
+                    
+                except Exception as e:
+                    self.logger.error(f"🔍 DEBUG: Erreur traitement morceau {i+1}: {e}")
+                    self.logger.error(f"🔍 DEBUG: Données morceau: {str(song_data)[:200]}...")
+                    continue
+            
+            self.stats['tracks_discovered'] += len(processed_tracks)
+            self.stats['tracks_flagged'] = suspect_count
+            
+            self.logger.info(f"🔍 DEBUG: Terminé - {len(processed_tracks)} morceaux traités ({suspect_count} flaggés)")
+            
+            return DiscoveryResult(
+                success=True,
+                tracks=processed_tracks,
+                total_found=len(processed_tracks),
+                source="genius"
+            )
+            
+        except Exception as e:
+            self.stats['errors'] += 1
+            error_msg = f"Erreur découverte pour {artist_name}: {e}"
+            self.logger.error(f"🔍 DEBUG: {error_msg}")
+            self.logger.error(f"🔍 DEBUG: Traceback complet:\n{traceback.format_exc()}")
+            
             return DiscoveryResult(
                 success=False,
-                error=str(e)
+                error=str(e)  # Juste l'erreur, pas le préfixe
             )
     
-    def _search_artist(self, artist_name: str) -> Optional[Dict[str, Any]]:
-        """Recherche un artiste sur Genius (principal ET featuring)"""
-        cache_key = f"genius_artist_search_{normalize_text(artist_name)}"
-        
-        # Vérifier le cache
-        if self.cache_manager:
-            cached = self.cache_manager.get(cache_key)
-            if cached:
-                self.stats['cache_hits'] += 1
-                self.logger.info(f"💾 Cache hit pour artiste: {artist_name}")
-                return cached
-        
-        # Rate limiting
-        if self.rate_limiter:
-            self.rate_limiter.wait_if_needed()
-        
-        # Recherche API
+    def _search_artist_debug(self, artist_name: str) -> Optional[Dict[str, Any]]:
+        """Recherche un artiste avec logs debug ultra-détaillés"""
         try:
+            self.logger.info(f"🔍 DEBUG: Recherche API '{artist_name}'")
+            
+            # Rate limiting
+            if self.rate_limiter:
+                self.rate_limiter.wait_if_needed()
+            
             url = f"{self.base_url}/search"
             params = {'q': artist_name}
             
-            self.logger.info(f"🌐 Recherche API Genius: '{artist_name}'")
+            self.logger.debug(f"🔍 DEBUG: URL: {url}, Params: {params}")
+            
             response = self.session.get(url, headers=self.headers, params=params, timeout=30)
             response.raise_for_status()
             
             self.stats['api_calls'] += 1
+            self.logger.debug(f"🔍 DEBUG: Réponse HTTP {response.status_code}")
             
-            data = response.json()
-            hits = data.get('response', {}).get('hits', [])
+            # Parser la réponse JSON
+            try:
+                data = response.json()
+                self.logger.debug(f"🔍 DEBUG: JSON parsé, clés racine: {list(data.keys())}")
+            except Exception as e:
+                raise APIError(f"Erreur parsing JSON: {e}")
             
-            self.logger.info(f"📊 API Genius retourne {len(hits)} résultats")
+            # Accès sécurisé aux données
+            response_data = self._safe_get(data, 'response', default={})
+            if not response_data:
+                self.logger.warning("🔍 DEBUG: Pas de clé 'response' dans la réponse")
+                return None
             
-            # Debug: afficher les premiers résultats
-            for i, hit in enumerate(hits[:3]):
-                result = hit.get('result', {})
-                primary_artist = result.get('primary_artist', {})
-                self.logger.debug(f"  {i+1}. {result.get('title', 'N/A')} - {primary_artist.get('name', 'N/A')}")
+            hits = self._safe_get(response_data, 'hits', default=[])
+            if not hits:
+                self.logger.warning("🔍 DEBUG: Pas de 'hits' dans response")
+                return None
             
-            # Chercher l'artiste dans les résultats (artiste principal ET featuring)
+            self.logger.info(f"🔍 DEBUG: {len(hits)} résultats trouvés")
+            
+            # Chercher l'artiste exact
+            clean_target = clean_artist_name(artist_name).lower()
+            self.logger.debug(f"🔍 DEBUG: Recherche de '{clean_target}'")
+            
             for i, hit in enumerate(hits):
-                result = hit.get('result', {})
-                
-                # Vérifier l'artiste principal
-                if result.get('primary_artist'):
-                    artist = result['primary_artist']
-                    if self._is_matching_artist(artist['name'], artist_name):
-                        self.logger.info(f"🎯 Artiste principal trouvé: {artist['name']} (ID: {artist.get('id')})")
-                        # CORRECTION: expire_days au lieu de expire_hours
-                        if self.cache_manager:
-                            self.cache_manager.set(cache_key, artist, expire_days=1)
+                try:
+                    self.logger.debug(f"🔍 DEBUG: Examen hit {i+1}")
+                    
+                    result = self._safe_get(hit, 'result', default={})
+                    if not result:
+                        self.logger.debug(f"🔍 DEBUG: Hit {i+1} sans 'result'")
+                        continue
+                    
+                    primary_artist = self._safe_get(result, 'primary_artist', default={})
+                    if not primary_artist:
+                        self.logger.debug(f"🔍 DEBUG: Hit {i+1} sans 'primary_artist'")
+                        continue
+                    
+                    artist_name_found = self._safe_get(primary_artist, 'name', default='')
+                    if artist_name_found:
+                        clean_found = clean_artist_name(artist_name_found).lower()
+                        self.logger.debug(f"🔍 DEBUG: Comparaison '{clean_found}' vs '{clean_target}'")
                         
-                        self.stats['artists_found'] += 1
-                        return artist
-                
-                # Vérifier les artistes en featuring
-                featured_artists = result.get('featured_artists', [])
-                for featured in featured_artists:
-                    if self._is_matching_artist(featured['name'], artist_name):
-                        self.logger.info(f"🎯 Artiste en featuring trouvé: {featured['name']} (ID: {featured.get('id')})")
-                        # CORRECTION: expire_days au lieu de expire_hours
-                        if self.cache_manager:
-                            self.cache_manager.set(cache_key, featured, expire_days=1)
-                        
-                        self.stats['artists_found'] += 1
-                        return featured
+                        if clean_found == clean_target:
+                            self.logger.info(f"✅ Artiste trouvé: {artist_name_found}")
+                            self.stats['artists_found'] += 1
+                            return primary_artist
+                    
+                except Exception as e:
+                    self.logger.error(f"🔍 DEBUG: Erreur traitement hit {i+1}: {e}")
+                    continue
             
-            self.logger.warning(f"⚠️ Aucun artiste correspondant trouvé pour: {artist_name}")
+            self.logger.warning(f"🔍 DEBUG: Aucun artiste exact trouvé pour '{artist_name}'")
             return None
             
         except Exception as e:
-            self.logger.error(f"❌ Erreur recherche artiste {artist_name}: {e}")
+            self.logger.error(f"🔍 DEBUG: Erreur recherche artiste: {e}")
+            self.logger.error(f"🔍 DEBUG: Traceback:\n{traceback.format_exc()}")
             raise APIError(f"Erreur API Genius: {e}")
     
-    def _get_artist_songs(self, artist_id: int, max_tracks: int) -> List[Dict[str, Any]]:
-        """Récupère les morceaux d'un artiste (principal ET featuring)"""
+    def _get_artist_songs_debug(self, artist_id: int, max_tracks: int) -> List[Dict[str, Any]]:
+        """Récupère les morceaux avec logs debug"""
         songs = []
         page = 1
         per_page = 50
         
-        self.logger.info(f"🎵 Recherche des morceaux pour l'artiste ID {artist_id}")
+        self.logger.info(f"🔍 DEBUG: Récupération morceaux pour artiste {artist_id}")
         
         while len(songs) < max_tracks:
             try:
-                # Rate limiting
                 if self.rate_limiter:
                     self.rate_limiter.wait_if_needed()
                 
@@ -256,204 +348,116 @@ class GeniusDiscovery:
                     'sort': 'popularity'
                 }
                 
-                self.logger.info(f"📄 Récupération page {page} (jusqu'à {params['per_page']} morceaux)")
+                self.logger.debug(f"🔍 DEBUG: Page {page}, URL: {url}")
+                
                 response = self.session.get(url, headers=self.headers, params=params, timeout=30)
                 response.raise_for_status()
                 
                 self.stats['api_calls'] += 1
                 
                 data = response.json()
-                page_songs = data.get('response', {}).get('songs', [])
+                response_data = self._safe_get(data, 'response', default={})
+                page_songs = self._safe_get(response_data, 'songs', default=[])
                 
                 if not page_songs:
-                    self.logger.info(f"📄 Aucun morceau trouvé à la page {page}, arrêt")
+                    self.logger.info(f"🔍 DEBUG: Aucun morceau page {page}")
                     break
                 
-                self.logger.info(f"📄 Page {page}: {len(page_songs)} morceaux trouvés")
-                
-                # Filtrer et convertir les morceaux
-                for song in page_songs:
-                    if len(songs) >= max_tracks:
-                        break
-                    
-                    processed_song = self._process_song_data(song)
-                    if processed_song:
-                        songs.append(processed_song)
-                        self.logger.debug(f"  ✅ Morceau ajouté: {processed_song.get('title')}")
+                songs.extend(page_songs)
+                self.logger.info(f"🔍 DEBUG: Page {page}: +{len(page_songs)} morceaux (total: {len(songs)})")
                 
                 page += 1
-                time.sleep(0.5)  # Délai entre les requêtes (plus conservateur)
+                time.sleep(0.5)
                 
             except Exception as e:
-                self.logger.error(f"❌ Erreur récupération morceaux page {page}: {e}")
+                self.logger.error(f"🔍 DEBUG: Erreur page {page}: {e}")
                 break
         
-        self.logger.info(f"🎵 Total de {len(songs)} morceaux récupérés pour l'artiste {artist_id}")
+        self.logger.info(f"🔍 DEBUG: Total récupéré: {len(songs)} morceaux")
         return songs
     
-    def _process_song_data(self, song_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Traite les données d'un morceau depuis l'API Genius"""
+    def _process_song_data_debug(self, song_data: Dict[str, Any], artist_name: str) -> Dict[str, Any]:
+        """Traite les données d'un morceau avec logs debug"""
         try:
-            # Filtrer les morceaux non pertinents
-            if not self._is_valid_song(song_data):
-                return None
+            self.logger.debug(f"🔍 DEBUG: Traitement morceau, clés: {list(song_data.keys())}")
             
-            # Extraire les informations
-            processed = {
-                'title': song_data.get('title', '').strip(),
-                'artist_name': song_data.get('primary_artist', {}).get('name', '').strip(),
-                'genius_id': str(song_data.get('id', '')),
-                'genius_url': song_data.get('url', ''),
-                'release_date': song_data.get('release_date_for_display'),
+            # Extractions sécurisées
+            title = self._safe_get(song_data, 'title', default='').strip()
+            genius_id = self._safe_get(song_data, 'id')
+            genius_url = self._safe_get(song_data, 'url', default='')
+            
+            primary_artist = self._safe_get(song_data, 'primary_artist', default={})
+            album = self._safe_get(song_data, 'album')
+            
+            # Featured artists
+            featured_artists = []
+            featured_list = self._safe_get(song_data, 'featured_artists', default=[])
+            if isinstance(featured_list, list):
+                for fa in featured_list:
+                    if isinstance(fa, dict):
+                        fa_name = self._safe_get(fa, 'name')
+                        if fa_name:
+                            featured_artists.append(fa_name)
+            
+            # Album name
+            album_name = ''
+            if isinstance(album, dict):
+                album_name = self._safe_get(album, 'name', default='')
+            
+            # Stats
+            stats = self._safe_get(song_data, 'stats', default={})
+            page_views = None
+            hot = False
+            if isinstance(stats, dict):
+                page_views = self._safe_get(stats, 'pageviews')
+                hot = self._safe_get(stats, 'hot', default=False)
+            
+            track_data = {
+                'title': title,
+                'artist_name': artist_name,
+                'genius_id': genius_id,
+                'genius_url': genius_url,
+                'release_date': self._safe_get(song_data, 'release_date_for_display'),
+                'album_name': album_name,
+                'featured_artists': featured_artists,
+                'primary_artist_id': self._safe_get(primary_artist, 'id') if isinstance(primary_artist, dict) else None,
+                'primary_artist_name': self._safe_get(primary_artist, 'name', default='') if isinstance(primary_artist, dict) else '',
+                'page_views': page_views,
+                'hot': hot,
+                'song_art_image_url': self._safe_get(song_data, 'song_art_image_url', default=''),
+                'header_image_url': self._safe_get(song_data, 'header_image_url', default=''),
+                'battle_warning': False,
+                'warning_reason': None,
+            }
+            
+            self.logger.debug(f"🔍 DEBUG: Morceau traité: '{title}'")
+            return track_data
+            
+        except Exception as e:
+            self.logger.error(f"🔍 DEBUG: Erreur traitement morceau: {e}")
+            self.logger.error(f"🔍 DEBUG: Données: {str(song_data)[:300]}")
+            
+            # Retour minimal pour continuer
+            return {
+                'title': self._safe_get(song_data, 'title', default='Titre inconnu'),
+                'artist_name': artist_name,
+                'genius_id': self._safe_get(song_data, 'id'),
+                'genius_url': self._safe_get(song_data, 'url', default=''),
                 'featured_artists': [],
-                'album_name': None,
-                'source': DataSource.GENIUS
+                'album_name': '',
+                'release_date': None,
+                'primary_artist_id': None,
+                'primary_artist_name': '',
+                'page_views': None,
+                'hot': False,
+                'song_art_image_url': '',
+                'header_image_url': '',
+                'battle_warning': False,
+                'warning_reason': None,
             }
-            
-            # Album
-            album = song_data.get('album')
-            if album:
-                processed['album_name'] = album.get('name', '').strip()
-            
-            # Artistes en featuring
-            featured_artists = song_data.get('featured_artists', [])
-            if featured_artists:
-                processed['featured_artists'] = [
-                    artist.get('name', '').strip() 
-                    for artist in featured_artists
-                ]
-            
-            return processed
-            
-        except Exception as e:
-            self.logger.error(f"❌ Erreur traitement morceau: {e}")
-            return None
-    
-    def _is_valid_song(self, song_data: Dict[str, Any]) -> bool:
-        """Vérifie si un morceau est valide pour l'extraction"""
-        # Vérifier que c'est bien un morceau (pas un album ou autre)
-        if not song_data.get('primary_artist'):
-            return False
-        
-        # Vérifier qu'il y a un titre
-        title = song_data.get('title', '').strip()
-        if not title:
-            return False
-        
-        # Filtrer les types non désirés (annotations, etc.)
-        song_type = song_data.get('_type', '')
-        if song_type in ['annotation', 'album']:
-            return False
-        
-        # Filtrer les titres suspects (souvent des erreurs)
-        suspicious_patterns = [
-            'track list',
-            'tracklist',
-            'album art',
-            'credits',
-            'liner notes'
-        ]
-        
-        title_lower = title.lower()
-        for pattern in suspicious_patterns:
-            if pattern in title_lower:
-                return False
-        
-        return True
-    
-    def _is_matching_artist(self, api_name: str, search_name: str) -> bool:
-        """Vérifie si le nom d'artiste de l'API correspond à la recherche"""
-        if not api_name or not search_name:
-            return False
-        
-        # Normaliser les noms pour la comparaison
-        api_normalized = normalize_text(api_name).lower()
-        search_normalized = normalize_text(search_name).lower()
-        
-        # Correspondance exacte
-        if api_normalized == search_normalized:
-            return True
-        
-        # Correspondance partielle (pour gérer les variations)
-        if search_normalized in api_normalized or api_normalized in search_normalized:
-            return True
-        
-        # Correspondance avec séparateurs différents
-        api_no_separators = api_normalized.replace(' ', '').replace('-', '').replace('_', '')
-        search_no_separators = search_normalized.replace(' ', '').replace('-', '').replace('_', '')
-        
-        if api_no_separators == search_no_separators:
-            return True
-        
-        return False
-    
-    def _calculate_quality_score(self, tracks: List[Dict[str, Any]]) -> float:
-        """Calcule un score de qualité pour les morceaux découverts"""
-        if not tracks:
-            return 0.0
-        
-        score = 0.0
-        total_tracks = len(tracks)
-        
-        for track in tracks:
-            track_score = 0.0
-            
-            # Points pour les métadonnées disponibles
-            if track.get('title'):
-                track_score += 1.0
-            if track.get('album_name'):
-                track_score += 0.5
-            if track.get('release_date'):
-                track_score += 0.5
-            if track.get('genius_url'):
-                track_score += 0.3
-            if track.get('featured_artists'):
-                track_score += 0.2
-            
-            # Score maximum par track: 2.5
-            score += min(track_score, 2.5)
-        
-        # Score final sur 100
-        max_possible_score = total_tracks * 2.5
-        return (score / max_possible_score) * 100 if max_possible_score > 0 else 0.0
-    
-    def debug_search_artist(self, artist_name: str) -> Dict[str, Any]:
-        """Méthode de debug pour voir ce que retourne Genius"""
-        try:
-            url = f"{self.base_url}/search"
-            params = {'q': artist_name}
-            
-            response = self.session.get(url, headers=self.headers, params=params, timeout=30)
-            response.raise_for_status()
-            
-            data = response.json()
-            hits = data.get('response', {}).get('hits', [])
-            
-            debug_info = {
-                'search_query': artist_name,
-                'total_hits': len(hits),
-                'results': []
-            }
-            
-            for i, hit in enumerate(hits[:10]):  # Seulement les 10 premiers
-                result = hit.get('result', {})
-                debug_info['results'].append({
-                    'index': i,
-                    'title': result.get('title', 'N/A'),
-                    'primary_artist': result.get('primary_artist', {}).get('name', 'N/A'),
-                    'primary_artist_id': result.get('primary_artist', {}).get('id', 'N/A'),
-                    'featured_artists': [fa.get('name') for fa in result.get('featured_artists', [])],
-                    'type': result.get('_type', 'N/A'),
-                    'url': result.get('url', 'N/A')
-                })
-            
-            return debug_info
-            
-        except Exception as e:
-            return {'error': str(e)}
     
     def get_stats(self) -> Dict[str, Any]:
-        """Retourne les statistiques d'utilisation"""
+        """Retourne les statistiques"""
         return self.stats.copy()
     
     def reset_stats(self):
@@ -462,6 +466,7 @@ class GeniusDiscovery:
             'api_calls': 0,
             'cache_hits': 0,
             'artists_found': 0,
-            'tracks_discovered': 0
+            'tracks_discovered': 0,
+            'tracks_flagged': 0,
+            'errors': 0
         }
-        self.logger.info("Statistiques GeniusDiscovery remises à zéro")

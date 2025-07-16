@@ -10,6 +10,87 @@ from typing import Dict, List, Any, Optional
 import json
 import os
 
+if 'debug_initialized' not in st.session_state:
+    import os
+    import logging
+    os.environ['MDE_DEBUG'] = 'true'
+    logging.basicConfig(level=logging.DEBUG)
+    print("🔍 MODE DEBUG ACTIVÉ - Logs détaillés ci-dessous")
+    st.session_state.debug_initialized = True
+
+def safe_calculate_age(session_datetime):
+    """
+    Calcule l'âge d'une session de manière sécurisée pour éviter les erreurs timezone
+    
+    Args:
+        session_datetime: datetime de création/mise à jour de la session
+        
+    Returns:
+        timedelta: Âge de la session ou timedelta(0) en cas d'erreur
+    """
+    if not session_datetime:
+        return timedelta(0)
+    
+    try:
+        # Import conditionnel du gestionnaire de timezone
+        try:
+            from utils.timezone_utils import now_france, to_france_timezone
+            current_time = now_france()
+            # S'assurer que les deux datetimes ont le même timezone
+            normalized_session_time = to_france_timezone(session_datetime)
+        except ImportError:
+            # Fallback : utiliser datetime naive
+            current_time = datetime.now()
+            # Retirer la timezone si présente pour éviter le conflit
+            if session_datetime.tzinfo:
+                normalized_session_time = session_datetime.replace(tzinfo=None)
+            else:
+                normalized_session_time = session_datetime
+        
+        # Calculer l'âge
+        age = current_time - normalized_session_time
+        return age if age.total_seconds() >= 0 else timedelta(0)
+        
+    except Exception as e:
+        print(f"⚠️ Erreur calcul âge session: {e}")
+        return timedelta(0)
+
+def format_age(age_timedelta):
+    """
+    Formate un timedelta en chaîne lisible
+    
+    Args:
+        age_timedelta: timedelta à formater
+        
+    Returns:
+        str: Âge formaté (ex: "2h 30m", "1j 3h", "quelques secondes")
+    """
+    if not age_timedelta or age_timedelta.total_seconds() < 1:
+        return "quelques secondes"
+    
+    total_seconds = int(age_timedelta.total_seconds())
+    
+    # Calculs
+    days = total_seconds // 86400
+    hours = (total_seconds % 86400) // 3600
+    minutes = (total_seconds % 3600) // 60
+    
+    # Formatage
+    if days > 0:
+        if hours > 0:
+            return f"{days}j {hours}h"
+        else:
+            return f"{days}j"
+    elif hours > 0:
+        if minutes > 0:
+            return f"{hours}h {minutes}m"
+        else:
+            return f"{hours}h"
+    elif minutes > 0:
+        return f"{minutes}m"
+    else:
+        return "quelques secondes"
+
 # Configuration de la page
 st.set_page_config(
     page_title="Music Data Extractor",
@@ -658,7 +739,7 @@ class StreamlitInterface:
                         
                         with sol_col1:
                             if st.button("🔄 **Relancer extraction simple**", use_container_width=True):
-                                self.start_simple_extraction(artist_name, kwargs)
+                                self.start_simplified_extraction(artist_name, kwargs)
                                 return
                         
                         with sol_col2:
@@ -1372,8 +1453,8 @@ class StreamlitInterface:
                 
                 with col4:
                     if session.created_at:
-                        age = datetime.now() - session.created_at
-                        st.write(f"{age.days}j {age.seconds//3600}h")
+                        age = safe_calculate_age(session.created_at)
+                        st.write(format_age(age))
                     else:
                         st.write("Date inconnue")
                 
@@ -1475,7 +1556,7 @@ class StreamlitInterface:
                 st.markdown(f"`{session.created_at.strftime('%d/%m/%Y à %H:%M')}`")
                 
                 # Calcul de l'âge
-                age = datetime.now() - session.created_at
+                age = safe_calculate_age(session.created_at)
                 days = age.days
                 hours = age.seconds // 3600
                 st.caption(f"Il y a {days} jour(s) et {hours} heure(s)")
@@ -2030,8 +2111,8 @@ class StreamlitInterface:
                     
                     with col2:
                         if session.created_at:
-                            age = datetime.now() - session.created_at
-                            st.write(f"Âge: {age.days}j {age.seconds//3600}h")
+                            age = safe_calculate_age(session.created_at)
+                            st.write(format_age(age))
                         else:
                             st.write("Âge: Inconnu")
                     
@@ -3039,3 +3120,101 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+def create_session_safe(self, artist_name: str, metadata: dict = None) -> str:
+    """Création de session sécurisée qui évite le freeze"""
+    print(f"🔍 DÉBUT create_session_safe pour {artist_name}")
+    
+    # ÉVITER COMPLÈTEMENT le SessionManager - Aller directement au fallback
+    st.info("ℹ️ Utilisation du mode session temporaire (plus stable)")
+    
+    # Session temporaire de fallback DIRECTEMENT
+    import uuid, time
+    session_id = f"temp_{int(time.time())}_{str(uuid.uuid4())[:8]}"
+    
+    if 'temp_sessions' not in st.session_state:
+        st.session_state.temp_sessions = {}
+    
+    st.session_state.temp_sessions[session_id] = {
+        'id': session_id,
+        'artist_name': artist_name,
+        'status': 'in_progress',
+        'created_at': time.time(),
+        'metadata': metadata or {}
+    }
+    
+    print(f"✅ Session temporaire créée: {session_id}")
+    return session_id
+
+def start_simplified_extraction(self, artist_name: str, kwargs: dict):
+    """Version simplifiée de l'extraction qui évite les blocages"""
+    st.header(f"🎵 Extraction pour {artist_name}")
+    
+    # Étape 1: Session
+    st.markdown("### 📝 Étape 1/3 : Initialisation")
+    with st.spinner("Création de la session..."):
+        try:
+            session_id = self.create_session_safe(artist_name, {
+                "max_tracks": kwargs.get('max_tracks', 100),
+                "interface": "streamlit_simplified"
+            })
+            st.success(f"✅ Session créée: {session_id[:12]}")
+        except Exception as e:
+            st.error(f"❌ Impossible de créer la session: {e}")
+            return
+    
+    # Étape 2: Découverte
+    st.markdown("### 🔍 Étape 2/3 : Découverte des morceaux")
+    discovery_progress = st.progress(0, text="Recherche en cours...")
+    
+    try:
+        with st.spinner("Recherche des morceaux..."):
+            discovery_progress.progress(0.3, text="Interrogation de Genius...")
+            time.sleep(0.5)
+            
+            tracks, stats = st.session_state.discovery_step.discover_artist_tracks(
+                artist_name=artist_name,
+                session_id=session_id,
+                max_tracks=kwargs.get('max_tracks', 100)
+            )
+            
+            discovery_progress.progress(1.0, text="Découverte terminée")
+            
+            if tracks and len(tracks) > 0:
+                st.success(f"🎉 {len(tracks)} morceaux trouvés !")
+                
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Morceaux", len(tracks))
+                with col2:
+                    flagged = len([t for t in tracks if t.get('battle_warning', False)])
+                    st.metric("Suspects", flagged)
+                with col3:
+                    st.metric("Sources", 1)
+            else:
+                st.warning("⚠️ Aucun morceau trouvé")
+                return
+                
+    except Exception as e:
+        st.error(f"❌ Erreur lors de la découverte: {e}")
+        return
+    
+    # Étape 3: Finalisation
+    st.markdown("### ✅ Étape 3/3 : Finalisation")
+    
+    if st.button("📊 **Terminer l'extraction**", type="primary"):
+        try:
+            if 'temp_sessions' in st.session_state and session_id in st.session_state.temp_sessions:
+                st.success("✅ Session temporaire terminée")
+                del st.session_state.temp_sessions[session_id]
+            else:
+                st.session_state.session_manager.complete_session(session_id, {
+                    'tracks_found': len(tracks),
+                    'completed_via': 'simplified_interface'
+                })
+                st.success("✅ Session sauvegardée")
+            
+            st.info("💡 Consultez la section 'Sessions' pour voir les détails")
+            
+        except Exception as e:
+            st.warning(f"⚠️ Erreur sauvegarde: {e}")
