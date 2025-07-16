@@ -164,20 +164,16 @@ class DiscoveryStep:
     
     def _get_or_create_artist(self, artist_name: str) -> Artist:
         """Récupère ou crée un artiste en base"""
-        # Chercher l'artiste existant
         artist = self.database.get_artist_by_name(artist_name)
-        
+    
         if not artist:
-            # Créer un nouvel artiste
             artist = Artist(
                 name=artist_name,
-                normalized_name=normalize_text(artist_name),
-                extraction_status=ExtractionStatus.IN_PROGRESS,
                 created_at=datetime.now()
             )
             artist = self.database.save_artist(artist)
             self.logger.info(f"✨ Nouvel artiste créé: {artist_name}")
-        
+    
         return artist
     
     def _convert_genius_tracks(self, genius_tracks: List[Dict[str, Any]], artist_id: int) -> List[Track]:
