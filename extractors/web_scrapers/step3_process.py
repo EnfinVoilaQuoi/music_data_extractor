@@ -1,4 +1,4 @@
-# extractors/step3_process.py
+# extractors/web_scrapers/step3_process.py
 """Alias pour compatibilité avec l'ancienne structure"""
 
 try:
