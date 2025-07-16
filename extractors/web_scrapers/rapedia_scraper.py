@@ -15,7 +15,7 @@ from ...core.exceptions import ScrapingError, PageNotFoundError, ElementNotFound
 from ...core.rate_limiter import RateLimiter
 from ...core.cache import CacheManager
 from ...config.settings import settings
-from ...utils.text_utils import clean_text, normalize_title, clean_artist_name
+from ...utils.text_utils import normalize_text, normalize_text, clean_artist_name
 from ...models.enums import DataSource, CreditType, CreditCategory
 
 class RapediaScraper:
@@ -173,7 +173,7 @@ class RapediaScraper:
                     
                     # Extraction du nom de l'artiste
                     name_element = link.find(['h1', 'h2', 'h3', 'span', 'div'])
-                    artist_name = clean_text(name_element.get_text()) if name_element else clean_text(link.get_text())
+                    artist_name = normalize_text(name_element.get_text()) if name_element else normalize_text(link.get_text())
                     
                     if artist_name and url:
                         result = {
@@ -186,7 +186,7 @@ class RapediaScraper:
                         # Extraction d'informations supplémentaires si disponibles
                         desc_element = item.find(class_=re.compile(r'description|bio|summary', re.I))
                         if desc_element:
-                            result['description'] = clean_text(desc_element.get_text())
+                            result['description'] = normalize_text(desc_element.get_text())
                         
                         results.append(result)
                         
@@ -268,7 +268,7 @@ class RapediaScraper:
                 track_links = soup.find_all('a', href=re.compile(r'/titre/|/track/|/song/|/morceau/'))
                 for link in track_links:
                     track_url = urljoin(base_url, link.get('href', ''))
-                    track_title = clean_text(link.get_text())
+                    track_title = normalize_text(link.get_text())
                     
                     if track_title and track_url:
                         track_data = self.scrape_track_details(track_url)
@@ -346,25 +346,25 @@ class RapediaScraper:
             title_selectors = ['h1', '.track-title', '.song-title', '.titre']
             title = self._extract_with_selectors(soup, title_selectors)
             if title:
-                track_data['title'] = clean_text(title)
+                track_data['title'] = normalize_text(title)
             
             # Extraction de l'artiste
             artist_selectors = ['.artist-name', '.artiste', '.artist', 'h2']
             artist = self._extract_with_selectors(soup, artist_selectors)
             if artist:
-                track_data['artist'] = clean_text(artist)
+                track_data['artist'] = normalize_text(artist)
             
             # Extraction de l'album
             album_selectors = ['.album-name', '.album', '.album-title']
             album = self._extract_with_selectors(soup, album_selectors)
             if album:
-                track_data['album'] = clean_text(album)
+                track_data['album'] = normalize_text(album)
             
             # Extraction de la date de sortie
             date_selectors = ['.release-date', '.date', '.sortie']
             release_date = self._extract_with_selectors(soup, date_selectors)
             if release_date:
-                track_data['release_date'] = clean_text(release_date)
+                track_data['release_date'] = normalize_text(release_date)
             
             # Extraction des crédits - c'est la partie la plus importante
             credits_section = soup.find(['div', 'section'], class_=re.compile(r'credit|prod|info', re.I))
@@ -381,7 +381,7 @@ class RapediaScraper:
             # Extraction des paroles si disponibles
             lyrics_section = soup.find(['div', 'section'], class_=re.compile(r'lyrics|paroles', re.I))
             if lyrics_section:
-                lyrics = clean_text(lyrics_section.get_text())
+                lyrics = normalize_text(lyrics_section.get_text())
                 if lyrics and len(lyrics) > 50:  # Filtrer les faux positifs
                     track_data['lyrics'] = lyrics
             
@@ -405,7 +405,7 @@ class RapediaScraper:
             # Extraction du titre depuis la section
             title_element = section.find(['h1', 'h2', 'h3', 'h4', 'a'])
             if title_element:
-                track_data['title'] = clean_text(title_element.get_text())
+                track_data['title'] = normalize_text(title_element.get_text())
                 
                 # Si c'est un lien, récupérer l'URL pour plus de détails
                 if title_element.name == 'a':
@@ -437,7 +437,7 @@ class RapediaScraper:
             for credit_list in credit_lists:
                 list_items = credit_list.find_all(['li', 'dt', 'dd'])
                 for item in list_items:
-                    item_text = clean_text(item.get_text())
+                    item_text = normalize_text(item.get_text())
                     if item_text:
                         parsed_credits = self._parse_credit_text(item_text)
                         credits.extend(parsed_credits)
@@ -568,7 +568,7 @@ class RapediaScraper:
             try:
                 element = soup.select_one(selector)
                 if element:
-                    text = clean_text(element.get_text())
+                    text = normalize_text(element.get_text())
                     if text:
                         return text
             except Exception:

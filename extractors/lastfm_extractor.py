@@ -8,10 +8,10 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from .base_extractor import BaseExtractor, ExtractionResult, ExtractorConfig
-from ..models.enums import ExtractorType, DataSource
-from ..core.exceptions import ExtractionError, RateLimitError, ValidationError
-from ..config.settings import settings
-from ..utils.text_utils import clean_text, normalize_title
+from models.enums import ExtractorType, DataSource
+from core.exceptions import ExtractionError, RateLimitError, ValidationError
+from config.settings import settings
+from utils.text_utils import clean_text, normalize_title
 
 
 class LastFMExtractor(BaseExtractor):

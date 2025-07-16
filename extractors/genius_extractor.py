@@ -12,11 +12,11 @@ from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
 from .base_extractor import BaseExtractor, ExtractionResult, ExtractorConfig
-from ..models.enums import ExtractorType, CreditType, DataSource
-from ..models.entities import Track, Album, Artist, Credit
-from ..core.exceptions import ExtractionError, RateLimitError, ValidationError
-from ..config.settings import settings
-from ..utils.text_utils import clean_text, extract_featuring_artists, normalize_title
+from models.enums import ExtractorType, CreditType, DataSource
+from models.entities import Track, Album, Artist, Credit
+from core.exceptions import ExtractionError, APIRateLimitError, DataValidationError
+from config.settings import settings
+from utils.text_utils import normalize_text, extract_featuring_artists, clean_track_title
 
 
 class GeniusExtractor(BaseExtractor):
@@ -790,4 +790,11 @@ class GeniusExtractor(BaseExtractor):
                 'genius_id': result.get('id'),
                 'title': result.get('title'),
                 'artist': result.get('primary_artist', {}).get('name'),
-                'artist_id': result.get('primary
+                'artist_id': result.get('primary_artist', {}).get('id'),
+                'url': result.get('url'),
+                'path': result.get('path'),
+                'header_image': result.get('header_image_thumbnail_url')
+            }
+
+            processed.append(processed_result)
+        return processed

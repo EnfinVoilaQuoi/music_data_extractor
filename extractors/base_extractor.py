@@ -5,12 +5,12 @@ from dataclasses import dataclass
 import logging
 from datetime import datetime, timedelta
 
-from ..models.entities import Track, Album, Artist, Credit
-from ..models.enums import CreditType, ExtractorType, DataQuality
-from ..core.exceptions import ExtractionError, RateLimitError, ValidationError
-from ..core.cache import CacheManager
-from ..core.rate_limiter import RateLimiter
-from ..config.settings import settings
+from models.entities import Track, Album, Artist, Credit
+from models.enums import CreditType, ExtractorType, DataQuality
+from core.exceptions import ExtractionError, APIRateLimitError, DataValidationError
+from core.cache import CacheManager
+from core.rate_limiter import RateLimiter
+from config.settings import settings
 
 
 @dataclass

@@ -13,7 +13,7 @@ from ...core.exceptions import ExtractionError, RateLimitError
 from ...core.cache import CacheManager
 from ...core.rate_limiter import RateLimiter
 from ...config.settings import settings
-from ...utils.text_utils import clean_text, normalize_title
+from ...utils.text_utils import normalize_text, normalize_text
 
 
 class SongBPMScraper:
@@ -208,7 +208,7 @@ class SongBPMScraper:
             # Titre du morceau
             title_elem = container.find(['h2', 'h3', 'h4']) or container.find('a', class_=re.compile(r'title|name|track'))
             if title_elem:
-                result_data['title'] = clean_text(title_elem.get_text())
+                result_data['title'] = normalize_text(title_elem.get_text())
                 
                 # URL du morceau
                 link = title_elem.find('a') or title_elem
@@ -223,7 +223,7 @@ class SongBPMScraper:
                     artist_text = artist_elem.get_text()
                 else:
                     artist_text = str(artist_elem)
-                result_data['artist'] = clean_text(artist_text.replace('by', '').strip())
+                result_data['artist'] = normalize_text(artist_text.replace('by', '').strip())
             
             # BPM (si visible dans les résultats)
             bpm_elem = container.find(text=re.compile(r'\d+\s*bpm', re.IGNORECASE))
@@ -256,7 +256,7 @@ class SongBPMScraper:
             
             for link in all_links[:10]:  # Limiter à 10 pour éviter le spam
                 href = link.get('href', '')
-                text = clean_text(link.get_text())
+                text = normalize_text(link.get_text())
                 
                 if len(text) > 5 and href.startswith('/'):  # Filtres basiques
                     result_data = {
@@ -276,8 +276,8 @@ class SongBPMScraper:
         if not search_results:
             return None
         
-        target_artist_norm = normalize_title(target_artist)
-        target_title_norm = normalize_title(target_title)
+        target_artist_norm = normalize_text(target_artist)
+        target_title_norm = normalize_text(target_title)
         
         best_match = None
         best_score = 0.0
@@ -286,12 +286,12 @@ class SongBPMScraper:
             score = 0.0
             
             # Score basé sur le titre
-            result_title_norm = normalize_title(result.get('title', ''))
+            result_title_norm = normalize_text(result.get('title', ''))
             title_similarity = self._calculate_similarity(result_title_norm, target_title_norm)
             score += title_similarity * 0.6
             
             # Score basé sur l'artiste
-            result_artist_norm = normalize_title(result.get('artist', ''))
+            result_artist_norm = normalize_text(result.get('artist', ''))
             artist_similarity = self._calculate_similarity(result_artist_norm, target_artist_norm)
             score += artist_similarity * 0.4
             
@@ -353,14 +353,14 @@ class SongBPMScraper:
             # Titre et artiste depuis le titre de la page ou les headers
             title_elem = soup.find('h1') or soup.find('title')
             if title_elem:
-                title_text = clean_text(title_elem.get_text())
+                title_text = normalize_text(title_elem.get_text())
                 details['page_title'] = title_text
                 
                 # Essayer d'extraire artiste et titre
                 if ' - ' in title_text:
                     parts = title_text.split(' - ', 1)
-                    details['artist'] = clean_text(parts[0])
-                    details['title'] = clean_text(parts[1].replace(' | SongBPM', ''))
+                    details['artist'] = normalize_text(parts[0])
+                    details['title'] = normalize_text(parts[1].replace(' | SongBPM', ''))
             
             # BPM - plusieurs patterns possibles
             bpm_patterns = [
@@ -390,7 +390,7 @@ class SongBPMScraper:
             for pattern in key_patterns:
                 key_match = re.search(pattern, page_text, re.IGNORECASE)
                 if key_match:
-                    details['key'] = clean_text(key_match.group(1))
+                    details['key'] = normalize_text(key_match.group(1))
                     break
             
             # Durée
@@ -418,20 +418,20 @@ class SongBPMScraper:
                 # Chercher le texte suivant qui pourrait être le genre
                 parent = genre_elem.parent if hasattr(genre_elem, 'parent') else None
                 if parent:
-                    genre_text = clean_text(parent.get_text())
+                    genre_text = normalize_text(parent.get_text())
                     genre_match = re.search(r'(?:genre|style)[:\s]*([^,\n]+)', genre_text, re.IGNORECASE)
                     if genre_match:
-                        details['genre'] = clean_text(genre_match.group(1))
+                        details['genre'] = normalize_text(genre_match.group(1))
             
             # Album (si mentionné)
             album_elem = soup.find(text=re.compile(r'album', re.IGNORECASE))
             if album_elem:
                 parent = album_elem.parent if hasattr(album_elem, 'parent') else None
                 if parent:
-                    album_text = clean_text(parent.get_text())
+                    album_text = normalize_text(parent.get_text())
                     album_match = re.search(r'album[:\s]*([^,\n]+)', album_text, re.IGNORECASE)
                     if album_match:
-                        details['album'] = clean_text(album_match.group(1))
+                        details['album'] = normalize_text(album_match.group(1))
             
             # Année de sortie
             year_match = re.search(r'(?:year|released?)[:\s]*(\d{4})', page_text, re.IGNORECASE)
@@ -441,7 +441,7 @@ class SongBPMScraper:
             # Label/Maison de disques
             label_match = re.search(r'(?:label|record label)[:\s]*([^,\n]+)', page_text, re.IGNORECASE)
             if label_match:
-                details['label'] = clean_text(label_match.group(1))
+                details['label'] = normalize_text(label_match.group(1))
             
         except Exception as e:
             self.logger.warning(f"Erreur lors du parsing des détails: {e}")
@@ -463,16 +463,16 @@ class SongBPMScraper:
         # Correspondance artiste
         if result.get('artist'):
             artist_similarity = self._calculate_similarity(
-                normalize_title(result['artist']),
-                normalize_title(target_artist)
+                normalize_text(result['artist']),
+                normalize_text(target_artist)
             )
             score += artist_similarity * 0.2
         
         # Correspondance titre
         if result.get('title'):
             title_similarity = self._calculate_similarity(
-                normalize_title(result['title']),
-                normalize_title(target_title)
+                normalize_text(result['title']),
+                normalize_text(target_title)
             )
             score += title_similarity * 0.2
         

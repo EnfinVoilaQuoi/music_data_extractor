@@ -7,11 +7,11 @@ from dataclasses import dataclass
 import re
 
 from .base_extractor import BaseExtractor, ExtractionResult, ExtractorConfig
-from ..models.enums import ExtractorType, CreditType, CreditCategory, DataSource, DataQuality
-from ..models.entities import Track, Credit
-from ..core.exceptions import ExtractionError, DataValidationError
-from ..config.settings import settings
-from ..utils.text_utils import clean_text, normalize_title, clean_credit_role
+from models.enums import ExtractorType, CreditType, CreditCategory, DataSource, DataQuality
+from models.entities import Track, Credit
+from core.exceptions import ExtractionError, DataValidationError
+from config.settings import settings
+from utils.text_utils import normalize_text, normalize_text, normalize_text
 
 @dataclass
 class CreditMatch:
@@ -566,4 +566,5 @@ class CreditExtractor(BaseExtractor):
             CreditType.FEATURING: CreditCategory.FEATURING,
             CreditType.RAP: CreditCategory.VOCAL,
             CreditType.GUITAR: CreditCategory.INSTRUMENT,
-            CreditType.PIANO: CreditCategory
+            CreditType.PIANO: CreditCategory.INSTRUMENT
+        }

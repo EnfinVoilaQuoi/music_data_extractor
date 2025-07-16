@@ -9,10 +9,10 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from .base_extractor import BaseExtractor, ExtractionResult, ExtractorConfig
-from ..models.enums import ExtractorType, DataSource
-from ..core.exceptions import APIError, APIRateLimitError, APIAuthenticationError
-from ..config.settings import settings
-from ..utils.text_utils import clean_artist_name, normalize_title, extract_year_from_date
+from models.enums import ExtractorType, DataSource
+from core.exceptions import APIError, APIRateLimitError, APIAuthenticationError
+from config.settings import settings
+from utils.text_utils import clean_artist_name, normalize_text, extract_year_from_text
 
 class SpotifyExtractor(BaseExtractor):
     """
@@ -545,7 +545,7 @@ class SpotifyExtractor(BaseExtractor):
             # Extraire l'année de sortie
             release_date = album.get('release_date')
             if release_date:
-                processed['release_year'] = extract_year_from_date(release_date)
+                processed['release_year'] = extract_year_from_text(release_date)
         
         # Audio features (si disponibles)
         audio_features = track_data.get('audio_features', {})
@@ -611,7 +611,7 @@ class SpotifyExtractor(BaseExtractor):
         
         # Extraire l'année
         if album_data.get('release_date'):
-            processed['release_year'] = extract_year_from_date(album_data['release_date'])
+            processed['release_year'] = extract_year_from_text(album_data['release_date'])
         
         # URL de la pochette (prendre la plus grande image disponible)
         images = album_data.get('images', [])
@@ -878,3 +878,4 @@ class SpotifyExtractor(BaseExtractor):
             self.logger.error(f"Erreur lors de la récupération des top tracks pour {artist_id}: {e}")
             return []
         """
+"""

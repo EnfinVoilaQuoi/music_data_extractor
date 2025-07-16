@@ -14,7 +14,7 @@ from ...core.exceptions import ExtractionError, RateLimitError
 from ...core.cache import CacheManager
 from ...core.rate_limiter import RateLimiter
 from ...config.settings import settings
-from ...utils.text_utils import clean_text, normalize_title
+from ...utils.text_utils import normalize_text, normalize_text
 
 
 class TuneBatScraper:
@@ -225,13 +225,13 @@ class TuneBatScraper:
                 return None
             
             # Titre et artiste
-            text = clean_text(container.get_text())
+            text = normalize_text(container.get_text())
             
             # TuneBat affiche souvent "Artist - Title"
             if ' - ' in text:
                 parts = text.split(' - ', 1)
-                result_data['artist'] = clean_text(parts[0])
-                result_data['title'] = clean_text(parts[1])
+                result_data['artist'] = normalize_text(parts[0])
+                result_data['title'] = normalize_text(parts[1])
             else:
                 result_data['title'] = text
             

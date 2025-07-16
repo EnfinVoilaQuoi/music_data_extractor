@@ -15,7 +15,7 @@ from ...utils.selenium_manager import SeleniumManager
 from ...core.exceptions import ScrapingError, ElementNotFoundError
 from ...core.cache import CacheManager
 from ...config.settings import settings
-from ...utils.text_utils import clean_text, normalize_title
+from ...utils.text_utils import normalize_text, normalize_text
 from ...models.enums import DataSource, CreditType, CreditCategory
 
 class GeniusWebScraper:
@@ -228,7 +228,7 @@ class GeniusWebScraper:
                 if title_elem:
                     title = self.selenium_manager.extract_text_safe(title_elem)
                     if title:
-                        metadata['title'] = clean_text(title)
+                        metadata['title'] = normalize_text(title)
                         break
             
             # Artiste principal
@@ -238,7 +238,7 @@ class GeniusWebScraper:
                 if artist_elem:
                     artist = self.selenium_manager.extract_text_safe(artist_elem)
                     if artist and artist not in metadata.get('title', ''):
-                        metadata['artist'] = clean_text(artist)
+                        metadata['artist'] = normalize_text(artist)
                         break
             
             # Informations d'album
@@ -253,7 +253,7 @@ class GeniusWebScraper:
                 if date_elem:
                     date_text = self.selenium_manager.extract_text_safe(date_elem)
                     if date_text:
-                        metadata['release_date'] = clean_text(date_text)
+                        metadata['release_date'] = normalize_text(date_text)
                         break
             
             self.logger.debug(f"Métadonnées extraites: {metadata}")
@@ -278,7 +278,7 @@ class GeniusWebScraper:
             for link in album_links:
                 album_text = self.selenium_manager.extract_text_safe(link)
                 if album_text and len(album_text) > 1:
-                    album_info['album_title'] = clean_text(album_text)
+                    album_info['album_title'] = normalize_text(album_text)
                     album_info['album_url'] = link.get_attribute('href')
                     break
             
@@ -539,8 +539,8 @@ class GeniusWebScraper:
             if credit_role and people:
                 for person in people:
                     credit = {
-                        'person_name': clean_text(person),
-                        'role_raw': clean_text(credit_role),
+                        'person_name': normalize_text(person),
+                        'role_raw': normalize_text(credit_role),
                         'role_normalized': self._normalize_credit_role(credit_role),
                         'credit_type': self._detect_credit_type(credit_role),
                         'credit_category': self._detect_credit_category(credit_role),
@@ -589,8 +589,8 @@ class GeniusWebScraper:
                         person = person.strip()
                         if person and len(person) > 1:
                             credit = {
-                                'person_name': clean_text(person),
-                                'role_raw': clean_text(role_raw),
+                                'person_name': normalize_text(person),
+                                'role_raw': normalize_text(role_raw),
                                 'role_normalized': self._normalize_credit_role(role_raw),
                                 'credit_type': self._detect_credit_type(role_raw),
                                 'credit_category': self._detect_credit_category(role_raw),
@@ -703,7 +703,7 @@ class GeniusWebScraper:
                 continue
             
             # Nettoyage final
-            credit['person_name'] = clean_text(person_name)
+            credit['person_name'] = normalize_text(person_name)
             credit['confidence_score'] = self._calculate_credit_confidence(credit)
             
             cleaned_credits.append(credit)
@@ -758,7 +758,7 @@ class GeniusWebScraper:
                 if lyrics_elem:
                     lyrics_text = self.selenium_manager.extract_text_safe(lyrics_elem)
                     if lyrics_text and len(lyrics_text) > 50:
-                        return clean_text(lyrics_text)
+                        return normalize_text(lyrics_text)
             
             return None
             

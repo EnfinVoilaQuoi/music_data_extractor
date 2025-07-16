@@ -58,10 +58,10 @@ except ImportError as e:
     logging.getLogger(__name__).warning(f"Impossible d'importer ExtractionStep: {e}")
 
 try:
-    from .step3_lyrics import LyricsStep
-    __all__.append('LyricsStep')
+    from steps.step3_process import ProcessingStep
+    __all__.append('ProcessingStep')
 except ImportError as e:
-    logging.getLogger(__name__).warning(f"Impossible d'importer LyricsStep: {e}")
+    logging.getLogger(__name__).warning(f"Impossible d'importer ProcessingStep: {e}")
 
 try:
     from .step4_export import ExportStep

@@ -9,11 +9,11 @@ import discogs_client
 from discogs_client.exceptions import HTTPError
 
 from .base_extractor import BaseExtractor, ExtractionResult, ExtractorConfig
-from ..models.enums import ExtractorType, CreditType, DataSource, CreditCategory
-from ..models.entities import Track, Album, Artist, Credit
-from ..core.exceptions import ExtractionError, RateLimitError, ValidationError
-from ..config.settings import settings
-from ..utils.text_utils import clean_text, normalize_title, extract_featuring_artists
+from models.enums import ExtractorType, CreditType, DataSource, CreditCategory
+from models.entities import Track, Album, Artist, Credit
+from core.exceptions import ExtractionError, RateLimitError, ValidationError
+from config.settings import settings
+from utils.text_utils import clean_text, normalize_title, extract_featuring_artists
 
 
 class DiscogsExtractor(BaseExtractor):
