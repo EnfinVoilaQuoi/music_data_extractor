@@ -1,4 +1,4 @@
-# __main__.py
+# __main__.py - VERSION CORRIGÉE
 """
 Music Data Extractor - Point d'entrée principal
 
@@ -21,8 +21,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 from config.settings import settings
 from core.session_manager import get_session_manager
 from core.database import Database
-from steps.step1_discover import DiscoveryStep
-from steps.step2_extract import ExtractionStep
 from utils.export_utils import ExportManager, export_all_formats
 from utils.logging_config import setup_logging
 from models.enums import ExportFormat
@@ -41,113 +39,80 @@ class MusicDataExtractorCLI:
         Pipeline complet d'extraction pour un artiste.
         
         Args:
-            artist_name: Nom de l'artiste
-            max_tracks: Limite du nombre de morceaux
-            export_format: Format d'export ('json', 'html', 'csv', 'all')
+            artist_name: Nom de l'artiste à extraire
+            max_tracks: Nombre maximum de tracks à traiter
+            export_format: Format d'export ('json', 'csv', 'html', 'all')
             
         Returns:
-            ID de session créée
+            ID de la session créée
         """
-        print(f"\n🎵 === EXTRACTION POUR {artist_name.upper()} ===")
+        # Import dynamique pour éviter les imports circulaires
+        from steps.step1_discover import DiscoveryStep
+        from steps.step2_extract import ExtractionStep
+        
+        self.logger.info(f"🎯 Début extraction pour: {artist_name}")
+        
+        # Créer une session
+        session_id = self.session_manager.create_session(
+            artist_name=artist_name,
+            metadata={'cli_extraction': True, 'max_tracks': max_tracks}
+        )
         
         try:
             # Étape 1: Découverte
-            print("\n📍 ÉTAPE 1: Découverte des morceaux...")
             discovery_step = DiscoveryStep(self.session_manager, self.database)
             tracks, discovery_stats = discovery_step.discover_artist_tracks(
-                artist_name, max_tracks=max_tracks
+                artist_name, session_id, max_tracks
             )
+            
+            self.logger.info(f"📊 Découverte terminée: {discovery_stats.final_count} morceaux trouvés")
             
             if not tracks:
-                print("❌ Aucun morceau trouvé pour cet artiste")
-                return None
+                self.logger.warning("❌ Aucun morceau trouvé")
+                self.session_manager.fail_session(session_id, "Aucun morceau trouvé")
+                return session_id
             
-            print(f"✅ {len(tracks)} morceaux découverts")
-            
-            # Récupérer l'ID de session
-            sessions = self.session_manager.get_active_sessions()
-            current_session = None
-            for session in sessions:
-                if session.artist_name == artist_name:
-                    current_session = session
-                    break
-            
-            if not current_session:
-                print("❌ Erreur: session non trouvée")
-                return None
-            
-            # Étape 2: Extraction détaillée
-            print(f"\n📍 ÉTAPE 2: Extraction détaillée des crédits...")
+            # Étape 2: Extraction
             extraction_step = ExtractionStep(self.session_manager, self.database)
-            enriched_tracks, extraction_stats = extraction_step.extract_tracks_data(
-                current_session.id
-            )
+            extraction_results = extraction_step.extract_tracks_data(tracks, session_id)
             
-            print(f"✅ {extraction_stats.successful_extractions} morceaux traités avec succès")
-            print(f"   - {extraction_stats.tracks_with_credits} avec crédits")
-            print(f"   - {extraction_stats.tracks_with_spotify_data} avec données Spotify")
+            self.logger.info(f"🔍 Extraction terminée: {len(extraction_results)} morceaux traités")
             
             # Étape 3: Export
             if export_format:
-                print(f"\n📍 ÉTAPE 3: Export en format {export_format}...")
-                self._export_results(artist_name, enriched_tracks, export_format)
+                export_manager = ExportManager(self.database)
+                artist = self.database.get_artist_by_name(artist_name)
+                
+                if artist:
+                    if export_format.lower() == 'all':
+                        files = export_all_formats(export_manager, artist)
+                    else:
+                        format_enum = ExportFormat(export_format.lower())
+                        files = export_manager.export_artist_data(artist, [format_enum])
+                    
+                    self.logger.info(f"📤 Export terminé: {len(files)} fichiers créés")
+                    for file_path in files.values():
+                        self.logger.info(f"   📁 {file_path}")
             
-            # Finaliser la session
-            self.session_manager.complete_session(
-                current_session.id,
-                {
-                    'total_tracks': len(tracks),
-                    'successful_extractions': extraction_stats.successful_extractions,
-                    'credits_found': extraction_stats.tracks_with_credits
-                }
-            )
+            # Marquer comme terminé
+            self.session_manager.complete_session(session_id, {
+                'tracks_discovered': len(tracks),
+                'tracks_extracted': len(extraction_results),
+                'export_format': export_format
+            })
             
-            print(f"\n🎉 EXTRACTION TERMINÉE AVEC SUCCÈS !")
-            print(f"   Session ID: {current_session.id}")
-            
-            return current_session.id
+            self.logger.info(f"✅ Extraction terminée avec succès pour {artist_name}")
             
         except Exception as e:
-            self.logger.error(f"Erreur lors de l'extraction: {e}")
-            print(f"❌ Erreur: {e}")
-            return None
-    
-    def _export_results(self, artist_name: str, tracks: list, export_format: str):
-        """Exporte les résultats dans le format demandé"""
-        try:
-            # Récupérer l'artiste
-            artist = self.database.get_artist_by_name(artist_name)
-            if not artist:
-                print("⚠️ Artiste non trouvé pour l'export")
-                return
-            
-            export_manager = ExportManager()
-            
-            if export_format.lower() == 'all':
-                # Export dans tous les formats
-                results = export_all_formats(artist, tracks, artist_name)
-                print("📁 Fichiers générés:")
-                for format_name, filepath in results.items():
-                    if filepath:
-                        print(f"   - {format_name.upper()}: {filepath}")
-            else:
-                # Export dans un format spécifique
-                try:
-                    format_enum = ExportFormat(export_format.lower())
-                    filepath = export_manager.export_artist_data(
-                        artist, tracks, format=format_enum
-                    )
-                    print(f"📁 Fichier généré: {filepath}")
-                except ValueError:
-                    print(f"⚠️ Format non supporté: {export_format}")
-                    print(f"   Formats disponibles: {', '.join([f.value for f in ExportFormat])}")
+            self.logger.error(f"❌ Erreur lors de l'extraction: {e}")
+            self.session_manager.fail_session(session_id, str(e))
+            raise
         
-        except Exception as e:
-            print(f"⚠️ Erreur lors de l'export: {e}")
+        return session_id
     
     def show_stats(self, artist_name: Optional[str] = None):
         """Affiche les statistiques"""
-        print("\n📊 === STATISTIQUES ===")
+        print("\n📈 === STATISTIQUES ===")
         
         try:
             if artist_name:
@@ -181,7 +146,7 @@ class MusicDataExtractorCLI:
         print("\n📋 === SESSIONS RÉCENTES ===")
         
         try:
-            sessions = self.session_manager.list_sessions()[:10]  # 10 plus récentes
+            sessions = self.session_manager.list_sessions(limit=10)  # 10 plus récentes
             
             if not sessions:
                 print("Aucune session trouvée")
@@ -195,139 +160,80 @@ class MusicDataExtractorCLI:
                     'paused': '⏸️'
                 }.get(session.status.value, '❓')
                 
-                print(f"{status_emoji} {session.artist_name}")
-                print(f"   ID: {session.id}")
-                print(f"   Statut: {session.status.value}")
-                print(f"   Morceaux: {session.tracks_processed}/{session.total_tracks_found}")
-                if session.updated_at:
-                    print(f"   Dernière MAJ: {session.updated_at.strftime('%d/%m/%Y %H:%M')}")
+                print(f"{status_emoji} {session.artist_name} ({session.id[:8]}...)")
+                print(f"   Status: {session.status.value}")
+                if session.created_at:
+                    print(f"   Créé le: {session.created_at.strftime('%d/%m/%Y %H:%M')}")
                 print()
         
         except Exception as e:
             print(f"❌ Erreur lors de la récupération des sessions: {e}")
-    
-    def resume_session(self, session_id: str):
-        """Reprend une session interrompue"""
-        print(f"\n⏯️ === REPRISE DE SESSION {session_id} ===")
-        
-        try:
-            session = self.session_manager.get_session(session_id)
-            if not session:
-                print(f"❌ Session '{session_id}' non trouvée")
-                return
-            
-            print(f"🎤 Artiste: {session.artist_name}")
-            print(f"📊 Progression: {session.tracks_processed}/{session.total_tracks_found}")
-            
-            # Reprendre selon l'étape actuelle
-            if 'discovery' in session.current_step.lower():
-                print("🔄 Reprise de la découverte...")
-                discovery_step = DiscoveryStep(self.session_manager, self.database)
-                tracks, _ = discovery_step.resume_discovery(session_id)
-            elif 'extraction' in session.current_step.lower():
-                print("🔄 Reprise de l'extraction...")
-                extraction_step = ExtractionStep(self.session_manager, self.database)
-                tracks, _ = extraction_step.extract_tracks_data(session_id)
-            else:
-                print("✅ Session déjà terminée")
-                return
-            
-            print("✅ Session reprise avec succès")
-        
-        except Exception as e:
-            print(f"❌ Erreur lors de la reprise: {e}")
 
 def main():
-    """Fonction principale avec parsing des arguments"""
-    parser = argparse.ArgumentParser(
-        description="Music Data Extractor - Extraction de données musicales avec crédits complets",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Exemples d'utilisation:
-  python -m music_data_extractor extract "Nekfeu"
-  python -m music_data_extractor extract "PNL" --max-tracks 50 --export html
-  python -m music_data_extractor gui
-  python -m music_data_extractor stats
-  python -m music_data_extractor sessions
-  python -m music_data_extractor resume session_123456
-        """
-    )
+    """Point d'entrée principal"""
+    parser = argparse.ArgumentParser(description="Music Data Extractor")
     
-    # Commandes principales
     subparsers = parser.add_subparsers(dest='command', help='Commandes disponibles')
     
     # Commande extract
     extract_parser = subparsers.add_parser('extract', help='Extraire les données d\'un artiste')
-    extract_parser.add_argument('artist', help='Nom de l\'artiste')
+    extract_parser.add_argument('artist_name', help='Nom de l\'artiste')
     extract_parser.add_argument('--max-tracks', type=int, help='Nombre maximum de morceaux')
-    extract_parser.add_argument('--export', choices=['json', 'csv', 'html', 'excel', 'xml', 'all'], 
-                               help='Format d\'export')
+    extract_parser.add_argument('--export', choices=['json', 'csv', 'html', 'all'], 
+                               help='Format d\'export des données')
+    extract_parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'], 
+                               default='INFO', help='Niveau de logging')
     
     # Commande GUI
     gui_parser = subparsers.add_parser('gui', help='Lancer l\'interface graphique')
     
     # Commande stats
     stats_parser = subparsers.add_parser('stats', help='Afficher les statistiques')
-    stats_parser.add_argument('--artist', help='Statistiques pour un artiste spécifique')
+    stats_parser.add_argument('--artist', help='Artiste spécifique (optionnel)')
     
     # Commande sessions
     sessions_parser = subparsers.add_parser('sessions', help='Lister les sessions')
     
-    # Commande resume
-    resume_parser = subparsers.add_parser('resume', help='Reprendre une session')
-    resume_parser.add_argument('session_id', help='ID de la session à reprendre')
-    
-    # Options globales
-    parser.add_argument('--debug', action='store_true', help='Mode debug')
-    parser.add_argument('--headless', action='store_true', help='Mode sans interface (pour Selenium)')
-    
     args = parser.parse_args()
     
+    if not args.command:
+        parser.print_help()
+        return
+    
     # Configuration du logging
-    log_level = logging.DEBUG if args.debug else logging.INFO
-    setup_logging(level=log_level)
+    if hasattr(args, 'log_level'):
+        setup_logging(level=getattr(logging, args.log_level))
+    else:
+        setup_logging()
     
-    # Configuration Selenium si spécifiée
-    if args.headless:
-        settings.config['selenium']['headless'] = True
-    
-    # Initialisation de l'interface CLI
     cli = MusicDataExtractorCLI()
     
-    # Exécution de la commande
     if args.command == 'extract':
-        session_id = cli.extract_artist(
-            args.artist, 
-            max_tracks=args.max_tracks,
-            export_format=args.export
-        )
-        
-    elif args.command == 'gui':
-        # Lancer l'interface graphique
         try:
-            from gui.streamlit_app import run_streamlit_app
-            print("🖥️ Lancement de l'interface graphique...")
-            print("   L'interface va s'ouvrir dans votre navigateur")
-            run_streamlit_app()
+            session_id = cli.extract_artist(
+                artist_name=args.artist_name,
+                max_tracks=args.max_tracks,
+                export_format=args.export
+            )
+            print(f"\n✅ Extraction terminée. Session ID: {session_id}")
+        except Exception as e:
+            print(f"\n❌ Erreur: {e}")
+            sys.exit(1)
+    
+    elif args.command == 'gui':
+        try:
+            import streamlit.web.cli as stcli
+            sys.argv = ["streamlit", "run", "streamlit_app.py"]
+            stcli.main()
         except ImportError:
-            print("❌ Interface graphique non disponible")
-            print("   Installez Streamlit: pip install streamlit")
-            print("   Ou utilisez la CLI: python -m music_data_extractor extract \"Artiste\"")
+            print("❌ Streamlit n'est pas installé. Installez-le avec: pip install streamlit")
+            sys.exit(1)
     
     elif args.command == 'stats':
-        cli.show_stats(args.artist)
+        cli.show_stats(args.artist if hasattr(args, 'artist') else None)
     
     elif args.command == 'sessions':
         cli.list_sessions()
-    
-    elif args.command == 'resume':
-        cli.resume_session(args.session_id)
-    
-    else:
-        # Aucune commande fournie - afficher l'aide et proposer le GUI
-        parser.print_help()
-        print("\n💡 Conseil: Pour une interface plus conviviale, essayez:")
-        print("   python -m music_data_extractor gui")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

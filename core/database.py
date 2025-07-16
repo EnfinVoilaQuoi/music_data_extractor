@@ -74,7 +74,7 @@ class Database:
         
         # Marquer la migration comme exécutée
         conn.execute(
-            "INSERT INTO migrations (filename) VALUES (?)",
+            "INSERT INTO migrations (filename) VALUES (?",
             (migration_file,)
         )
     
@@ -121,7 +121,8 @@ class Database:
                 genre TEXT,
                 country TEXT,
                 active_years TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         
@@ -310,18 +311,30 @@ class Database:
                 session.id
             ))
     
-    def list_sessions(self, status: Optional[SessionStatus] = None) -> List[Session]:
-        """Liste les sessions, optionnellement filtrées par statut"""
+    def list_sessions(self, status: Optional[SessionStatus] = None, limit: Optional[int] = None) -> List[Session]:
+        """Liste les sessions, optionnellement filtrées par statut et limitées en nombre"""
         with self.get_connection() as conn:
             if status:
-                cursor = conn.execute(
-                    "SELECT * FROM sessions WHERE status = ? ORDER BY created_at DESC",
-                    (status.value,)
-                )
+                if limit:
+                    cursor = conn.execute(
+                        "SELECT * FROM sessions WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                        (status.value, limit)
+                    )
+                else:
+                    cursor = conn.execute(
+                        "SELECT * FROM sessions WHERE status = ? ORDER BY created_at DESC",
+                        (status.value,)
+                    )
             else:
-                cursor = conn.execute(
-                    "SELECT * FROM sessions ORDER BY created_at DESC"
-                )
+                if limit:
+                    cursor = conn.execute(
+                        "SELECT * FROM sessions ORDER BY created_at DESC LIMIT ?",
+                        (limit,)
+                    )
+                else:
+                    cursor = conn.execute(
+                        "SELECT * FROM sessions ORDER BY created_at DESC"
+                    )
             
             sessions = []
             for row in cursor.fetchall():
@@ -364,143 +377,116 @@ class Database:
         """Récupère un artiste par son nom"""
         with self.get_connection() as conn:
             cursor = conn.execute(
-                "SELECT * FROM artists WHERE name = ?",
+                "SELECT * FROM artists WHERE name = ? COLLATE NOCASE",
                 (name,)
             )
             row = cursor.fetchone()
             
             if row:
-                from ..models.enums import Genre  # Import local pour éviter les cycles
                 return Artist(
                     id=row['id'],
                     name=row['name'],
                     genius_id=row['genius_id'],
                     spotify_id=row['spotify_id'],
                     discogs_id=row['discogs_id'],
-                    genre=Genre(row['genre']) if row['genre'] else None,
+                    genre=row['genre'],
                     country=row['country'],
-                    active_years=row['active_years'],
-                    created_at=datetime.fromisoformat(row['created_at']) if row['created_at'] else None
+                    active_years=row['active_years']
                 )
         return None
     
-    def get_or_create_artist(self, name: str) -> Artist:
-        """Récupère ou crée un artiste"""
-        artist = self.get_artist_by_name(name)
-        if not artist:
-            new_artist = Artist(name=name)
-            artist_id = self.create_artist(new_artist)
-            new_artist.id = artist_id
-            return new_artist
-        return artist
-    
-    # ==================== ALBUMS ====================
-    
-    def create_album(self, album: Album) -> int:
-        """Crée un nouvel album"""
-        with self.get_connection() as conn:
-            cursor = conn.execute("""
-                INSERT INTO albums (
-                    title, artist_id, release_date, release_year, album_type,
-                    genre, label, spotify_id, discogs_id, genius_id,
-                    track_count, total_duration, cover_url
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                album.title,
-                album.artist_id,
-                album.release_date,
-                album.release_year,
-                album.album_type.value if album.album_type else None,
-                album.genre,
-                album.label,
-                album.spotify_id,
-                album.discogs_id,
-                album.genius_id,
-                album.track_count,
-                album.total_duration,
-                album.cover_url
-            ))
-            return cursor.lastrowid
-    
-    def get_album_by_id(self, album_id: int) -> Optional[Album]:
-        """Récupère un album par son ID"""
+    def get_artist_by_id(self, artist_id: int) -> Optional[Artist]:
+        """Récupère un artiste par son ID"""
         with self.get_connection() as conn:
             cursor = conn.execute(
-                "SELECT * FROM albums WHERE id = ?",
-                (album_id,)
-            )
-            row = cursor.fetchone()
-            
-            if row:
-                return self._row_to_album(row)
-        return None
-    
-    def get_album_by_title_and_artist(self, title: str, artist_id: int) -> Optional[Album]:
-        """Récupère un album par titre et artiste"""
-        with self.get_connection() as conn:
-            cursor = conn.execute(
-                "SELECT * FROM albums WHERE title = ? AND artist_id = ?",
-                (title, artist_id)
-            )
-            row = cursor.fetchone()
-            
-            if row:
-                return self._row_to_album(row)
-        return None
-    
-    def get_albums_by_artist_id(self, artist_id: int) -> List[Album]:
-        """Récupère tous les albums d'un artiste"""
-        with self.get_connection() as conn:
-            cursor = conn.execute(
-                "SELECT * FROM albums WHERE artist_id = ? ORDER BY release_year DESC, title",
+                "SELECT * FROM artists WHERE id = ?",
                 (artist_id,)
             )
+            row = cursor.fetchone()
             
-            albums = []
-            for row in cursor.fetchall():
-                albums.append(self._row_to_album(row))
-            
-            return albums
+            if row:
+                return Artist(
+                    id=row['id'],
+                    name=row['name'],
+                    genius_id=row['genius_id'],
+                    spotify_id=row['spotify_id'],
+                    discogs_id=row['discogs_id'],
+                    genre=row['genre'],
+                    country=row['country'],
+                    active_years=row['active_years']
+                )
+        return None
     
-    def update_album(self, album: Album):
-        """Met à jour un album"""
+    def update_artist(self, artist: Artist):
+        """Met à jour un artiste"""
         with self.get_connection() as conn:
             conn.execute("""
-                UPDATE albums SET
-                    title = ?, release_date = ?, release_year = ?, album_type = ?,
-                    genre = ?, label = ?, spotify_id = ?, discogs_id = ?,
-                    track_count = ?, total_duration = ?, cover_url = ?,
+                UPDATE artists SET
+                    name = ?,
+                    genius_id = ?,
+                    spotify_id = ?,
+                    discogs_id = ?,
+                    genre = ?,
+                    country = ?,
+                    active_years = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
             """, (
-                album.title, album.release_date, album.release_year,
-                album.album_type.value if album.album_type else None,
-                album.genre, album.label, album.spotify_id, album.discogs_id,
-                album.track_count, album.total_duration, album.cover_url,
-                album.id
+                artist.name,
+                artist.genius_id,
+                artist.spotify_id,
+                artist.discogs_id,
+                artist.genre.value if artist.genre else None,
+                artist.country,
+                artist.active_years,
+                artist.id
             ))
     
-    def _row_to_album(self, row) -> Album:
-        """Convertit une ligne de base en objet Album"""
-        from ..models.enums import AlbumType  # Import local
-        return Album(
-            id=row['id'],
-            title=row['title'],
-            artist_id=row['artist_id'],
-            release_date=row['release_date'],
-            release_year=row['release_year'],
-            album_type=AlbumType(row['album_type']) if row['album_type'] else None,
-            genre=row['genre'],
-            label=row['label'],
-            spotify_id=row['spotify_id'],
-            discogs_id=row['discogs_id'],
-            genius_id=row['genius_id'],
-            track_count=row['track_count'],
-            total_duration=row['total_duration'],
-            cover_url=row['cover_url'],
-            created_at=datetime.fromisoformat(row['created_at']) if row['created_at'] else None,
-            updated_at=datetime.fromisoformat(row['updated_at']) if row['updated_at'] else None
-        )
+    def list_artists(self, limit: Optional[int] = None) -> List[Artist]:
+        """Liste tous les artistes"""
+        with self.get_connection() as conn:
+            if limit:
+                cursor = conn.execute(
+                    "SELECT * FROM artists ORDER BY name LIMIT ?",
+                    (limit,)
+                )
+            else:
+                cursor = conn.execute("SELECT * FROM artists ORDER BY name")
+            
+            artists = []
+            for row in cursor.fetchall():
+                artists.append(Artist(
+                    id=row['id'],
+                    name=row['name'],
+                    genius_id=row['genius_id'],
+                    spotify_id=row['spotify_id'],
+                    discogs_id=row['discogs_id'],
+                    genre=row['genre'],
+                    country=row['country'],
+                    active_years=row['active_years']
+                ))
+            
+            return artists
+    
+    def delete_artist(self, artist_id: int) -> bool:
+        """Supprime un artiste et toutes ses données associées"""
+        with self.get_connection() as conn:
+            try:
+                # Supprimer en cascade (crédits -> tracks -> albums -> artiste)
+                conn.execute("""
+                    DELETE FROM credits WHERE track_id IN (
+                        SELECT id FROM tracks WHERE artist_id = ?
+                    )
+                """, (artist_id,))
+                
+                conn.execute("DELETE FROM tracks WHERE artist_id = ?", (artist_id,))
+                conn.execute("DELETE FROM albums WHERE artist_id = ?", (artist_id,))
+                conn.execute("DELETE FROM artists WHERE id = ?", (artist_id,))
+                
+                return True
+            except Exception as e:
+                print(f"Erreur suppression artiste: {e}")
+                return False
     
     # ==================== TRACKS ====================
     
@@ -530,48 +516,38 @@ class Database:
                 track.has_lyrics,
                 track.lyrics
             ))
-            track_id = cursor.lastrowid
-            
-            # Ajouter les features
-            for feature in track.featuring_artists:
-                conn.execute("""
-                    INSERT INTO track_features (track_id, featured_artist)
-                    VALUES (?, ?)
-                """, (track_id, feature))
-            
-            return track_id
+            return cursor.lastrowid
     
-    def get_track_by_genius_id(self, genius_id: int) -> Optional[Track]:
-        """Récupère un track par son ID Genius"""
+    def get_track_by_id(self, track_id: int) -> Optional[Track]:
+        """Récupère un track par son ID"""
         with self.get_connection() as conn:
             cursor = conn.execute(
-                "SELECT * FROM tracks WHERE genius_id = ?",
-                (genius_id,)
+                "SELECT * FROM tracks WHERE id = ?",
+                (track_id,)
             )
             row = cursor.fetchone()
             
             if row:
-                track = self._row_to_track(row)
-                # Charger les crédits et features
-                track.credits = self.get_credits_by_track_id(track.id)
-                track.featuring_artists = self.get_features_by_track_id(track.id)
-                return track
+                return self._row_to_track(row)
         return None
     
-    def get_tracks_by_artist_id(self, artist_id: int) -> List[Track]:
+    def get_tracks_by_artist(self, artist_id: int, limit: Optional[int] = None) -> List[Track]:
         """Récupère tous les tracks d'un artiste"""
         with self.get_connection() as conn:
-            cursor = conn.execute(
-                "SELECT * FROM tracks WHERE artist_id = ? ORDER BY album_title, track_number",
-                (artist_id,)
-            )
+            if limit:
+                cursor = conn.execute(
+                    "SELECT * FROM tracks WHERE artist_id = ? ORDER BY title LIMIT ?",
+                    (artist_id, limit)
+                )
+            else:
+                cursor = conn.execute(
+                    "SELECT * FROM tracks WHERE artist_id = ? ORDER BY title",
+                    (artist_id,)
+                )
             
             tracks = []
             for row in cursor.fetchall():
-                track = self._row_to_track(row)
-                track.credits = self.get_credits_by_track_id(track.id)
-                track.featuring_artists = self.get_features_by_track_id(track.id)
-                tracks.append(track)
+                tracks.append(self._row_to_track(row))
             
             return tracks
     
@@ -580,21 +556,44 @@ class Database:
         with self.get_connection() as conn:
             conn.execute("""
                 UPDATE tracks SET
-                    title = ?, artist_name = ?, album_id = ?, album_title = ?,
-                    track_number = ?, disc_number = ?, spotify_id = ?,
-                    duration_seconds = ?, bpm = ?, key = ?, has_lyrics = ?,
-                    lyrics = ?, updated_at = CURRENT_TIMESTAMP
+                    title = ?,
+                    artist_id = ?,
+                    artist_name = ?,
+                    album_id = ?,
+                    album_title = ?,
+                    track_number = ?,
+                    disc_number = ?,
+                    genius_id = ?,
+                    spotify_id = ?,
+                    genius_url = ?,
+                    duration_seconds = ?,
+                    bpm = ?,
+                    key = ?,
+                    has_lyrics = ?,
+                    lyrics = ?,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
             """, (
-                track.title, track.artist_name, track.album_id, track.album_title,
-                track.track_number, track.disc_number, track.spotify_id,
-                track.duration_seconds, track.bpm, track.key, track.has_lyrics,
-                track.lyrics, track.id
+                track.title,
+                track.artist_id,
+                track.artist_name,
+                track.album_id,
+                track.album_title,
+                track.track_number,
+                track.disc_number,
+                track.genius_id,
+                track.spotify_id,
+                track.genius_url,
+                track.duration_seconds,
+                track.bpm,
+                track.key,
+                track.has_lyrics,
+                track.lyrics,
+                track.id
             ))
     
     def _row_to_track(self, row) -> Track:
         """Convertit une ligne de base en objet Track"""
-        from ..models.enums import ExtractionStatus, DataSource  # Import local
         return Track(
             id=row['id'],
             title=row['title'],
@@ -611,138 +610,67 @@ class Database:
             bpm=row['bpm'],
             key=row['key'],
             has_lyrics=bool(row['has_lyrics']),
-            lyrics=row['lyrics'],
-            created_at=datetime.fromisoformat(row['created_at']) if row['created_at'] else None,
-            updated_at=datetime.fromisoformat(row['updated_at']) if row['updated_at'] else None
+            lyrics=row['lyrics']
         )
     
-    # ==================== CREDITS ====================
-    
-    def create_credit(self, credit: Credit) -> int:
-        """Crée un nouveau crédit"""
-        with self.get_connection() as conn:
-            cursor = conn.execute("""
-                INSERT INTO credits (track_id, credit_category, credit_type, person_name, instrument_detail, source)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                credit.track_id,
-                credit.credit_category.value if credit.credit_category else None,
-                credit.credit_type.value if credit.credit_type else None,
-                credit.person_name,
-                credit.instrument,
-                credit.data_source.value if credit.data_source else None
-            ))
-            return cursor.lastrowid
-    
-    def get_credits_by_track_id(self, track_id: int) -> List[Credit]:
-        """Récupère tous les crédits d'un track"""
-        with self.get_connection() as conn:
-            cursor = conn.execute(
-                "SELECT * FROM credits WHERE track_id = ?",
-                (track_id,)
-            )
-            
-            credits = []
-            for row in cursor.fetchall():
-                from ..models.enums import CreditCategory, CreditType, DataSource  # Import local
-                credits.append(Credit(
-                    id=row['id'],
-                    track_id=row['track_id'],
-                    credit_category=CreditCategory(row['credit_category']) if row['credit_category'] else None,
-                    credit_type=CreditType(row['credit_type']) if row['credit_type'] else CreditType.OTHER,
-                    person_name=row['person_name'],
-                    instrument=row['instrument_detail'],  # Mapping du nom de colonne
-                    data_source=DataSource(row['source']) if row['source'] else DataSource.MANUAL
-                ))
-            
-            return credits
-    
-    def get_features_by_track_id(self, track_id: int) -> List[str]:
-        """Récupère les features d'un track"""
-        with self.get_connection() as conn:
-            cursor = conn.execute(
-                "SELECT featured_artist FROM track_features WHERE track_id = ?",
-                (track_id,)
-            )
-            return [row['featured_artist'] for row in cursor.fetchall()]
-    
-    # ==================== CACHE ====================
-    
-    def set_cache(self, key: str, data: Any, expires_at: Optional[datetime] = None):
-        """Met en cache des données"""
-        with self.get_connection() as conn:
-            conn.execute("""
-                INSERT OR REPLACE INTO cache (cache_key, data, expires_at)
-                VALUES (?, ?, ?)
-            """, (key, json.dumps(data), expires_at.isoformat() if expires_at else None))
-    
-    def get_cache(self, key: str) -> Optional[Any]:
-        """Récupère des données du cache"""
-        with self.get_connection() as conn:
-            cursor = conn.execute(
-                "SELECT data, expires_at FROM cache WHERE cache_key = ?",
-                (key,)
-            )
-            row = cursor.fetchone()
-            
-            if row:
-                # Vérifier l'expiration
-                if row['expires_at']:
-                    expires_at = datetime.fromisoformat(row['expires_at'])
-                    if datetime.now() > expires_at:
-                        # Cache expiré, le supprimer
-                        conn.execute("DELETE FROM cache WHERE cache_key = ?", (key,))
-                        return None
-                
-                return json.loads(row['data'])
-        return None
-    
-    def clear_expired_cache(self):
-        """Nettoie le cache expiré"""
-        with self.get_connection() as conn:
-            conn.execute(
-                "DELETE FROM cache WHERE expires_at IS NOT NULL AND expires_at < ?",
-                (datetime.now().isoformat(),)
-            )
-    
-    # ==================== STATISTIQUES ====================
+    # ==================== STATS ====================
     
     def get_stats(self, artist_id: Optional[int] = None) -> Dict[str, Any]:
-        """Récupère les statistiques générales ou pour un artiste"""
+        """Récupère les statistiques"""
         with self.get_connection() as conn:
             stats = {}
             
             if artist_id:
                 # Stats pour un artiste spécifique
-                cursor = conn.execute(
-                    "SELECT COUNT(*) as count FROM tracks WHERE artist_id = ?",
-                    (artist_id,)
-                )
-                stats['total_tracks'] = cursor.fetchone()['count']
-                
-                cursor = conn.execute(
-                    "SELECT COUNT(*) as count FROM tracks WHERE artist_id = ? AND has_lyrics = 1",
-                    (artist_id,)
-                )
-                stats['tracks_with_lyrics'] = cursor.fetchone()['count']
-                
                 cursor = conn.execute("""
-                    SELECT COUNT(DISTINCT c.track_id) as count 
-                    FROM credits c 
-                    JOIN tracks t ON c.track_id = t.id 
+                    SELECT 
+                        COUNT(*) as total_tracks,
+                        COUNT(CASE WHEN has_lyrics = 1 THEN 1 END) as tracks_with_lyrics,
+                        AVG(duration_seconds) as avg_duration
+                    FROM tracks WHERE artist_id = ?
+                """, (artist_id,))
+                row = cursor.fetchone()
+                stats.update(dict(row))
+                
+                # Crédits pour cet artiste
+                cursor = conn.execute("""
+                    SELECT COUNT(*) as total_credits
+                    FROM credits c
+                    JOIN tracks t ON c.track_id = t.id
                     WHERE t.artist_id = ?
                 """, (artist_id,))
-                stats['tracks_with_credits'] = cursor.fetchone()['count']
+                row = cursor.fetchone()
+                stats['total_credits'] = row['total_credits']
                 
             else:
                 # Stats générales
-                cursor = conn.execute("SELECT COUNT(*) as count FROM artists")
-                stats['total_artists'] = cursor.fetchone()['count']
+                cursor = conn.execute("SELECT COUNT(*) as total_artists FROM artists")
+                stats['total_artists'] = cursor.fetchone()['total_artists']
                 
-                cursor = conn.execute("SELECT COUNT(*) as count FROM tracks")
-                stats['total_tracks'] = cursor.fetchone()['count']
+                cursor = conn.execute("SELECT COUNT(*) as total_tracks FROM tracks")
+                stats['total_tracks'] = cursor.fetchone()['total_tracks']
                 
-                cursor = conn.execute("SELECT COUNT(*) as count FROM credits")
-                stats['total_credits'] = cursor.fetchone()['count']
+                cursor = conn.execute("SELECT COUNT(*) as total_credits FROM credits")
+                stats['total_credits'] = cursor.fetchone()['total_credits']
             
             return stats
+    
+    def get_database_size(self) -> float:
+        """Retourne la taille de la base en MB"""
+        try:
+            size_bytes = Path(self.db_path).stat().st_size
+            return size_bytes / (1024 * 1024)  # Conversion en MB
+        except:
+            return 0.0
+    
+    def get_artist_count(self) -> int:
+        """Retourne le nombre total d'artistes"""
+        with self.get_connection() as conn:
+            cursor = conn.execute("SELECT COUNT(*) as count FROM artists")
+            return cursor.fetchone()['count']
+    
+    def get_track_count(self) -> int:
+        """Retourne le nombre total de tracks"""
+        with self.get_connection() as conn:
+            cursor = conn.execute("SELECT COUNT(*) as count FROM tracks")
+            return cursor.fetchone()['count']

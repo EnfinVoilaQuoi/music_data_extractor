@@ -1,4 +1,4 @@
-# steps/__init__.py
+# steps/__init__.py - VERSION CORRIGÉE
 """Étapes de traitement du pipeline d'extraction"""
 
 import logging
@@ -8,36 +8,52 @@ __all__ = []
 # Configuration du logger
 logger = logging.getLogger(__name__)
 
-# Imports conditionnels pour les étapes
-try:
-    from .step1_discover import DiscoveryStep
-    __all__.append('DiscoveryStep')
-    logger.info("✅ DiscoveryStep importé")
-except ImportError as e:
-    logger.warning(f"⚠️ Erreur import DiscoveryStep: {e}")
-
-try:
-    from .step2_extract import ExtractionStep
-    __all__.append('ExtractionStep')
-    logger.info("✅ ExtractionStep importé")
-except ImportError as e:
-    logger.warning(f"⚠️ Erreur import ExtractionStep: {e}")
-
-try:
-    from .step3_process import ProcessingStep
-    __all__.append('ProcessingStep')
-    logger.info("✅ ProcessingStep importé")
-except ImportError as e:
-    logger.warning(f"⚠️ Erreur import ProcessingStep: {e}")
-
-try:
-    from .step4_export import ExportStep
-    __all__.append('ExportStep')
-    logger.info("✅ ExportStep importé")
-except ImportError as e:
-    logger.warning(f"⚠️ Erreur import ExportStep: {e}")
+# Imports conditionnels pour les étapes - SUPPRESSION DES IMPORTS PROBLÉMATIQUES
+# Ces imports seront faits directement par les modules qui en ont besoin
 
 # Fonction helper pour lister les étapes disponibles
 def get_available_steps():
     """Retourne la liste des étapes disponibles"""
-    return __all__
+    return [
+        'DiscoveryStep',
+        'ExtractionStep', 
+        'ProcessingStep',
+        'ExportStep'
+    ]
+
+# Fonctions d'import dynamique pour éviter les imports circulaires
+def get_discovery_step():
+    """Import dynamique de DiscoveryStep"""
+    try:
+        from .step1_discover import DiscoveryStep
+        return DiscoveryStep
+    except ImportError as e:
+        logger.warning(f"⚠️ Erreur import DiscoveryStep: {e}")
+        return None
+
+def get_extraction_step():
+    """Import dynamique d'ExtractionStep"""
+    try:
+        from .step2_extract import ExtractionStep
+        return ExtractionStep
+    except ImportError as e:
+        logger.warning(f"⚠️ Erreur import ExtractionStep: {e}")
+        return None
+
+def get_processing_step():
+    """Import dynamique de ProcessingStep"""
+    try:
+        from .step3_process import ProcessingStep
+        return ProcessingStep
+    except ImportError as e:
+        logger.warning(f"⚠️ Erreur import ProcessingStep: {e}")
+        return None
+
+def get_export_step():
+    """Import dynamique d'ExportStep"""
+    try:
+        from .step4_export import ExportStep
+        return ExportStep
+    except ImportError as e:
+        logger.warning(f"⚠️ Erreur import ExportStep: {e}")
+        return None

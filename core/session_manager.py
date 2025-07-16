@@ -13,7 +13,7 @@ from models.enums import SessionStatus
 from core.database import Database
 
 class SessionManager:
-    """Gestionnaire des sessions de travail avec sauvegarde automatique"""
+    """Gestionnaire des sessions de travail avec sauvegarde automatique intelligente"""
     
     def __init__(self, db: Optional[Database] = None):
         self.db = db or Database()
@@ -26,6 +26,11 @@ class SessionManager:
         self._auto_save_thread = None
         self._stop_auto_save = threading.Event()
         self._session_lock = threading.Lock()
+        
+        # NOUVEAU: Sauvegarde intelligente - suivi des modifications
+        self._last_activity_time = None
+        self._sessions_modified = set()  # IDs des sessions modifiées
+        self._save_only_if_active = settings.get('sessions.save_only_if_active', True)
         
         # Callbacks pour les événements de session
         self.event_callbacks: Dict[str, List[Callable]] = {
@@ -40,6 +45,12 @@ class SessionManager:
         self._start_auto_save()
         self._load_active_sessions()
     
+    def _mark_session_modified(self, session_id: str):
+        """Marque une session comme modifiée pour la sauvegarde intelligente"""
+        with self._session_lock:
+            self._sessions_modified.add(session_id)
+            self._last_activity_time = datetime.now()
+    
     def _start_auto_save(self):
         """Démarre le thread de sauvegarde automatique"""
         if self._auto_save_thread and self._auto_save_thread.is_alive():
@@ -48,18 +59,58 @@ class SessionManager:
         self._stop_auto_save.clear()
         self._auto_save_thread = threading.Thread(target=self._auto_save_worker, daemon=True)
         self._auto_save_thread.start()
-        print(f"🔄 Auto-sauvegarde démarrée (intervalle: {self.auto_save_interval}s)")
+        
+        save_mode = "intelligente" if self._save_only_if_active else "systématique"
+        print(f"🔄 Auto-sauvegarde {save_mode} démarrée (intervalle: {self.auto_save_interval}s)")
     
     def _auto_save_worker(self):
-        """Worker pour la sauvegarde automatique"""
+        """Worker pour la sauvegarde automatique - VERSION INTELLIGENTE"""
         while not self._stop_auto_save.wait(self.auto_save_interval):
             try:
-                self._save_active_sessions()
+                if self._save_only_if_active:
+                    self._smart_save_active_sessions()
+                else:
+                    self._save_active_sessions()
             except Exception as e:
                 print(f"⚠️ Erreur lors de la sauvegarde automatique: {e}")
     
+    def _smart_save_active_sessions(self):
+        """Sauvegarde intelligente - seulement si activité récente"""
+        with self._session_lock:
+            # Vérifier s'il y a eu de l'activité récente
+            if not self._last_activity_time:
+                return
+            
+            # Seulement sauvegarder si activité dans les dernières 5 minutes
+            time_since_activity = datetime.now() - self._last_activity_time
+            if time_since_activity.total_seconds() > 300:  # 5 minutes
+                return
+            
+            # Sauvegarder seulement les sessions modifiées
+            if not self._sessions_modified:
+                return
+            
+            saved_count = 0
+            sessions_to_remove = set()
+            
+            for session_id in self._sessions_modified:
+                if session_id in self.active_sessions:
+                    try:
+                        session = self.active_sessions[session_id]
+                        self.db.update_session(session)
+                        saved_count += 1
+                        sessions_to_remove.add(session_id)
+                    except Exception as e:
+                        print(f"⚠️ Erreur sauvegarde session {session_id}: {e}")
+            
+            # Nettoyer la liste des sessions modifiées
+            self._sessions_modified -= sessions_to_remove
+            
+            if saved_count > 0:
+                print(f"💾 {saved_count} session(s) modifiée(s) sauvegardée(s)")
+    
     def _save_active_sessions(self):
-        """Sauvegarde toutes les sessions actives"""
+        """Sauvegarde toutes les sessions actives (mode classique)"""
         with self._session_lock:
             saved_count = 0
             for session in self.active_sessions.values():
@@ -107,56 +158,54 @@ class SessionManager:
             
             # Ajouter la session
             self.active_sessions[session_id] = session
-            
-            # Sauvegarder en base
             self.db.create_session(session)
+            
+            # Marquer comme modifiée
+            self._mark_session_modified(session_id)
         
         print(f"✨ Nouvelle session créée: {session_id} pour {artist_name}")
         self._trigger_event('session_created', session)
-        
         return session_id
     
     def get_session(self, session_id: str) -> Optional[Session]:
-        """Récupère une session par son ID"""
+        """Récupère une session par ID"""
+        # D'abord chercher dans les sessions actives
         with self._session_lock:
-            # Vérifier d'abord dans les sessions actives
             if session_id in self.active_sessions:
                 return self.active_sessions[session_id]
-            
-            # Sinon chercher en base et la charger
-            session = self.db.get_session(session_id)
-            if session and session.status in [SessionStatus.IN_PROGRESS, SessionStatus.PAUSED]:
-                self.active_sessions[session_id] = session
-            
-            return session
+        
+        # Sinon chercher en base
+        return self.db.get_session(session_id)
     
     def update_session(self, session_id: str, **updates) -> bool:
-        """Met à jour une session"""
+        """Met à jour une session avec les champs fournis"""
         session = self.get_session(session_id)
         if not session:
-            print(f"⚠️ Session non trouvée: {session_id}")
             return False
         
         with self._session_lock:
             # Appliquer les mises à jour
-            for key, value in updates.items():
-                if hasattr(session, key):
-                    setattr(session, key, value)
+            for field, value in updates.items():
+                if hasattr(session, field):
+                    setattr(session, field, value)
             
             session.updated_at = datetime.now()
             
-            # Sauvegarder en base immédiatement pour les mises à jour importantes
-            if any(key in ['status', 'current_step', 'total_tracks_found'] for key in updates.keys()):
-                self.db.update_session(session)
+            # Mettre à jour en mémoire et base
+            if session_id in self.active_sessions:
+                self.active_sessions[session_id] = session
+            
+            self.db.update_session(session)
+            
+            # Marquer comme modifiée
+            self._mark_session_modified(session_id)
         
         self._trigger_event('session_updated', session)
         return True
     
-    def update_progress(self, session_id: str, 
-                      tracks_processed: Optional[int] = None,
-                      tracks_with_credits: Optional[int] = None,
-                      tracks_with_albums: Optional[int] = None,
-                      current_step: Optional[str] = None) -> bool:
+    def update_progress(self, session_id: str, tracks_processed: Optional[int] = None,
+                       tracks_with_credits: Optional[int] = None, tracks_with_albums: Optional[int] = None,
+                       current_step: Optional[str] = None) -> bool:
         """Met à jour le progrès d'une session"""
         updates = {}
         if tracks_processed is not None:
@@ -192,6 +241,9 @@ class SessionManager:
             self.db.update_session(session)
             if session_id in self.active_sessions:
                 del self.active_sessions[session_id]
+            
+            # Retirer de la liste des modifiées
+            self._sessions_modified.discard(session_id)
         
         print(f"✅ Session terminée: {session_id}")
         self._trigger_event('session_completed', session)
@@ -213,6 +265,9 @@ class SessionManager:
             self.db.update_session(session)
             if session_id in self.active_sessions:
                 del self.active_sessions[session_id]
+            
+            # Retirer de la liste des modifiées
+            self._sessions_modified.discard(session_id)
         
         print(f"❌ Session échouée: {session_id} - {error_message}")
         self._trigger_event('session_failed', session)
@@ -236,9 +291,9 @@ class SessionManager:
             print(f"▶️ Session reprise: {session_id}")
         return result
     
-    def list_sessions(self, status: Optional[SessionStatus] = None) -> List[Session]:
-        """Liste les sessions, optionnellement filtrées par statut"""
-        return self.db.list_sessions(status)
+    def list_sessions(self, status: Optional[SessionStatus] = None, limit: Optional[int] = None) -> List[Session]:
+        """Liste les sessions, optionnellement filtrées par statut et limitées en nombre"""
+        return self.db.list_sessions(status, limit)
     
     def get_active_sessions(self) -> List[Session]:
         """Récupère toutes les sessions actives"""
