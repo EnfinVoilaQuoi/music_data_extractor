@@ -1,4 +1,4 @@
-# core/session_manager.py - Version hybride avec toutes les fonctionnalités
+# core/session_manager.py - Version corrigée sans problèmes de freeze
 import uuid
 import json
 import time
@@ -24,26 +24,26 @@ except ImportError:
     USE_FRANCE_TZ = False
 
 class SessionManager:
-    """Gestionnaire des sessions hybride - Simplicité + Fonctionnalités avancées"""
+    """Gestionnaire des sessions sans threading pour éviter les freezes"""
     
-    def __init__(self, db: Optional[Database] = None):
+    def __init__(self, db: Optional[Database] = None, enable_threading: bool = False):
         self.db = db or Database()
         self.active_sessions: Dict[str, Session] = {}
         
         # Configuration
         self.auto_save_interval = settings.get('sessions.auto_save_interval', 60)
-        self.max_sessions = settings.get('sessions.max_sessions', 20)  # Augmenté
+        self.max_sessions = settings.get('sessions.max_sessions', 20)
         self.cleanup_after_days = settings.get('sessions.cleanup_after_days', 30)
         
-        # Sauvegarde intelligente
-        self._sessions_modified = set()  # IDs des sessions modifiées
+        # Threading DÉSACTIVÉ par défaut pour éviter les freezes
+        self.enable_threading = enable_threading
+        self._sessions_modified = set()
         self._last_activity_time = None
-        self._save_only_if_active = settings.get('sessions.save_only_if_active', True)
         
-        # Threading pour sauvegarde automatique (optionnel)
+        # Threading optionnel (désactivé par défaut)
         self._auto_save_thread = None
         self._stop_auto_save = threading.Event()
-        self._session_lock = threading.Lock()
+        self._session_lock = threading.Lock() if enable_threading else None
         
         # Callbacks pour les événements
         self.event_callbacks: Dict[str, List[Callable]] = {
@@ -57,12 +57,13 @@ class SessionManager:
         
         # Initialisation
         self._load_active_sessions()
-        if settings.get('sessions.enable_auto_save', True):
+        
+        # Auto-save seulement si threading explicitement activé
+        if enable_threading and settings.get('sessions.enable_auto_save', False):
             self._start_auto_save()
         
-        tz_msg = "avec timezone France" if USE_FRANCE_TZ else "sans timezone (UTC)"
-        auto_save_msg = "avec sauvegarde auto" if self._auto_save_thread else "sans sauvegarde auto"
-        print(f"✅ SessionManager hybride initialisé {tz_msg}, {auto_save_msg}")
+        threading_msg = "avec threading" if enable_threading else "sans threading (stable)"
+        print(f"✅ SessionManager initialisé {threading_msg}")
     
     def _get_current_time(self) -> datetime:
         """Retourne l'heure actuelle selon la configuration timezone"""
@@ -79,49 +80,43 @@ class SessionManager:
             # Retirer la timezone pour éviter les conflits
             return dt.replace(tzinfo=None) if dt.tzinfo else dt
     
+    def _with_lock(self, func):
+        """Exécute une fonction avec ou sans lock selon la configuration"""
+        if self.enable_threading and self._session_lock:
+            with self._session_lock:
+                return func()
+        else:
+            return func()
+    
     def _mark_session_modified(self, session_id: str):
-        """Marque une session comme modifiée pour la sauvegarde intelligente"""
-        with self._session_lock:
-            self._sessions_modified.add(session_id)
-            self._last_activity_time = self._get_current_time()
+        """Marque une session comme modifiée"""
+        self._sessions_modified.add(session_id)
+        self._last_activity_time = self._get_current_time()
     
     def _start_auto_save(self):
-        """Démarre le thread de sauvegarde automatique"""
+        """Démarre le thread de sauvegarde automatique (si threading activé)"""
+        if not self.enable_threading:
+            return
+            
         if self._auto_save_thread and self._auto_save_thread.is_alive():
             return
         
         self._stop_auto_save.clear()
         self._auto_save_thread = threading.Thread(target=self._auto_save_worker, daemon=True)
         self._auto_save_thread.start()
-        
-        save_mode = "intelligente" if self._save_only_if_active else "systématique"
-        print(f"🔄 Auto-sauvegarde {save_mode} démarrée (intervalle: {self.auto_save_interval}s)")
+        print(f"🔄 Auto-sauvegarde démarrée (intervalle: {self.auto_save_interval}s)")
     
     def _auto_save_worker(self):
-        """Worker pour la sauvegarde automatique intelligente"""
+        """Worker pour la sauvegarde automatique"""
         while not self._stop_auto_save.wait(self.auto_save_interval):
             try:
-                if self._save_only_if_active:
-                    self._smart_save_active_sessions()
-                else:
-                    self._save_active_sessions()
+                self._save_modified_sessions()
             except Exception as e:
                 print(f"⚠️ Erreur lors de la sauvegarde automatique: {e}")
     
-    def _smart_save_active_sessions(self):
-        """Sauvegarde intelligente - seulement si activité récente"""
-        with self._session_lock:
-            # Vérifier s'il y a eu de l'activité récente
-            if not self._last_activity_time:
-                return
-            
-            # Seulement sauvegarder si activité dans les dernières 5 minutes
-            current_time = self._get_current_time()
-            time_since_activity = current_time - self._last_activity_time
-            if time_since_activity.total_seconds() > 300:  # 5 minutes
-                return
-            
-            # Sauvegarder seulement les sessions modifiées
+    def _save_modified_sessions(self):
+        """Sauvegarde seulement les sessions modifiées"""
+        def _save_logic():
             if not self._sessions_modified:
                 return
             
@@ -143,10 +138,12 @@ class SessionManager:
             
             if saved_count > 0:
                 print(f"💾 {saved_count} session(s) modifiée(s) sauvegardée(s)")
+        
+        self._with_lock(_save_logic)
     
-    def _save_active_sessions(self):
+    def _save_all_sessions(self):
         """Sauvegarde toutes les sessions actives"""
-        with self._session_lock:
+        def _save_logic():
             saved_count = 0
             for session in self.active_sessions.values():
                 try:
@@ -157,51 +154,11 @@ class SessionManager:
             
             if saved_count > 0:
                 print(f"💾 {saved_count} session(s) sauvegardée(s)")
-    
-    def create_session(self, artist_name: str, metadata: Optional[Dict[str, Any]] = None) -> str:
-        """Crée une nouvelle session avec gestion intelligente des limites"""
-        session_id = str(uuid.uuid4())
-        current_time = self._get_current_time()
         
-        session = Session(
-            id=session_id,
-            artist_name=artist_name,
-            status=SessionStatus.IN_PROGRESS,
-            current_step="initialization",
-            created_at=current_time,
-            updated_at=current_time,
-            metadata=metadata or {}
-        )
-        
-        try:
-            with self._session_lock:
-                # Vérifier la limite de sessions actives
-                if len(self.active_sessions) >= self.max_sessions:
-                    self._cleanup_old_active_sessions()
-                
-                # Ajouter la session
-                self.active_sessions[session_id] = session
-                self._mark_session_modified(session_id)
-            
-            # Sauvegarder en base
-            self.db.create_session(session)
-            
-            # Déclencher l'événement
-            self._trigger_event('session_created', session)
-            
-            time_str = current_time.strftime('%H:%M:%S') if USE_FRANCE_TZ else current_time.strftime('%H:%M:%S UTC')
-            print(f"✨ Session créée ({time_str}): {session_id[:8]} pour {artist_name}")
-            return session_id
-            
-        except Exception as e:
-            print(f"⚠️ Erreur création session {artist_name}: {e}")
-            # Nettoyer si erreur
-            if session_id in self.active_sessions:
-                del self.active_sessions[session_id]
-            return session_id  # Retourner quand même l'ID pour continuer
+        self._with_lock(_save_logic)
     
     def _cleanup_old_active_sessions(self):
-        """Nettoie les sessions actives les plus anciennes pour faire de la place"""
+        """Nettoie les sessions actives les plus anciennes"""
         try:
             # Trier par date de mise à jour (plus ancien en premier)
             sorted_sessions = sorted(
@@ -209,7 +166,7 @@ class SessionManager:
                 key=lambda x: x[1].updated_at or datetime.min
             )
             
-            # Retirer les plus anciennes (garder juste en dessous de la limite)
+            # Retirer les plus anciennes
             sessions_to_remove = sorted_sessions[:max(1, len(sorted_sessions) - self.max_sessions + 2)]
             
             for session_id, session in sessions_to_remove:
@@ -222,7 +179,7 @@ class SessionManager:
                 # Retirer de la mémoire
                 del self.active_sessions[session_id]
                 self._sessions_modified.discard(session_id)
-                print(f"🧹 Session {session_id[:8]} retirée des sessions actives (limite atteinte)")
+                print(f"🧹 Session {session_id[:8]} retirée des sessions actives")
                 
         except Exception as e:
             print(f"⚠️ Erreur nettoyage sessions actives: {e}")
@@ -247,8 +204,55 @@ class SessionManager:
         except Exception as e:
             print(f"⚠️ Erreur chargement sessions (continuons sans): {e}")
     
+    def create_session(self, artist_name: str, metadata: Optional[Dict[str, Any]] = None) -> str:
+        """Crée une nouvelle session SANS threading pour éviter les freezes"""
+        session_id = str(uuid.uuid4())
+        current_time = self._get_current_time()
+        
+        session = Session(
+            id=session_id,
+            artist_name=artist_name,
+            status=SessionStatus.IN_PROGRESS,
+            current_step="initialization",
+            created_at=current_time,
+            updated_at=current_time,
+            metadata=metadata or {}
+        )
+        
+        try:
+            def _create_logic():
+                # Vérifier la limite de sessions actives
+                if len(self.active_sessions) >= self.max_sessions:
+                    self._cleanup_old_active_sessions()
+                
+                # Ajouter la session
+                self.active_sessions[session_id] = session
+                self._mark_session_modified(session_id)
+                return session_id
+            
+            # Exécuter avec ou sans lock
+            result_id = self._with_lock(_create_logic)
+            
+            # Sauvegarder en base IMMÉDIATEMENT (pas de thread)
+            self.db.create_session(session)
+            
+            # Déclencher l'événement
+            self._trigger_event('session_created', session)
+            
+            time_str = current_time.strftime('%H:%M:%S') if USE_FRANCE_TZ else current_time.strftime('%H:%M:%S UTC')
+            print(f"✨ Session créée ({time_str}): {session_id[:8]} pour {artist_name}")
+            return session_id
+            
+        except Exception as e:
+            print(f"⚠️ Erreur création session {artist_name}: {e}")
+            # Nettoyer si erreur
+            if session_id in self.active_sessions:
+                del self.active_sessions[session_id]
+            # Retourner quand même l'ID pour que l'app continue
+            return session_id
+    
     def get_session(self, session_id: str) -> Optional[Session]:
-        """Récupère une session par ID avec normalisation timezone"""
+        """Récupère une session par ID"""
         # Chercher en mémoire d'abord
         if session_id in self.active_sessions:
             return self.active_sessions[session_id]
@@ -266,7 +270,7 @@ class SessionManager:
             return None
     
     def update_session(self, session: Session) -> bool:
-        """Met à jour une session (accepte l'objet Session directement)"""
+        """Met à jour une session"""
         try:
             if not session or not session.id:
                 print("⚠️ Session invalide pour mise à jour")
@@ -274,12 +278,14 @@ class SessionManager:
             
             session.updated_at = self._get_current_time()
             
-            with self._session_lock:
+            def _update_logic():
                 # Mettre à jour en mémoire
                 self.active_sessions[session.id] = session
                 self._mark_session_modified(session.id)
             
-            # Sauvegarder en base
+            self._with_lock(_update_logic)
+            
+            # Sauvegarder en base IMMÉDIATEMENT
             self.db.update_session(session)
             
             self._trigger_event('session_updated', session)
@@ -290,7 +296,7 @@ class SessionManager:
             return False
     
     def update_session_by_id(self, session_id: str, **updates) -> bool:
-        """Met à jour une session par ID et mises à jour"""
+        """Met à jour une session par ID"""
         try:
             session = self.get_session(session_id)
             if not session:
@@ -310,58 +316,36 @@ class SessionManager:
             print(f"⚠️ Erreur mise à jour session {session_id}: {e}")
             return False
     
-    def update_progress(self, session_id: str, tracks_processed: Optional[int] = None,
-                       tracks_with_credits: Optional[int] = None, 
-                       tracks_with_albums: Optional[int] = None,
-                       current_step: Optional[str] = None) -> bool:
-        """Met à jour le progrès d'une session"""
-        updates = {}
-        if tracks_processed is not None:
-            updates['tracks_processed'] = tracks_processed
-        if tracks_with_credits is not None:
-            updates['tracks_with_credits'] = tracks_with_credits
-        if tracks_with_albums is not None:
-            updates['tracks_with_albums'] = tracks_with_albums
-        if current_step is not None:
-            updates['current_step'] = current_step
-        
-        return self.update_session_by_id(session_id, **updates)
-    
     def complete_session(self, session_id: str, final_stats: Optional[Dict[str, Any]] = None) -> bool:
         """Marque une session comme terminée"""
         try:
-            session = self.get_session(session_id)
-            if not session:
-                print(f"⚠️ Session {session_id} non trouvée pour finalisation")
-                return False
-            
             current_time = self._get_current_time()
-            session.status = SessionStatus.COMPLETED
-            session.updated_at = current_time
+            
+            updates = {
+                'status': SessionStatus.COMPLETED,
+                'updated_at': current_time,
+                'current_step': 'completed'
+            }
             
             if final_stats:
-                session.metadata.update(final_stats)
+                updates['metadata'] = {
+                    **(self.get_session(session_id).metadata if self.get_session(session_id) else {}),
+                    'final_stats': final_stats,
+                    'completed_at': current_time.isoformat()
+                }
             
-            # Calculer la durée totale
-            if session.created_at:
-                duration = current_time - session.created_at
-                session.metadata['total_duration_seconds'] = int(duration.total_seconds())
+            result = self.update_session_by_id(session_id, **updates)
             
-            with self._session_lock:
-                # Sauvegarder en base
-                self.db.update_session(session)
-                
-                # Retirer des sessions actives
-                if session_id in self.active_sessions:
-                    del self.active_sessions[session_id]
-                self._sessions_modified.discard(session_id)
+            if result:
+                session = self.get_session(session_id)
+                if session:
+                    self._trigger_event('session_completed', session)
+                    print(f"✅ Session terminée: {session_id[:8]}")
             
-            print(f"✅ Session terminée: {session_id[:8]}")
-            self._trigger_event('session_completed', session)
-            return True
+            return result
             
         except Exception as e:
-            print(f"⚠️ Erreur finalisation session {session_id}: {e}")
+            print(f"⚠️ Erreur completion session {session_id}: {e}")
             return False
     
     def fail_session(self, session_id: str, error_message: str) -> bool:
@@ -379,7 +363,7 @@ class SessionManager:
             session.metadata['error_message'] = error_message
             session.metadata['failed_at'] = current_time.isoformat()
             
-            with self._session_lock:
+            def _fail_logic():
                 # Sauvegarder en base
                 self.db.update_session(session)
                 
@@ -387,6 +371,8 @@ class SessionManager:
                 if session_id in self.active_sessions:
                     del self.active_sessions[session_id]
                 self._sessions_modified.discard(session_id)
+            
+            self._with_lock(_fail_logic)
             
             print(f"❌ Session échouée: {session_id[:8]} - {error_message}")
             self._trigger_event('session_failed', session)
@@ -421,269 +407,99 @@ class SessionManager:
         try:
             sessions = self.db.list_sessions(status, limit)
             
-            # Normaliser les timestamps pour tous
+            # Normaliser les timestamps
             for session in sessions:
                 session.created_at = self._normalize_datetime(session.created_at)
                 session.updated_at = self._normalize_datetime(session.updated_at)
             
             return sessions
+            
         except Exception as e:
             print(f"⚠️ Erreur listage sessions: {e}")
             return []
     
-    def get_active_sessions(self) -> List[Session]:
-        """Récupère toutes les sessions actives"""
-        with self._session_lock:
-            return list(self.active_sessions.values())
-    
-    # ==================== NOUVELLES FONCTIONNALITÉS RÉCUPÉRÉES ====================
-    
-    def create_checkpoint(self, session_id: str, step_name: str, data: Dict[str, Any]) -> bool:
-        """Crée un point de sauvegarde pour une session"""
-        session = self.get_session(session_id)
-        if not session:
+    def delete_session(self, session_id: str) -> bool:
+        """Supprime une session"""
+        try:
+            def _delete_logic():
+                # Retirer de la mémoire
+                if session_id in self.active_sessions:
+                    del self.active_sessions[session_id]
+                self._sessions_modified.discard(session_id)
+            
+            self._with_lock(_delete_logic)
+            
+            # Supprimer de la base
+            success = self.db.delete_session(session_id)
+            
+            if success:
+                print(f"🗑️ Session supprimée: {session_id[:8]}")
+            
+            return success
+            
+        except Exception as e:
+            print(f"⚠️ Erreur suppression session {session_id}: {e}")
             return False
-        
-        try:
-            self.db.save_checkpoint(session_id, step_name, data)
-            print(f"💾 Checkpoint créé pour {session_id[:8]}: {step_name}")
-            return True
-        except Exception as e:
-            print(f"⚠️ Erreur création checkpoint: {e}")
-            return False
     
-    def get_checkpoint(self, session_id: str, step_name: str) -> Optional[Dict[str, Any]]:
-        """Récupère un checkpoint spécifique"""
+    def cleanup_old_sessions(self, days: Optional[int] = None) -> int:
+        """Nettoie les anciennes sessions"""
         try:
-            return self.db.get_checkpoint(session_id, step_name)
-        except Exception as e:
-            print(f"⚠️ Erreur récupération checkpoint: {e}")
-            return None
-    
-    def list_checkpoints(self, session_id: str) -> List[Dict[str, Any]]:
-        """Liste tous les checkpoints d'une session"""
-        try:
-            return self.db.list_checkpoints(session_id)
-        except Exception as e:
-            print(f"⚠️ Erreur listage checkpoints: {e}")
-            return []
-    
-    def get_session_summary(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Récupère un résumé complet d'une session"""
-        session = self.get_session(session_id)
-        if not session:
-            return None
-        
-        try:
-            summary = {
-                'session_id': session.id,
-                'artist_name': session.artist_name,
-                'status': session.status.value,
-                'current_step': session.current_step,
-                'created_at': session.created_at.isoformat() if session.created_at else None,
-                'updated_at': session.updated_at.isoformat() if session.updated_at else None,
-                'progress': {
-                    'total_tracks_found': session.total_tracks_found,
-                    'tracks_processed': session.tracks_processed,
-                    'tracks_with_credits': session.tracks_with_credits,
-                    'tracks_with_albums': session.tracks_with_albums,
-                    'failed_tracks': session.failed_tracks
-                },
-                'metadata': session.metadata,
-                'checkpoints': self.list_checkpoints(session_id)
-            }
+            days = days or self.cleanup_after_days
+            cutoff_date = self._get_current_time() - timedelta(days=days)
             
-            # Calculer le pourcentage de progression
-            if session.total_tracks_found and session.total_tracks_found > 0:
-                summary['progress']['percentage'] = round(
-                    (session.tracks_processed / session.total_tracks_found) * 100, 2
-                )
-            else:
-                summary['progress']['percentage'] = 0.0
-            
-            # Calculer la durée
-            if session.created_at:
-                current_time = self._get_current_time()
-                if session.status == SessionStatus.COMPLETED:
-                    # Chercher la durée dans les métadonnées
-                    duration = session.metadata.get('total_duration_seconds')
-                    if duration:
-                        summary['duration_seconds'] = duration
-                    else:
-                        # Fallback: calculer depuis les timestamps
-                        if session.updated_at:
-                            duration = session.updated_at - session.created_at
-                            summary['duration_seconds'] = int(duration.total_seconds())
-                else:
-                    # Session en cours
-                    duration = current_time - session.created_at
-                    summary['duration_seconds'] = int(duration.total_seconds())
-            
-            return summary
-            
-        except Exception as e:
-            print(f"⚠️ Erreur création résumé session: {e}")
-            return None
-    
-    def get_global_stats(self) -> Dict[str, Any]:
-        """Récupère les statistiques globales des sessions"""
-        try:
-            stats = {
-                'active_sessions_count': len(self.active_sessions),
-                'sessions_by_status': {},
-                'avg_completion_time_seconds': 0,
-                'top_artists': [],
-                'total_sessions': 0,
-                'total_tracks_discovered': 0,
-                'total_tracks_processed': 0
-            }
-            
-            # Sessions par statut
+            # Récupérer les sessions anciennes
+            old_sessions = []
             all_sessions = self.db.list_sessions()
-            stats['total_sessions'] = len(all_sessions)
             
-            for status in SessionStatus:
-                count = len([s for s in all_sessions if s.status == status])
-                stats['sessions_by_status'][status.value] = count
-            
-            # Calculs pour les sessions terminées
-            completed_sessions = [s for s in all_sessions if s.status == SessionStatus.COMPLETED]
-            if completed_sessions:
-                total_duration = 0
-                valid_durations = 0
-                
-                for session in completed_sessions:
-                    # Accumuler les totaux
-                    stats['total_tracks_discovered'] += session.total_tracks_found or 0
-                    stats['total_tracks_processed'] += session.tracks_processed or 0
-                    
-                    # Calculer la durée
-                    if session.created_at and session.updated_at:
-                        session.created_at = self._normalize_datetime(session.created_at)
-                        session.updated_at = self._normalize_datetime(session.updated_at)
-                        
-                        duration = session.updated_at - session.created_at
-                        total_duration += duration.total_seconds()
-                        valid_durations += 1
-                
-                if valid_durations > 0:
-                    stats['avg_completion_time_seconds'] = int(total_duration / valid_durations)
-            
-            # Top artistes par nombre de sessions
-            artist_counts = {}
             for session in all_sessions:
-                artist_counts[session.artist_name] = artist_counts.get(session.artist_name, 0) + 1
+                session_date = self._normalize_datetime(session.updated_at or session.created_at)
+                if session_date and session_date < cutoff_date:
+                    old_sessions.append(session.id)
             
-            stats['top_artists'] = [
-                {'artist': artist, 'sessions': count}
-                for artist, count in sorted(artist_counts.items(), key=lambda x: x[1], reverse=True)[:10]
-            ]
+            # Supprimer les anciennes sessions
+            deleted_count = 0
+            for session_id in old_sessions:
+                if self.delete_session(session_id):
+                    deleted_count += 1
+            
+            if deleted_count > 0:
+                print(f"🧹 {deleted_count} ancienne(s) session(s) supprimée(s)")
+            
+            return deleted_count
+            
+        except Exception as e:
+            print(f"⚠️ Erreur nettoyage anciennes sessions: {e}")
+            return 0
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Retourne les statistiques du gestionnaire"""
+        try:
+            all_sessions = self.db.list_sessions()
+            
+            stats = {
+                'total_sessions': len(all_sessions),
+                'active_sessions': len(self.active_sessions),
+                'status_breakdown': {},
+                'recent_activity': 0
+            }
+            
+            # Répartition par statut
+            for session in all_sessions:
+                status = session.status.value if hasattr(session.status, 'value') else str(session.status)
+                stats['status_breakdown'][status] = stats['status_breakdown'].get(status, 0) + 1
+            
+            # Activité récente (dernières 24h)
+            recent_cutoff = self._get_current_time() - timedelta(hours=24)
+            for session in all_sessions:
+                session_date = self._normalize_datetime(session.updated_at or session.created_at)
+                if session_date and session_date > recent_cutoff:
+                    stats['recent_activity'] += 1
             
             return stats
             
         except Exception as e:
-            print(f"⚠️ Erreur statistiques globales: {e}")
-            return {'error': str(e)}
-    
-    def cleanup_old_sessions(self):
-        """Nettoie les anciennes sessions terminées en base"""
-        try:
-            current_time = self._get_current_time()
-            cutoff_date = current_time - timedelta(days=self.cleanup_after_days)
-            
-            # Nettoyer en base via la méthode de la DB
-            cleaned_count = self.db.cleanup_old_sessions(cutoff_date)
-            
-            # Nettoyer en mémoire aussi
-            to_remove = []
-            for session_id, session in self.active_sessions.items():
-                if session.created_at and session.created_at < cutoff_date:
-                    to_remove.append(session_id)
-            
-            for session_id in to_remove:
-                del self.active_sessions[session_id]
-                self._sessions_modified.discard(session_id)
-            
-            total_cleaned = cleaned_count + len(to_remove)
-            if total_cleaned > 0:
-                print(f"🧹 {total_cleaned} sessions anciennes nettoyées")
-            
-            return total_cleaned
-            
-        except Exception as e:
-            print(f"⚠️ Erreur nettoyage sessions: {e}")
-            return 0
-    
-    # ==================== MÉTHODES UTILITAIRES ====================
-    
-    def manual_save_all(self):
-        """Sauvegarde manuelle de toutes les sessions actives"""
-        try:
-            with self._session_lock:
-                saved_count = 0
-                for session in self.active_sessions.values():
-                    try:
-                        self.db.update_session(session)
-                        saved_count += 1
-                    except Exception as e:
-                        print(f"⚠️ Erreur sauvegarde {session.id}: {e}")
-                
-                # Nettoyer la liste des modifiées
-                self._sessions_modified.clear()
-                
-                if saved_count > 0:
-                    print(f"💾 {saved_count} session(s) sauvegardée(s) manuellement")
-                return saved_count
-                
-        except Exception as e:
-            print(f"⚠️ Erreur sauvegarde globale: {e}")
-            return 0
-    
-    def restart_failed_session(self, session_id: str) -> bool:
-        """Redémarre une session échouée"""
-        try:
-            session = self.get_session(session_id)
-            if not session:
-                print(f"⚠️ Session {session_id} non trouvée")
-                return False
-            
-            if session.status != SessionStatus.FAILED:
-                print(f"⚠️ Session {session_id} n'est pas en échec (statut: {session.status.value})")
-                return False
-            
-            # Réinitialiser le statut
-            current_time = self._get_current_time()
-            session.status = SessionStatus.IN_PROGRESS
-            session.last_error = None
-            session.error_count = 0
-            session.updated_at = current_time
-            
-            # Nettoyer les métadonnées d'erreur
-            if 'error_message' in session.metadata:
-                del session.metadata['error_message']
-            if 'failed_at' in session.metadata:
-                del session.metadata['failed_at']
-            
-            # Ajouter info de redémarrage
-            session.metadata['restarted_at'] = current_time.isoformat()
-            session.metadata['restart_count'] = session.metadata.get('restart_count', 0) + 1
-            
-            # Remettre en sessions actives et sauvegarder
-            with self._session_lock:
-                self.active_sessions[session_id] = session
-                self._mark_session_modified(session_id)
-            
-            result = self.update_session(session)
-            
-            if result:
-                print(f"🔄 Session redémarrée: {session_id[:8]}")
-                self._trigger_event('session_resumed', session)
-            
-            return result
-            
-        except Exception as e:
-            print(f"⚠️ Erreur redémarrage session {session_id}: {e}")
-            return False
+            print(f"⚠️ Erreur récupération stats: {e}")
+            return {}
     
     def add_event_callback(self, event_type: str, callback: Callable):
         """Ajoute un callback pour un événement de session"""
@@ -704,16 +520,20 @@ class SessionManager:
         """Arrête le gestionnaire de sessions proprement"""
         print("🛑 Arrêt du gestionnaire de sessions...")
         
-        # Arrêter le thread de sauvegarde
+        # Arrêter le thread de sauvegarde si activé
         if self._auto_save_thread:
             self._stop_auto_save.set()
             if self._auto_save_thread.is_alive():
                 self._auto_save_thread.join(timeout=5)
         
         # Sauvegarder une dernière fois toutes les sessions actives
-        self._save_active_sessions()
+        self._save_all_sessions()
         
         print("✅ Gestionnaire de sessions arrêté")
+    
+    def force_save_all(self):
+        """Force la sauvegarde de toutes les sessions actives"""
+        self._save_all_sessions()
     
     def __enter__(self):
         """Support du context manager"""
@@ -727,11 +547,11 @@ class SessionManager:
 # Instance globale du gestionnaire de sessions
 _session_manager = None
 
-def get_session_manager() -> SessionManager:
+def get_session_manager(enable_threading: bool = False) -> SessionManager:
     """Récupère l'instance globale du gestionnaire de sessions"""
     global _session_manager
     if _session_manager is None:
-        _session_manager = SessionManager()
+        _session_manager = SessionManager(enable_threading=enable_threading)
     return _session_manager
 
 def reset_session_manager():
@@ -740,3 +560,30 @@ def reset_session_manager():
     if _session_manager:
         _session_manager.stop()
     _session_manager = None
+
+def create_session_safe(artist_name: str, metadata: dict = None, 
+                       fallback_to_temp: bool = True) -> str:
+    """
+    Fonction utilitaire pour créer une session de manière sécurisée.
+    Fallback automatique vers session temporaire si problème.
+    """
+    print(f"🔍 Création session sécurisée pour {artist_name}")
+    
+    try:
+        # Tentative normale sans threading
+        session_manager = get_session_manager(enable_threading=False)
+        session_id = session_manager.create_session(artist_name, metadata)
+        print(f"✅ Session normale créée: {session_id[:8]}")
+        return session_id
+        
+    except Exception as e:
+        print(f"⚠️ Échec création normale: {e}")
+        
+        if fallback_to_temp:
+            # Fallback vers session temporaire
+            import time
+            session_id = f"temp_{int(time.time())}_{str(uuid.uuid4())[:8]}"
+            print(f"🔄 Session temporaire créée: {session_id}")
+            return session_id
+        else:
+            raise e
