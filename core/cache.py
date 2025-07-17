@@ -1,253 +1,200 @@
-# core/cache.py
-import hashlib
+# core/cache.py - Version optimisée et simplifiée
 import json
+import sqlite3
 from datetime import datetime, timedelta
-from typing import Any, Optional, Dict, Callable, List
-from functools import wraps
-import fnmatch
+from typing import Any, Optional, Dict
+from pathlib import Path
 
 from config.settings import settings
-from core.database import Database
 
 class CacheManager:
-    """Gestionnaire de cache intelligent avec expiration automatique"""
+    """Gestionnaire de cache simple et efficace"""
     
-    def __init__(self, db: Optional[Database] = None):
-        self.db = db or Database()
-        self.default_expire_days = settings.get('performance.cache_expire_days', 7)
-    
-    def _generate_cache_key(self, prefix: str, *args, **kwargs) -> str:
-        """Génère une clé de cache unique basée sur les paramètres"""
-        # Créer une chaîne unique à partir des arguments
-        key_data = {
-            'args': args,
-            'kwargs': kwargs
+    def __init__(self, cache_db_path: Optional[Path] = None):
+        self.cache_db_path = cache_db_path or (settings.data_dir / "cache.db")
+        self.cache_db_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Durées de cache par défaut (en heures)
+        self.default_durations = {
+            'artist_search': 24,      # Recherche d'artiste
+            'track_list': 12,         # Liste des morceaux
+            'track_details': 48,      # Détails d'un morceau
+            'api_response': 6         # Réponses API génériques
         }
-        key_string = json.dumps(key_data, sort_keys=True, default=str)
         
-        # Hasher pour éviter les clés trop longues
-        key_hash = hashlib.md5(key_string.encode()).hexdigest()
-        
-        return f"{prefix}:{key_hash}"
+        self._init_cache_db()
+        print(f"✅ CacheManager initialisé (DB: {self.cache_db_path})")
+    
+    def _init_cache_db(self):
+        """Initialise la base de données du cache"""
+        with sqlite3.connect(self.cache_db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS cache (
+                    cache_key TEXT PRIMARY KEY,
+                    data TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP,
+                    cache_type TEXT DEFAULT 'general'
+                )
+            """)
+            
+            # Index pour améliorer les performances
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_cache_expires 
+                ON cache(expires_at)
+            """)
     
     def get(self, key: str) -> Optional[Any]:
         """Récupère une valeur du cache"""
-        return self.db.get_cache(key)
+        try:
+            with sqlite3.connect(self.cache_db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute("""
+                    SELECT data FROM cache 
+                    WHERE cache_key = ? 
+                    AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+                """, (key,))
+                row = cursor.fetchone()
+                
+                if row:
+                    return json.loads(row['data'])
+            return None
+        except Exception as e:
+            print(f"⚠️ Erreur lecture cache {key}: {e}")
+            return None
     
-    def set(self, key: str, value: Any, expire_days: Optional[int] = None) -> None:
-        """Met une valeur en cache avec expiration"""
-        if expire_days is None:
-            expire_days = self.default_expire_days
-        
-        expires_at = datetime.now() + timedelta(days=expire_days)
-        self.db.set_cache(key, value, expires_at)
+    def set(self, key: str, value: Any, duration_hours: Optional[int] = None, cache_type: str = 'general') -> bool:
+        """Stocke une valeur dans le cache"""
+        try:
+            # Calculer l'expiration
+            expires_at = None
+            if duration_hours:
+                expires_at = datetime.now() + timedelta(hours=duration_hours)
+            elif cache_type in self.default_durations:
+                expires_at = datetime.now() + timedelta(hours=self.default_durations[cache_type])
+            
+            with sqlite3.connect(self.cache_db_path) as conn:
+                conn.execute("""
+                    INSERT OR REPLACE INTO cache (cache_key, data, expires_at, cache_type)
+                    VALUES (?, ?, ?, ?)
+                """, (
+                    key,
+                    json.dumps(value),
+                    expires_at.isoformat() if expires_at else None,
+                    cache_type
+                ))
+            return True
+        except Exception as e:
+            print(f"⚠️ Erreur écriture cache {key}: {e}")
+            return False
     
-    def delete(self, key: str) -> None:
+    def delete(self, key: str) -> bool:
         """Supprime une entrée du cache"""
-        with self.db.get_connection() as conn:
-            conn.execute("DELETE FROM cache WHERE cache_key = ?", (key,))
+        try:
+            with sqlite3.connect(self.cache_db_path) as conn:
+                cursor = conn.execute("DELETE FROM cache WHERE cache_key = ?", (key,))
+                return cursor.rowcount > 0
+        except Exception as e:
+            print(f"⚠️ Erreur suppression cache {key}: {e}")
+            return False
     
-    def clear_expired(self) -> None:
-        """Nettoie le cache expiré"""
-        self.db.clear_expired_cache()
-    
-    def clear_all(self) -> None:
-        """Vide tout le cache"""
-        with self.db.get_connection() as conn:
-            conn.execute("DELETE FROM cache")
-    
-    def get_cache_keys(self, pattern: Optional[str] = None) -> List[str]:
-        """Récupère toutes les clés de cache, optionnellement filtrées par pattern"""
-        with self.db.get_connection() as conn:
-            if pattern:
-                cursor = conn.execute(
-                    "SELECT cache_key FROM cache WHERE cache_key LIKE ?",
-                    (pattern.replace('*', '%'),)
-                )
-            else:
-                cursor = conn.execute("SELECT cache_key FROM cache")
-            
-            return [row['cache_key'] for row in cursor.fetchall()]
-    
-    def cached_api_call(self, api_name: str, expire_days: int = 7):
-        """Décorateur pour mettre en cache les appels API"""
-        def decorator(func: Callable) -> Callable:
-            @wraps(func)
-            def wrapper(*args, **kwargs):
-                # Générer la clé de cache
-                cache_key = self._generate_cache_key(f"api:{api_name}:{func.__name__}", *args, **kwargs)
+    def clear(self, cache_type: Optional[str] = None) -> int:
+        """Vide le cache (optionnellement par type)"""
+        try:
+            with sqlite3.connect(self.cache_db_path) as conn:
+                if cache_type:
+                    cursor = conn.execute("DELETE FROM cache WHERE cache_type = ?", (cache_type,))
+                else:
+                    cursor = conn.execute("DELETE FROM cache")
                 
-                # Vérifier le cache
-                cached_result = self.get(cache_key)
-                if cached_result is not None:
-                    print(f"🎯 Cache hit pour {api_name}: {func.__name__}")
-                    return cached_result
+                deleted_count = cursor.rowcount
+                if deleted_count > 0:
+                    print(f"🧹 {deleted_count} entrée(s) de cache supprimée(s)")
                 
-                # Appeler la fonction et mettre en cache
-                print(f"⏳ Appel API {api_name}: {func.__name__}")
-                result = func(*args, **kwargs)
-                if result is not None:  # Ne pas cacher les résultats vides
-                    self.set(cache_key, result, expire_days)
-                    print(f"💾 Résultat mis en cache pour {api_name}")
+                return deleted_count
+        except Exception as e:
+            print(f"⚠️ Erreur vidage cache: {e}")
+            return 0
+    
+    def cleanup_expired(self) -> int:
+        """Supprime les entrées de cache expirées"""
+        try:
+            with sqlite3.connect(self.cache_db_path) as conn:
+                cursor = conn.execute("""
+                    DELETE FROM cache 
+                    WHERE expires_at IS NOT NULL AND expires_at <= CURRENT_TIMESTAMP
+                """)
                 
-                return result
-            
-            return wrapper
-        return decorator
-    
-    def cached_extraction(self, source: str, expire_days: int = 7):
-        """Décorateur spécialisé pour les extractions de données"""
-        def decorator(func: Callable) -> Callable:
-            @wraps(func)
-            def wrapper(*args, **kwargs):
-                cache_key = self._generate_cache_key(f"extraction:{source}:{func.__name__}", *args, **kwargs)
+                deleted_count = cursor.rowcount
+                if deleted_count > 0:
+                    print(f"🧹 {deleted_count} entrée(s) expirée(s) supprimée(s)")
                 
-                cached_result = self.get(cache_key)
-                if cached_result is not None:
-                    print(f"🎯 Cache hit pour {source}: {func.__name__}")
-                    return cached_result
-                
-                print(f"⏳ Extraction {source}: {func.__name__}")
-                result = func(*args, **kwargs)
-                
-                if result is not None:
-                    self.set(cache_key, result, expire_days)
-                    print(f"💾 Résultat mis en cache pour {source}")
-                
-                return result
-            
-            return wrapper
-        return decorator
-
-class SmartCache:
-    """Cache intelligent avec invalidation automatique"""
-    
-    def __init__(self, cache_manager: CacheManager):
-        self.cache = cache_manager
-        self.invalidation_rules = self._setup_invalidation_rules()
-    
-    def _setup_invalidation_rules(self) -> Dict[str, List[str]]:
-        """Définit les règles d'invalidation du cache"""
-        return {
-            # Quand un track est modifié, invalider ses caches
-            'track_updated': [
-                'api:genius:*',
-                'api:spotify:*',
-                'extraction:*'
-            ],
-            # Quand un artiste est modifié
-            'artist_updated': [
-                'api:genius:artist:*',
-                'api:spotify:artist:*'
-            ],
-            # Quand de nouveaux crédits sont ajoutés
-            'credits_updated': [
-                'extraction:genius:credits:*',
-                'stats:*'
-            ]
-        }
-    
-    def invalidate_by_event(self, event: str, entity_id: Optional[str] = None):
-        """Invalide le cache basé sur un événement"""
-        if event in self.invalidation_rules:
-            patterns = self.invalidation_rules[event]
-            for pattern in patterns:
-                if entity_id:
-                    pattern = pattern.replace('*', f'*{entity_id}*')
-                self._invalidate_pattern(pattern)
-    
-    def _invalidate_pattern(self, pattern: str):
-        """Invalide les entrées de cache correspondant à un pattern"""
-        # Récupérer toutes les clés de cache
-        all_keys = self.cache.get_cache_keys()
-        
-        # Trouver les clés qui correspondent au pattern
-        matching_keys = []
-        for key in all_keys:
-            if fnmatch.fnmatch(key, pattern):
-                matching_keys.append(key)
-        
-        # Supprimer les clés correspondantes
-        for key in matching_keys:
-            self.cache.delete(key)
-        
-        if matching_keys:
-            print(f"🗑️ Invalidé {len(matching_keys)} entrées de cache pour le pattern: {pattern}")
-
-class CacheStats:
-    """Statistiques et monitoring du cache"""
-    
-    def __init__(self, cache_manager: CacheManager):
-        self.cache = cache_manager
+                return deleted_count
+        except Exception as e:
+            print(f"⚠️ Erreur nettoyage expirations: {e}")
+            return 0
     
     def get_stats(self) -> Dict[str, Any]:
-        """Récupère les statistiques du cache"""
-        with self.cache.db.get_connection() as conn:
-            # Nombre total d'entrées
-            cursor = conn.execute("SELECT COUNT(*) as count FROM cache")
-            total_entries = cursor.fetchone()['count']
-            
-            # Entrées expirées
-            cursor = conn.execute("""
-                SELECT COUNT(*) as count FROM cache 
-                WHERE expires_at IS NOT NULL AND expires_at < ?
-            """, (datetime.now().isoformat(),))
-            expired_entries = cursor.fetchone()['count']
-            
-            # Taille approximative du cache
-            cursor = conn.execute("SELECT SUM(LENGTH(data)) as size FROM cache")
-            cache_size_bytes = cursor.fetchone()['size'] or 0
-            
-            # Répartition par préfixe
-            cursor = conn.execute("""
-                SELECT SUBSTR(cache_key, 1, INSTR(cache_key || ':', ':') - 1) as prefix,
-                       COUNT(*) as count
-                FROM cache
-                GROUP BY prefix
-                ORDER BY count DESC
-            """)
-            prefix_stats = {row['prefix']: row['count'] for row in cursor.fetchall()}
-            
-            return {
-                'total_entries': total_entries,
-                'expired_entries': expired_entries,
-                'active_entries': total_entries - expired_entries,
-                'cache_size_bytes': cache_size_bytes,
-                'cache_size_mb': round(cache_size_bytes / (1024 * 1024), 2),
-                'prefix_distribution': prefix_stats,
-                'hit_rate': self._calculate_hit_rate()
-            }
+        """Retourne les statistiques du cache"""
+        try:
+            with sqlite3.connect(self.cache_db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                
+                # Statistiques générales
+                cursor = conn.execute("SELECT COUNT(*) as total FROM cache")
+                total_entries = cursor.fetchone()['total']
+                
+                # Entrées expirées
+                cursor = conn.execute("""
+                    SELECT COUNT(*) as expired FROM cache 
+                    WHERE expires_at IS NOT NULL AND expires_at <= CURRENT_TIMESTAMP
+                """)
+                expired_entries = cursor.fetchone()['expired']
+                
+                # Répartition par type
+                cursor = conn.execute("""
+                    SELECT cache_type, COUNT(*) as count 
+                    FROM cache 
+                    GROUP BY cache_type
+                """)
+                type_breakdown = {row['cache_type']: row['count'] for row in cursor.fetchall()}
+                
+                return {
+                    'total_entries': total_entries,
+                    'expired_entries': expired_entries,
+                    'valid_entries': total_entries - expired_entries,
+                    'type_breakdown': type_breakdown
+                }
+        except Exception as e:
+            print(f"⚠️ Erreur stats cache: {e}")
+            return {}
     
-    def _calculate_hit_rate(self) -> float:
-        """Calcule approximativement le taux de réussite du cache"""
-        # Simplification: basé sur le ratio entrées actives / total
-        stats = self.get_stats()
-        if stats['total_entries'] == 0:
-            return 0.0
-        
-        return round((stats['active_entries'] / stats['total_entries']) * 100, 2)
+    def cache_artist_search(self, artist_name: str, data: Any) -> bool:
+        """Cache spécialisé pour les recherches d'artiste"""
+        key = f"artist_search:{artist_name.lower()}"
+        return self.set(key, data, cache_type='artist_search')
     
-    def cleanup_recommendations(self) -> List[str]:
-        """Recommandations pour optimiser le cache"""
-        recommendations = []
-        stats = self.get_stats()
-        
-        if stats['expired_entries'] > 0:
-            recommendations.append(f"Nettoyer {stats['expired_entries']} entrées expirées")
-        
-        if stats['cache_size_mb'] > 50:  # Si > 50MB
-            recommendations.append(f"Cache volumineux ({stats['cache_size_mb']}MB), considérer un nettoyage")
-        
-        # Analyser la distribution des préfixes
-        total = stats['total_entries']
-        for prefix, count in stats['prefix_distribution'].items():
-            percentage = (count / total) * 100
-            if percentage > 50:
-                recommendations.append(f"Préfixe '{prefix}' représente {percentage:.1f}% du cache")
-        
-        return recommendations
+    def get_cached_artist_search(self, artist_name: str) -> Optional[Any]:
+        """Récupère une recherche d'artiste en cache"""
+        key = f"artist_search:{artist_name.lower()}"
+        return self.get(key)
+    
+    def cache_track_list(self, artist_id: str, tracks: Any) -> bool:
+        """Cache spécialisé pour les listes de morceaux"""
+        key = f"track_list:{artist_id}"
+        return self.set(key, tracks, cache_type='track_list')
+    
+    def get_cached_track_list(self, artist_id: str) -> Optional[Any]:
+        """Récupère une liste de morceaux en cache"""
+        key = f"track_list:{artist_id}"
+        return self.get(key)
 
 # Instance globale du gestionnaire de cache
-cache_manager = CacheManager()
-smart_cache = SmartCache(cache_manager)
-cache_stats = CacheStats(cache_manager)
+_cache_manager = None
+
+def get_cache_manager() -> CacheManager:
+    """Récupère l'instance globale du gestionnaire de cache"""
+    global _cache_manager
+    if _cache_manager is None:
+        _cache_manager = CacheManager()
+    return _cache_manager
