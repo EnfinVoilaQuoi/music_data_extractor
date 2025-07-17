@@ -7,11 +7,7 @@ __all__ = []
 
 logger = logging.getLogger(__name__)
 
-# SUPPRESSION DES RÉEXPORTS PROBLÉMATIQUES
-# Ces imports créent des imports circulaires car ils tentent d'importer depuis steps/
-# qui lui-même peut importer depuis extractors/
-
-# Au lieu d'importer automatiquement, on propose des fonctions d'import dynamique
+# Fonctions d'import dynamique
 def get_discovery_step():
     """Import dynamique de DiscoveryStep pour éviter les imports circulaires"""
     try:
@@ -48,7 +44,7 @@ def get_export_step():
         logger.warning(f"⚠️ Impossible d'importer ExportStep: {e}")
         return None
 
-# Import sécurisé des utilitaires (pas de risque d'import circulaire)
+# Import sécurisé des utilitaires
 try:
     from utils.text_utils import (
         clean_artist_name, normalize_text, clean_track_title,

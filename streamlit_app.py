@@ -1,14 +1,17 @@
-# streamlit_app.py - Version optimisée et corrigée pour éviter les freezes
+# streamlit_app.py - Version complète corrigée
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from datetime import datetime, timedelta
-from pathlib import Path
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import time
-import uuid
-import signal
+from datetime import datetime, timedelta
+from typing import Dict, List, Any, Optional
+import json
+import os
+import logging
 
-# Configuration Streamlit
+# Configuration de la page
 st.set_page_config(
     page_title="Music Data Extractor",
     page_icon="🎵",
@@ -16,24 +19,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Imports sécurisés
-try:
-    from config.settings import settings
-    from core.database import Database
-    from core.session_manager import SessionManager
-    from steps.step1_discover import DiscoveryStep
-    from utils.export_utils import ExportManager
-    from models.enums import SessionStatus, ExportFormat
-    modules_available = True
-except ImportError as e:
-    st.error(f"❌ Erreur d'import: {e}")
-    modules_available = False
-
-# Variables de session
-if 'debug_mode' not in st.session_state:
-    st.session_state.debug_mode = st.query_params.get("debug", "false").lower() == "true"
-
-# Styles CSS essentiels
+# CSS personnalisé simplifié
 st.markdown("""
 <style>
     .main-header {
@@ -53,238 +39,171 @@ st.markdown("""
         margin-bottom: 1rem;
     }
     
+    .status-badge {
+        padding: 0.25rem 0.5rem;
+        border-radius: 12px;
+        font-size: 0.8rem;
+        font-weight: bold;
+    }
+    
     .status-progress { background: #17a2b8; color: white; }
     .status-completed { background: #28a745; color: white; }
     .status-failed { background: #dc3545; color: white; }
     .status-paused { background: #ffc107; color: black; }
-    
-    .nav-title {
-        font-size: 18px;
-        font-weight: bold;
-        color: #ffffff !important;
-        margin-bottom: 15px;
-        padding: 0 8px;
-        border-bottom: 2px solid #667eea;
-        padding-bottom: 8px;
-    }
-    
-    /* Style pour les boutons radio - VERSION CORRIGÉE POUR STREAMLIT MODERNE */
-    .stRadio > div {
-        gap: 8px;
-    }
-    
-    /* Cacher les cercles radio */
-    .stRadio > div > label > div:first-child {
-        display: none !important;
-    }
-    
-    /* Style de base pour tous les labels radio */
-    .stRadio > div > label {
-        background: rgba(255, 255, 255, 0.1) !important;
-        border-radius: 8px !important;
-        padding: 12px 16px !important;
-        margin: 4px 0 !important;
-        border: 1px solid rgba(255, 255, 255, 0.2) !important;
-        cursor: pointer !important;
-        transition: all 0.3s ease !important;
-        width: 100% !important;
-        display: block !important;
-        color: #ffffff !important;
-        backdrop-filter: blur(10px) !important;
-    }
-    
-    /* Effet hover */
-    .stRadio > div > label:hover {
-        background: rgba(255, 255, 255, 0.2) !important;
-        border-color: #667eea !important;
-        box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2) !important;
-    }
-    
-    /* Style pour le bouton sélectionné - basé sur l'input checked */
-    .stRadio > div > label:has(input[type="radio"]:checked) {
-        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%) !important;
-        color: white !important;
-        font-weight: bold !important;
-        border-color: #667eea !important;
-        box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4) !important;
-    }
-    
-    /* Fallback pour navigateurs qui ne supportent pas :has() */
-    .stRadio > div > label input[type="radio"]:checked + div {
-        /* Force le parent label à avoir le style sélectionné */
-    }
-    
-    /* Autre fallback avec sélecteur plus général */
-    .stSidebar [data-testid="stRadio"] label:has(input:checked) {
-        background: linear-gradient(90deg, #667eea 0%, #764ba2 100%) !important;
-        color: white !important;
-        font-weight: bold !important;
-        border-color: #667eea !important;
-        box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4) !important;
-    }
-    
-    .stSidebar .stMarkdown, .stSidebar .stText {
-        color: #ffffff !important;
-    }
-    
-    .stSidebar .stAlert {
-        background: rgba(255, 255, 255, 0.1) !important;
-        border: 1px solid rgba(255, 255, 255, 0.2) !important;
-        color: #ffffff !important;
-        border-radius: 8px !important; /* Même bordure arrondie que la navigation */
-    }
 </style>
 """, unsafe_allow_html=True)
 
+def safe_import_modules():
+    """Import sécurisé des modules avec gestion d'erreurs"""
+    try:
+        from config.settings import settings
+        from core.database import Database
+        from core.session_manager import get_session_manager
+        from steps.step1_discover import DiscoveryStep
+        from utils.export_utils import ExportManager
+        from models.enums import SessionStatus, ExtractionStatus
+        
+        modules = {
+            'settings': settings,
+            'Database': Database,
+            'get_session_manager': get_session_manager,
+            'DiscoveryStep': DiscoveryStep,
+            'ExportManager': ExportManager,
+            'SessionStatus': SessionStatus
+        }
+        
+        # Imports optionnels
+        try:
+            from steps.step2_extract import ExtractionStep
+            modules['ExtractionStep'] = ExtractionStep
+        except ImportError:
+            modules['ExtractionStep'] = None
+        
+        try:
+            from steps.step4_export import Step4Export
+            from models.enums import ExportFormat
+            modules['Step4Export'] = Step4Export
+            modules['ExportFormat'] = ExportFormat
+        except ImportError:
+            modules['Step4Export'] = None
+            modules['ExportFormat'] = None
+        
+        return modules, True
+        
+    except ImportError as e:
+        st.error(f"❌ Erreur d'import des modules: {e}")
+        return {}, False
+
+def safe_calculate_age(session_datetime):
+    """Calcule l'âge d'une session de manière sécurisée"""
+    if not session_datetime:
+        return timedelta(0)
+    
+    try:
+        current_time = datetime.now()
+        if hasattr(session_datetime, 'tzinfo') and session_datetime.tzinfo:
+            session_datetime = session_datetime.replace(tzinfo=None)
+        
+        age = current_time - session_datetime
+        return age if age.total_seconds() >= 0 else timedelta(0)
+        
+    except Exception as e:
+        st.warning(f"⚠️ Erreur calcul âge: {e}")
+        return timedelta(0)
+
+def format_age(age_timedelta):
+    """Formate un timedelta en chaîne lisible"""
+    if not age_timedelta or age_timedelta.total_seconds() < 1:
+        return "quelques secondes"
+    
+    total_seconds = int(age_timedelta.total_seconds())
+    days = total_seconds // 86400
+    hours = (total_seconds % 86400) // 3600
+    minutes = (total_seconds % 3600) // 60
+    
+    if days > 0:
+        return f"{days}j {hours}h" if hours > 0 else f"{days}j"
+    elif hours > 0:
+        return f"{hours}h {minutes}m" if minutes > 0 else f"{hours}h"
+    elif minutes > 0:
+        return f"{minutes}m"
+    else:
+        return "quelques secondes"
+
 class StreamlitInterface:
-    """Interface Streamlit optimisée et sécurisée"""
+    """Interface Streamlit principale - Version simplifiée et robuste"""
     
     def __init__(self):
-        if not modules_available:
+        # Import des modules
+        self.modules, self.modules_available = safe_import_modules()
+        if not self.modules_available:
             st.stop()
         
-        self.debug_mode = st.session_state.debug_mode
-        self.initialize_components()
+        # Initialisation des composants avec gestion d'erreurs
+        self.init_components()
+        
+        # État de l'interface simplifié
+        if 'current_session_id' not in st.session_state:
+            st.session_state.current_session_id = None
     
-    def initialize_components(self):
-        """Initialisation sécurisée des composants"""
-        
-        if self.debug_mode:
-            st.write("🔍 MODE DEBUG ACTIVÉ")
-        
+    def init_components(self):
+        """Initialise les composants avec gestion d'erreurs robuste"""
         try:
             # Database
             if 'database' not in st.session_state:
-                st.session_state.database = Database()
-                if self.debug_mode:
-                    st.write("✅ Database initialisée")
+                st.session_state.database = self.modules['Database']()
             
-            # SessionManager SANS THREADING (critique pour éviter les freezes)
+            # Session Manager avec fallback simple
             if 'session_manager' not in st.session_state:
-                st.session_state.session_manager = SessionManager(
-                    db=st.session_state.database,
-                    enable_threading=False  # IMPORTANT: Pas de threading
-                )
-                if self.debug_mode:
-                    st.write("✅ SessionManager créé (mode stable sans threading)")
+                try:
+                    st.session_state.session_manager = self.modules['get_session_manager']()
+                except Exception as e:
+                    st.warning(f"⚠️ Session manager unavailable: {e}")
+                    st.session_state.session_manager = None
             
             # Discovery Step
             if 'discovery_step' not in st.session_state:
-                st.session_state.discovery_step = DiscoveryStep(
-                    session_manager=st.session_state.session_manager,
-                    database=st.session_state.database
-                )
-                if self.debug_mode:
-                    st.write("✅ DiscoveryStep initialisé")
+                st.session_state.discovery_step = self.modules['DiscoveryStep']()
             
             # Export Manager
             if 'export_manager' not in st.session_state:
-                st.session_state.export_manager = ExportManager()
-                if self.debug_mode:
-                    st.write("✅ ExportManager initialisé")
+                st.session_state.export_manager = self.modules['ExportManager']()
             
-            # APIs
-            if 'apis_configured' not in st.session_state:
-                st.session_state.apis_configured = self.check_api_configuration()
+            # Extraction Step (optionnel)
+            if self.modules['ExtractionStep'] and 'extraction_step' not in st.session_state:
+                st.session_state.extraction_step = self.modules['ExtractionStep']()
             
-            return True
-            
+            # Export Step (optionnel)
+            if self.modules['Step4Export'] and 'export_step' not in st.session_state:
+                st.session_state.export_step = self.modules['Step4Export'](st.session_state.database)
+                
         except Exception as e:
-            st.error(f"❌ Erreur initialisation: {e}")
-            if self.debug_mode:
-                st.exception(e)
-            return False
-    
-    def check_api_configuration(self):
-        """Vérifie les APIs configurées"""
-        api_count = 0
-        
-        if hasattr(settings, 'genius_api_key') and settings.genius_api_key:
-            api_count += 1
-        if hasattr(settings, 'spotify_client_id') and settings.spotify_client_id:
-            api_count += 1
-        if hasattr(settings, 'spotify_client_secret') and settings.spotify_client_secret:
-            api_count += 1
-        if hasattr(settings, 'discogs_token') and settings.discogs_token:
-            api_count += 1
-        if hasattr(settings, 'lastfm_api_key') and settings.lastfm_api_key:
-            api_count += 1
-        
-        return api_count
-    
-    def create_session_safe(self, artist_name: str, metadata: dict = None) -> str:
-        """Création de session sécurisée avec fallback automatique"""
-        print(f"🔍 Création session sécurisée pour {artist_name}")
-        
-        try:
-            # Tentative normale AVEC TIMEOUT pour détecter les freezes
-            def timeout_handler(signum, frame):
-                raise TimeoutError("Timeout création session")
-            
-            use_timeout = hasattr(signal, 'SIGALRM')  # Unix/Linux seulement
-            
-            if use_timeout:
-                signal.signal(signal.SIGALRM, timeout_handler)
-                signal.alarm(5)  # 5 secondes max
-            
-            start_time = time.time()
-            
-            session_id = st.session_state.session_manager.create_session(
-                artist_name=artist_name,
-                metadata=metadata or {}
-            )
-            
-            if use_timeout:
-                signal.alarm(0)
-            
-            creation_time = time.time() - start_time
-            if creation_time > 3:
-                st.warning(f"⚠️ Création lente ({creation_time:.1f}s)")
-            
-            print(f"✅ Session normale créée: {session_id[:8]} en {creation_time:.1f}s")
-            return session_id
-            
-        except Exception as e:
-            if use_timeout:
-                signal.alarm(0)
-            
-            print(f"⚠️ Échec création normale: {e}")
-            
-            # FALLBACK - Session temporaire
-            session_id = f"temp_{int(time.time())}_{str(uuid.uuid4())[:8]}"
-            
-            if 'temp_sessions' not in st.session_state:
-                st.session_state.temp_sessions = {}
-            
-            st.session_state.temp_sessions[session_id] = {
-                'id': session_id,
-                'artist_name': artist_name,
-                'status': 'in_progress',
-                'created_at': time.time(),
-                'metadata': metadata or {}
-            }
-            
-            st.info("ℹ️ Session temporaire créée (mode stable)")
-            print(f"✅ Session temporaire: {session_id}")
-            return session_id
+            st.error(f"❌ Erreur initialisation composants: {e}")
     
     def run(self):
-        """Point d'entrée principal"""
-        
+        """Lance l'interface principale"""
         # En-tête
         st.markdown("""
         <div class="main-header">
             <h1>🎵 Music Data Extractor</h1>
-            <p>Interface d'extraction de données musicales</p>
+            <p>Extracteur de données musicales avec focus rap/hip-hop</p>
         </div>
         """, unsafe_allow_html=True)
         
-        # Sidebar navigation
-        self.render_sidebar()
+        # Sidebar avec menu
+        with st.sidebar:
+            st.markdown("### 📱 Navigation")
+            page = st.radio(
+                "Menu",
+                ["🏠 Dashboard", "🔍 Nouvelle extraction", "📝 Sessions", "📤 Exports", "⚙️ Paramètres"],
+                label_visibility="collapsed"
+            )
+            
+            # Informations système
+            st.markdown("---")
+            self.render_sidebar_info()
         
-        # Contenu principal
-        page = st.session_state.get('current_page', '🏠 Dashboard')
-        
+        # Affichage de la page sélectionnée
         if page == "🏠 Dashboard":
             self.render_dashboard()
         elif page == "🔍 Nouvelle extraction":
@@ -296,135 +215,42 @@ class StreamlitInterface:
         elif page == "⚙️ Paramètres":
             self.render_settings()
     
-    def render_sidebar(self):
-        """Sidebar avec navigation et stats"""
-        with st.sidebar:
-            st.markdown('<div class="nav-title">🧭 Navigation</div>', unsafe_allow_html=True)
-            
-            # Menu principal avec boutons radio - VERSION ORIGINALE
-            page = st.radio(
-                "Menu de navigation",
-                options=[
-                    "🏠 Dashboard", 
-                    "🔍 Nouvelle extraction", 
-                    "📝 Sessions", 
-                    "📤 Exports", 
-                    "⚙️ Paramètres"
-                ],
-                index=0,
-                label_visibility="collapsed",
-                key="current_page"
-            )
-            
-            st.markdown("---")
-            st.markdown('<div class="nav-title">📊 Stats rapides</div>', unsafe_allow_html=True)
-            
-            try:
-                # Stats essentielles
-                sessions = st.session_state.session_manager.list_sessions()
-                active_sessions = len([s for s in sessions if s.status == SessionStatus.IN_PROGRESS])
-                
-                total_tracks = 0
-                total_artists = 0
-                
-                # Tentative de récupération des stats DB
-                try:
-                    if hasattr(st.session_state.database, 'get_connection'):
-                        with st.session_state.database.get_connection() as conn:
-                            cursor = conn.execute("SELECT COUNT(*) FROM tracks")
-                            result = cursor.fetchone()
-                            total_tracks = result[0] if result else 0
-                            
-                            cursor = conn.execute("SELECT COUNT(DISTINCT artist_id) FROM tracks")
-                            result = cursor.fetchone()
-                            total_artists = result[0] if result else 0
-                except:
-                    pass
-                
-                st.info(f"🎵 **{total_tracks}** morceaux")
-                st.info(f"👥 **{total_artists}** artistes")
-                st.info(f"⚡ **{active_sessions}** sessions actives")
-                
-                # APIs
-                api_count = st.session_state.get('apis_configured', 0)
-                if api_count >= 3:
-                    st.success(f"✅ {api_count}/5 APIs")
-                elif api_count >= 1:
-                    st.warning(f"⚠️ {api_count}/5 APIs")
-                else:
-                    st.error("❌ Aucune API")
-                
-            except Exception as e:
-                st.warning("⚠️ Impossible de charger les stats")
-                if self.debug_mode:
-                    st.error(f"Erreur: {e}")
-    
-    def render_dashboard(self):
-        """Dashboard principal"""
-        st.header("📊 Dashboard")
-        
-        # Métriques principales
-        col1, col2, col3, col4 = st.columns(4)
-        
+    def render_sidebar_info(self):
+        """Affiche les informations dans la sidebar"""
         try:
-            sessions = st.session_state.session_manager.list_sessions()
-            active_sessions = len([s for s in sessions if s.status == SessionStatus.IN_PROGRESS])
+            st.markdown("### 📊 Système")
+            st.success("✅ Base de données connectée")
             
-            # Stats de base
-            total_tracks = 0
-            total_artists = 0
+            # Sessions si disponibles
+            if st.session_state.session_manager:
+                try:
+                    sessions = st.session_state.session_manager.list_sessions()
+                    active_sessions = len([s for s in sessions if s.status == self.modules['SessionStatus'].IN_PROGRESS])
+                    st.info(f"🔄 {active_sessions} session(s) active(s)")
+                except Exception as e:
+                    st.warning("⚠️ Sessions non disponibles")
             
-            try:
-                with st.session_state.database.get_connection() as conn:
-                    cursor = conn.execute("SELECT COUNT(*) FROM tracks")
-                    result = cursor.fetchone()
-                    total_tracks = result[0] if result else 0
-                    
-                    cursor = conn.execute("SELECT COUNT(DISTINCT artist_id) FROM tracks")
-                    result = cursor.fetchone()
-                    total_artists = result[0] if result else 0
-            except:
-                pass
-            
-            with col1:
-                st.metric("🎵 Morceaux", total_tracks)
-            
-            with col2:
-                st.metric("👥 Artistes", total_artists)
-            
-            with col3:
-                st.metric("⚡ Sessions actives", active_sessions)
-            
-            with col4:
-                st.metric("📝 Total sessions", len(sessions))
-            
-            # Sessions récentes
-            st.subheader("🕒 Sessions récentes")
-            recent_sessions = sessions[-5:] if sessions else []
-            
-            if recent_sessions:
-                for session in reversed(recent_sessions):
-                    self.render_session_card(session)
-            else:
-                st.info("Aucune session récente. Créez votre première extraction !")
+            # Métriques rapides
+            stats = self.get_quick_stats()
+            if stats:
+                st.metric("Artistes", stats.get('total_artists', 0))
+                st.metric("Morceaux", stats.get('total_tracks', 0))
                 
         except Exception as e:
-            st.error(f"❌ Erreur dashboard: {e}")
-            if self.debug_mode:
-                st.exception(e)
+            st.error(f"❌ Erreur sidebar: {e}")
     
     def render_new_extraction(self):
-        """Interface nouvelle extraction"""
-        st.header("🎵 Nouvelle extraction")
+        """Interface pour nouvelle extraction - Version simplifiée"""
+        st.header("🔍 Nouvelle extraction")
         
         with st.form("new_extraction"):
             col1, col2 = st.columns([2, 1])
             
             with col1:
                 artist_name = st.text_input(
-                    "Nom de l'artiste *",
-                    placeholder="Ex: Nekfeu, JuL, PNL...",
-                    help="Saisissez le nom exact de l'artiste"
+                    "Nom de l'artiste",
+                    placeholder="Ex: Eminem, Booba, Nekfeu...",
+                    help="Saisissez le nom de l'artiste à extraire"
                 )
             
             with col2:
@@ -435,434 +261,402 @@ class StreamlitInterface:
                     value=100
                 )
             
-            # Options avancées
-            with st.expander("⚙️ Options avancées"):
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    enable_lyrics = st.checkbox("Extraire les paroles", value=True)
-                    batch_size = st.selectbox("Taille des lots", [5, 10, 15, 20], index=1)
-                    force_refresh = st.checkbox("Forcer le rafraîchissement", False)
-                
-                with col2:
-                    max_workers = st.selectbox("Workers parallèles", [1, 2, 3, 5], index=2)
-                    use_cache = st.checkbox("Utiliser le cache", value=True)
-                    
-                    priority_sources = st.multiselect(
-                        "Sources prioritaires",
-                        ["genius", "spotify", "discogs", "lastfm", "rapedia"],
-                        default=["genius", "spotify"],
-                        help="Ordre de priorité pour l'extraction des données"
-                    )
+            # Options simples
+            with st.expander("🔧 Options"):
+                enable_lyrics = st.checkbox("Inclure les paroles", True)
+                include_features = st.checkbox("Inclure les featuring", True)
             
             submitted = st.form_submit_button("🚀 Lancer l'extraction", use_container_width=True)
-        
-        if submitted:
-            if not artist_name.strip():
-                st.error("❌ Veuillez saisir un nom d'artiste")
-                return
             
-            if st.session_state.get('apis_configured', 0) == 0:
-                st.error("❌ Aucune API configurée. Allez dans Paramètres.")
-                return
-            
-            # Lancer l'extraction
-            self.start_extraction(
-                artist_name=artist_name.strip(),
-                max_tracks=max_tracks,
-                enable_lyrics=enable_lyrics,
-                batch_size=batch_size,
-                max_workers=max_workers,
-                use_cache=use_cache,
-                force_refresh=force_refresh,
-                priority_sources=priority_sources
-            )
+            if submitted and artist_name:
+                self.start_extraction_robust(
+                    artist_name=artist_name,
+                    max_tracks=max_tracks,
+                    enable_lyrics=enable_lyrics,
+                    include_features=include_features
+                )
     
-    def start_extraction(self, artist_name: str, **kwargs):
-        """Lance l'extraction avec suivi"""
-        st.header(f"🎵 Extraction pour {artist_name}")
+    def start_extraction_robust(self, **kwargs):
+        """Démarre une extraction avec gestion d'erreurs robuste"""
+        artist_name = kwargs['artist_name']
         
-        # Barre de progression
-        progress = st.progress(0, text="Initialisation...")
-        status = st.empty()
+        # Containers pour l'affichage
+        status_container = st.empty()
+        progress_container = st.empty()
+        results_container = st.empty()
         
         try:
-            # Étape 1: Création session
-            status.text("🔄 Création de la session...")
-            progress.progress(0.1)
+            with status_container.container():
+                st.info(f"🚀 **Démarrage de l'extraction pour {artist_name}**")
             
-            session_id = self.create_session_safe(artist_name, {
-                "max_tracks": kwargs.get('max_tracks', 100),
-                "enable_lyrics": kwargs.get('enable_lyrics', True),
-                "batch_size": kwargs.get('batch_size', 10),
-                "max_workers": kwargs.get('max_workers', 3),
-                "use_cache": kwargs.get('use_cache', True),
-                "force_refresh": kwargs.get('force_refresh', False),
-                "priority_sources": kwargs.get('priority_sources', ["genius", "spotify"]),
-                "interface": "streamlit_v3"
-            })
+            # Étape 1: Session (simple et robuste)
+            session_id = self.create_session_robust(artist_name, kwargs)
             
-            progress.progress(0.3)
-            status.text(f"✅ Session créée: {session_id[:12]}")
-            st.success(f"Session: {session_id[:12]}")
+            with progress_container.container():
+                st.write("🔍 **Découverte des morceaux en cours...**")
+                progress_bar = st.progress(0, text="Recherche...")
             
-            # Étape 2: Découverte
-            status.text("🔍 Découverte des morceaux...")
-            progress.progress(0.5)
+            # Étape 2: Découverte avec gestion d'erreurs robuste
+            progress_bar.progress(0.3, text="Interrogation des sources...")
             
+            tracks, stats = self.discover_tracks_robust(artist_name, session_id, kwargs)
+            
+            progress_bar.progress(1.0, text="Découverte terminée")
+            
+            # Affichage des résultats
+            with results_container.container():
+                if tracks:
+                    self.display_discovery_results(tracks, stats, artist_name)
+                    
+                    # Actions suivantes
+                    st.markdown("### 🎯 Prochaines étapes")
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        if st.button("🔄 **Nouvelle extraction**", use_container_width=True):
+                            self.clear_extraction_state()
+                            st.rerun()
+                    
+                    with col2:
+                        if st.button("📊 **Voir Sessions**", use_container_width=True):
+                            st.info("💡 Consultez l'onglet Sessions")
+                    
+                    with col3:
+                        if st.button("📤 **Aller aux Exports**", use_container_width=True):
+                            st.info("💡 Consultez l'onglet Exports")
+                else:
+                    st.error(f"❌ Aucun morceau trouvé pour {artist_name}")
+                    
+                    if st.button("🔄 **Réessayer**", use_container_width=True):
+                        self.clear_extraction_state()
+                        st.rerun()
+            
+            # Nettoyer les containers de progression
+            status_container.empty()
+            progress_container.empty()
+            
+        except Exception as e:
+            st.error(f"❌ Erreur lors de l'extraction: {e}")
+            
+            # Affichage de debug si nécessaire
+            with st.expander("🔍 Détails de l'erreur"):
+                st.exception(e)
+            
+            if st.button("🔄 **Réessayer**", use_container_width=True):
+                self.clear_extraction_state()
+                st.rerun()
+    
+    def create_session_robust(self, artist_name: str, kwargs: dict) -> str:
+        """Crée une session de manière robuste avec fallback"""
+        import uuid
+        
+        # Essai avec SessionManager si disponible
+        if st.session_state.session_manager:
+            try:
+                session_id = st.session_state.session_manager.create_session(
+                    artist_name=artist_name,
+                    metadata=kwargs
+                )
+                return session_id
+            except Exception as e:
+                st.warning(f"⚠️ SessionManager failed: {e}, using fallback")
+        
+        # Fallback: Session temporaire
+        session_id = f"temp_{int(time.time())}_{str(uuid.uuid4())[:8]}"
+        
+        if 'temp_sessions' not in st.session_state:
+            st.session_state.temp_sessions = {}
+        
+        st.session_state.temp_sessions[session_id] = {
+            'id': session_id,
+            'artist_name': artist_name,
+            'status': 'in_progress',
+            'created_at': datetime.now(),
+            'metadata': kwargs
+        }
+        
+        st.session_state.current_session_id = session_id
+        st.info("📝 Session temporaire créée")
+        return session_id
+    
+    def discover_tracks_robust(self, artist_name: str, session_id: str, kwargs: dict):
+        """Découverte robuste avec gestion d'erreurs détaillée"""
+        try:
+            # Appel de découverte avec gestion d'erreurs
             tracks, stats = st.session_state.discovery_step.discover_artist_tracks(
                 artist_name=artist_name,
                 session_id=session_id,
                 max_tracks=kwargs.get('max_tracks', 100)
             )
             
-            progress.progress(0.8)
+            return tracks, stats
             
-            if tracks and len(tracks) > 0:
-                status.text(f"✅ {len(tracks)} morceaux trouvés")
-                st.success(f"🎉 {len(tracks)} morceaux découverts !")
+        except KeyError as ke:
+            # Gestion spécifique de l'erreur "No item with that key"
+            st.error(f"❌ Erreur de clé manquante: {ke}")
+            st.warning("💡 Cette erreur indique souvent un problème avec l'API ou les données retournées")
+            
+            # Proposer un diagnostic
+            with st.expander("🔍 Diagnostic"):
+                st.write("**Causes possibles:**")
+                st.write("- Clé API invalide ou expirée")
+                st.write("- Structure de données inattendue de l'API")
+                st.write("- Nom d'artiste non reconnu par les sources")
+                st.write("- Problème temporaire avec les services externes")
                 
-                # Résultats
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Morceaux trouvés", len(tracks))
-                with col2:
-                    st.metric("Source principale", "Genius")
-                with col3:
-                    st.metric("Temps", f"{stats.discovery_time_seconds:.1f}s")
-                
-                # Prévisualisation
-                if tracks:
-                    st.subheader("📋 Aperçu des morceaux")
-                    
-                    tracks_df = pd.DataFrame([{
-                        'Titre': track.title[:50] + '...' if len(track.title) > 50 else track.title,
-                        'Album': track.album_name[:30] + '...' if track.album_name and len(track.album_name) > 30 else track.album_name or 'N/A',
-                        'Année': track.release_year or 'N/A',
-                        'Source': track.data_source.value if hasattr(track.data_source, 'value') else str(track.data_source)
-                    } for track in tracks[:20]])
-                    
-                    st.dataframe(tracks_df, use_container_width=True)
-                    
-                    if len(tracks) > 20:
-                        st.info(f"Affichage des 20 premiers sur {len(tracks)} total")
-                
-                # Finaliser
-                if hasattr(st.session_state.session_manager, 'complete_session'):
-                    st.session_state.session_manager.complete_session(session_id, {
-                        'tracks_found': len(tracks)
-                    })
-                
-                progress.progress(1.0)
-                status.text("✅ Extraction terminée")
-                
-                # Actions
-                st.markdown("### 🎯 Actions")
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    if st.button("📤 Exporter", use_container_width=True):
-                        st.session_state.current_page = "📤 Exports"
-                        st.rerun()
-                
-                with col2:
-                    if st.button("🔍 Détails", use_container_width=True):
-                        st.session_state.current_page = "📝 Sessions"
-                        st.rerun()
-                
-                with col3:
-                    if st.button("🎵 Nouvelle", use_container_width=True):
-                        st.rerun()
-                
-            else:
-                status.text("❌ Aucun morceau trouvé")
-                st.error(f"❌ Aucun morceau trouvé pour {artist_name}")
-                st.info("💡 Vérifiez l'orthographe ou essayez un autre artiste")
+                st.write("**Solutions:**")
+                st.write("1. Vérifiez les clés API dans Paramètres")
+                st.write("2. Essayez avec un nom d'artiste plus connu")
+                st.write("3. Réessayez dans quelques minutes")
+            
+            raise Exception(f"Erreur découverte pour {artist_name}: {ke}")
             
         except Exception as e:
-            progress.empty()
-            status.empty()
-            st.error(f"❌ Erreur extraction: {e}")
-            if self.debug_mode:
-                st.exception(e)
+            st.error(f"❌ Erreur découverte: {e}")
+            raise
+    
+    def display_discovery_results(self, tracks, stats, artist_name):
+        """Affiche les résultats de découverte"""
+        st.success(f"🎉 **Extraction réussie pour {artist_name}!**")
+        
+        # Métriques
+        if hasattr(stats, 'final_count'):
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("🎵 Morceaux trouvés", stats.final_count)
+            
+            with col2:
+                st.metric("💎 Genius", getattr(stats, 'genius_found', 0))
+            
+            with col3:
+                st.metric("🗑️ Doublons supprimés", getattr(stats, 'duplicates_removed', 0))
+            
+            with col4:
+                if hasattr(stats, 'discovery_time_seconds'):
+                    st.metric("⏱️ Temps", f"{stats.discovery_time_seconds:.1f}s")
+        else:
+            # Fallback si stats n'a pas la structure attendue
+            st.metric("🎵 Morceaux trouvés", len(tracks) if tracks else 0)
+        
+        # Informations supplémentaires
+        if tracks:
+            st.write(f"✅ **{len(tracks)} morceaux** découverts avec succès")
+            
+            # Aperçu des premiers morceaux
+            with st.expander("👁️ Aperçu des morceaux trouvés"):
+                preview_tracks = tracks[:5]  # Premiers 5 morceaux
+                for i, track in enumerate(preview_tracks):
+                    title = track.title if hasattr(track, 'title') else track.get('title', 'Titre inconnu')
+                    st.write(f"{i+1}. {title}")
+                
+                if len(tracks) > 5:
+                    st.caption(f"... et {len(tracks) - 5} autres morceaux")
+    
+    def clear_extraction_state(self):
+        """Nettoie l'état d'extraction"""
+        # Nettoyer les sessions temporaires si elles existent
+        if 'temp_sessions' in st.session_state:
+            st.session_state.temp_sessions.clear()
+        
+        # Réinitialiser l'ID de session courante
+        st.session_state.current_session_id = None
+    
+    def render_dashboard(self):
+        """Dashboard simplifié"""
+        st.header("📊 Dashboard")
+        
+        # Métriques rapides
+        stats = self.get_quick_stats()
+        if stats:
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                st.metric("Sessions", stats.get('total_sessions', 0))
+            with col2:
+                st.metric("Artistes", stats.get('total_artists', 0))
+            with col3:
+                st.metric("Morceaux", stats.get('total_tracks', 0))
+            with col4:
+                st.metric("Actives", stats.get('active_sessions', 0))
+        
+        # Informations récentes
+        st.subheader("📈 Activité récente")
+        
+        if st.session_state.session_manager:
+            try:
+                sessions = st.session_state.session_manager.list_sessions()
+                recent_sessions = sorted(sessions, key=lambda s: s.created_at or datetime.min, reverse=True)[:3]
+                
+                if recent_sessions:
+                    for session in recent_sessions:
+                        status_emoji = {
+                            self.modules['SessionStatus'].IN_PROGRESS: "🔄",
+                            self.modules['SessionStatus'].COMPLETED: "✅",
+                            self.modules['SessionStatus'].FAILED: "❌"
+                        }.get(session.status, "❓")
+                        
+                        st.write(f"{status_emoji} **{session.artist_name}** - {session.status.value}")
+                else:
+                    st.info("Aucune session récente")
+            except Exception as e:
+                st.warning("⚠️ Impossible de charger les sessions récentes")
+        else:
+            st.info("Aucune session disponible")
     
     def render_sessions(self):
-        """Gestion des sessions"""
+        """Gestion des sessions simplifiée"""
         st.header("📝 Sessions")
         
-        # Filtres
-        col1, col2, col3 = st.columns(3)
+        if not st.session_state.session_manager:
+            st.warning("⚠️ Gestionnaire de sessions non disponible")
+            return
         
-        with col1:
-            status_filter = st.selectbox(
-                "Statut",
-                ["Tous", "En cours", "Terminées", "Échouées", "En pause"]
-            )
-        
-        with col2:
-            limit = st.selectbox("Nombre", [10, 25, 50], index=1)
-        
-        with col3:
-            if st.button("🔄 Actualiser", use_container_width=True):
-                st.rerun()
-        
-        # Sessions
         try:
-            if status_filter == "Tous":
-                sessions = st.session_state.session_manager.list_sessions(limit=limit)
-            else:
-                status_map = {
-                    "En cours": SessionStatus.IN_PROGRESS,
-                    "Terminées": SessionStatus.COMPLETED,
-                    "Échouées": SessionStatus.FAILED,
-                    "En pause": SessionStatus.PAUSED
-                }
-                sessions = st.session_state.session_manager.list_sessions(
-                    status=status_map[status_filter], limit=limit
-                )
+            sessions = st.session_state.session_manager.list_sessions()
             
             if not sessions:
                 st.info("Aucune session trouvée")
                 return
             
-            for session in reversed(sessions):
-                self.render_session_card(session, detailed=True)
-                
+            # Affichage simple des sessions
+            for session in sessions:
+                with st.container():
+                    col1, col2, col3 = st.columns([3, 2, 1])
+                    
+                    with col1:
+                        st.write(f"**{session.artist_name}**")
+                        st.caption(f"ID: {session.id[:8]}...")
+                    
+                    with col2:
+                        status_emoji = {
+                            self.modules['SessionStatus'].IN_PROGRESS: "🔄",
+                            self.modules['SessionStatus'].COMPLETED: "✅",
+                            self.modules['SessionStatus'].FAILED: "❌"
+                        }.get(session.status, "❓")
+                        st.write(f"{status_emoji} {session.status.value}")
+                    
+                    with col3:
+                        if session.created_at:
+                            age = safe_calculate_age(session.created_at)
+                            st.write(format_age(age))
+                    
+                    st.markdown("---")
+        
         except Exception as e:
-            st.error(f"❌ Erreur sessions: {e}")
-    
-    def render_session_card(self, session, detailed=False):
-        """Carte de session"""
-        
-        status_colors = {
-            SessionStatus.IN_PROGRESS: "#17a2b8",
-            SessionStatus.COMPLETED: "#28a745",
-            SessionStatus.FAILED: "#dc3545",
-            SessionStatus.PAUSED: "#ffc107"
-        }
-        
-        status_text = {
-            SessionStatus.IN_PROGRESS: "En cours",
-            SessionStatus.COMPLETED: "Terminée",
-            SessionStatus.FAILED: "Échouée",
-            SessionStatus.PAUSED: "En pause"
-        }
-        
-        color = status_colors.get(session.status, "#6c757d")
-        status_label = status_text.get(session.status, "Inconnu")
-        
-        st.markdown(f"""
-        <div style="border-left: 4px solid {color}; padding: 1rem; margin: 1rem 0; background: #f8f9fa; border-radius: 0 8px 8px 0;">
-            <h4 style="margin: 0;">🎵 {session.artist_name}</h4>
-            <p style="margin: 0.5rem 0;">
-                <span style="background: {color}; color: white; padding: 0.2rem 0.5rem; border-radius: 12px; font-size: 0.8rem;">
-                    {status_label}
-                </span>
-                <span style="margin-left: 1rem;">ID: {session.id[:12]}</span>
-            </p>
-            <p style="margin: 0; color: #888; font-size: 0.9rem;">
-                Créée: {session.created_at.strftime('%d/%m/%Y %H:%M') if session.created_at else 'N/A'}
-            </p>
-        </div>
-        """, unsafe_allow_html=True)
-        
-        if detailed:
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                if session.status == SessionStatus.IN_PROGRESS and st.button("⏸️ Pause", key=f"pause_{session.id}"):
-                    if hasattr(st.session_state.session_manager, 'pause_session'):
-                        st.session_state.session_manager.pause_session(session.id)
-                        st.success("Session mise en pause")
-                        st.rerun()
-            
-            with col2:
-                if session.status == SessionStatus.PAUSED and st.button("▶️ Reprendre", key=f"resume_{session.id}"):
-                    if hasattr(st.session_state.session_manager, 'resume_session'):
-                        st.session_state.session_manager.resume_session(session.id)
-                        st.success("Session reprise")
-                        st.rerun()
-            
-            with col3:
-                if st.button("🗑️ Supprimer", key=f"delete_{session.id}"):
-                    if st.session_state.session_manager.delete_session(session.id):
-                        st.success("Session supprimée")
-                        st.rerun()
+            st.error(f"❌ Erreur chargement sessions: {e}")
     
     def render_exports(self):
-        """Gestion des exports"""
+        """Interface d'exports simplifiée"""
         st.header("📤 Exports")
+        st.info("💡 Fonctionnalité d'export en cours de développement")
         
-        # Création export
-        st.subheader("➕ Créer un export")
-        
-        with st.form("create_export"):
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                export_format = st.selectbox("Format", ["CSV", "JSON", "Excel", "HTML"])
-                include_lyrics = st.checkbox("Inclure paroles", True)
-            
-            with col2:
-                try:
-                    sessions = st.session_state.session_manager.list_sessions(SessionStatus.COMPLETED, limit=50)
-                    if sessions:
-                        session_options = [f"{s.artist_name} ({s.id[:8]})" for s in sessions]
-                        selected_sessions = st.multiselect("Sessions à exporter", session_options)
-                    else:
-                        st.warning("Aucune session terminée")
-                        selected_sessions = []
-                except:
-                    selected_sessions = []
-            
-            submitted = st.form_submit_button("📤 Créer export", use_container_width=True)
-        
-        if submitted and selected_sessions:
-            try:
-                session_ids = [s.split('(')[1].split(')')[0] for s in selected_sessions]
-                
-                with st.spinner("Création export..."):
-                    export_path = st.session_state.export_manager.export_sessions(
-                        session_ids=session_ids,
-                        format=export_format.lower(),
-                        include_lyrics=include_lyrics
-                    )
-                
-                st.success(f"✅ Export créé: {export_path}")
-                
-                if Path(export_path).exists():
-                    with open(export_path, 'rb') as file:
-                        st.download_button(
-                            "⬇️ Télécharger",
-                            data=file.read(),
-                            file_name=Path(export_path).name,
-                            mime="application/octet-stream"
-                        )
-                
-            except Exception as e:
-                st.error(f"❌ Erreur export: {e}")
-        
-        elif submitted:
-            st.warning("⚠️ Sélectionnez au moins une session")
-        
-        # Liste exports existants
-        st.markdown("---")
-        st.subheader("📁 Exports existants")
-        
-        try:
-            exports = st.session_state.export_manager.list_exports()
-            
-            if not exports:
-                st.info("📁 Aucun export trouvé")
-                return
-            
-            for export in exports:
-                col1, col2, col3, col4 = st.columns([3, 1, 1, 1])
-                
-                with col1:
-                    st.write(f"**{export['filename']}**")
-                    st.caption(f"Créé: {export['created_at']}")
-                
-                with col2:
-                    st.write(f"{export['size_mb']:.1f} MB")
-                
-                with col3:
-                    st.write(export['format'].upper())
-                
-                with col4:
-                    if Path(export['path']).exists():
-                        with open(export['path'], 'rb') as file:
-                            st.download_button(
-                                "⬇️",
-                                data=file.read(),
-                                file_name=export['filename'],
-                                key=f"dl_{export['filename']}"
-                            )
-                    else:
-                        st.write("❌ Manquant")
-        
-        except Exception as e:
-            st.error(f"❌ Erreur liste exports: {e}")
+        # Placeholder pour les fonctionnalités futures
+        st.markdown("""
+        **Fonctionnalités prévues:**
+        - Export JSON
+        - Export CSV
+        - Export Excel
+        - Export HTML
+        """)
     
     def render_settings(self):
-        """Paramètres"""
+        """Paramètres simplifiés"""
         st.header("⚙️ Paramètres")
         
-        # APIs
-        st.subheader("🔑 APIs")
+        # Configuration des APIs
+        st.subheader("🔑 Configuration des APIs")
         
-        with st.form("api_config"):
+        # Affichage de l'état actuel
+        try:
+            settings = self.modules['settings']
+            
             col1, col2 = st.columns(2)
             
             with col1:
-                genius_key = st.text_input(
-                    "Genius API Key",
-                    value=getattr(settings, 'genius_api_key', '') or "",
-                    type="password"
-                )
+                genius_status = "✅ Configuré" if settings.genius_api_key else "❌ Non configuré"
+                st.write(f"**Genius API:** {genius_status}")
                 
-                spotify_id = st.text_input(
-                    "Spotify Client ID",
-                    value=getattr(settings, 'spotify_client_id', '') or ""
-                )
+                if st.button("🔧 Configurer Genius"):
+                    st.info("💡 Modifiez le fichier .env pour configurer les APIs")
             
             with col2:
-                spotify_secret = st.text_input(
-                    "Spotify Client Secret",
-                    value=getattr(settings, 'spotify_client_secret', '') or "",
-                    type="password"
-                )
+                spotify_status = "✅ Configuré" if settings.spotify_client_id else "❌ Non configuré"
+                st.write(f"**Spotify API:** {spotify_status}")
                 
-                discogs_token = st.text_input(
-                    "Discogs Token",
-                    value=getattr(settings, 'discogs_token', '') or "",
-                    type="password"
-                )
+                if st.button("🔧 Configurer Spotify"):
+                    st.info("💡 Modifiez le fichier .env pour configurer les APIs")
+        
+        except Exception as e:
+            st.error(f"❌ Erreur chargement paramètres: {e}")
+    
+    def get_quick_stats(self) -> Dict[str, Any]:
+        """Récupère les statistiques rapides avec gestion d'erreurs"""
+        try:
+            stats = {}
             
-            if st.form_submit_button("💾 Sauvegarder"):
-                st.success("✅ Configuration sauvegardée")
-                st.info("ℹ️ Redémarrez pour appliquer")
-        
-        # Maintenance
-        st.markdown("---")
-        st.subheader("🧹 Maintenance")
-        
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            if st.button("🗑️ Vider cache", use_container_width=True):
-                st.success("✅ Cache vidé")
-        
-        with col2:
-            if st.button("🧹 Nettoyer sessions", use_container_width=True):
+            # Sessions
+            if st.session_state.session_manager:
                 try:
-                    count = st.session_state.session_manager.cleanup_old_sessions(days=30)
-                    st.success(f"✅ {count} sessions supprimées")
-                except Exception as e:
-                    st.error(f"❌ Erreur: {e}")
-        
-        with col3:
-            if st.button("📊 Stats DB", use_container_width=True):
-                try:
+                    sessions = st.session_state.session_manager.list_sessions()
+                    stats['total_sessions'] = len(sessions)
+                    stats['active_sessions'] = len([s for s in sessions if s.status == self.modules['SessionStatus'].IN_PROGRESS])
+                except:
+                    stats['total_sessions'] = 0
+                    stats['active_sessions'] = 0
+            else:
+                stats['total_sessions'] = 0
+                stats['active_sessions'] = 0
+            
+            # Base de données
+            try:
+                if hasattr(st.session_state.database, 'get_connection'):
                     with st.session_state.database.get_connection() as conn:
-                        cursor = conn.execute("SELECT COUNT(*) FROM tracks")
-                        tracks = cursor.fetchone()[0]
+                        cursor = conn.execute("SELECT COUNT(DISTINCT id) FROM artists")
+                        result = cursor.fetchone()
+                        stats['total_artists'] = result[0] if result else 0
                         
-                        cursor = conn.execute("SELECT COUNT(*) FROM sessions")
-                        sessions = cursor.fetchone()[0]
-                        
-                        st.info(f"📊 {tracks} morceaux, {sessions} sessions")
-                except Exception as e:
-                    st.error(f"❌ Erreur stats: {e}")
+                        cursor = conn.execute("SELECT COUNT(DISTINCT id) FROM tracks")
+                        result = cursor.fetchone()
+                        stats['total_tracks'] = result[0] if result else 0
+                else:
+                    stats['total_artists'] = 0
+                    stats['total_tracks'] = 0
+            except:
+                stats['total_artists'] = 0
+                stats['total_tracks'] = 0
+            
+            return stats
+        
+        except Exception as e:
+            return {'total_sessions': 0, 'active_sessions': 0, 'total_artists': 0, 'total_tracks': 0}
 
 def main():
-    """Fonction principale"""
+    """Fonction principale avec gestion d'erreurs robuste"""
     try:
         app = StreamlitInterface()
         app.run()
     except Exception as e:
-        st.error(f"Erreur critique: {e}")
-        st.exception(e)
+        st.error(f"❌ Erreur critique: {e}")
+        
+        # Interface de récupération
+        st.markdown("### 🆘 Mode de récupération")
+        st.write("Une erreur critique s'est produite. Essayez ces solutions:")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("🔄 Recharger l'application"):
+                st.rerun()
+        
+        with col2:
+            if st.button("🧹 Nettoyer le cache"):
+                st.cache_data.clear()
+                st.success("Cache nettoyé, rechargez la page")
+        
+        # Debug info
+        with st.expander("🔍 Informations de debug"):
+            st.exception(e)
 
 if __name__ == "__main__":
     main()

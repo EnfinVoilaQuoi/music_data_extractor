@@ -1,4 +1,4 @@
-# steps/__init__.py - VERSION CORRIGÉE
+# steps/__init__.py - Version corrigée sans imports circulaires
 """Étapes de traitement du pipeline d'extraction"""
 
 import logging
@@ -8,8 +8,8 @@ __all__ = []
 # Configuration du logger
 logger = logging.getLogger(__name__)
 
-# Imports conditionnels pour les étapes - SUPPRESSION DES IMPORTS PROBLÉMATIQUES
-# Ces imports seront faits directement par les modules qui en ont besoin
+# PAS D'IMPORTS DIRECTS - pour éviter les imports circulaires
+# Les modules qui ont besoin des steps les importeront directement
 
 # Fonction helper pour lister les étapes disponibles
 def get_available_steps():
@@ -57,3 +57,5 @@ def get_export_step():
     except ImportError as e:
         logger.warning(f"⚠️ Erreur import ExportStep: {e}")
         return None
+
+logger.info("✅ Module steps initialisé sans imports circulaires")
