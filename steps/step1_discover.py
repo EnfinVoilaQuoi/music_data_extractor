@@ -1,4 +1,4 @@
-# steps/step1_discover.py - Version complète corrigée
+# steps/step1_discover.py
 import logging
 from typing import Dict, List, Optional, Any, Set, Tuple
 from datetime import datetime
@@ -53,13 +53,13 @@ class DiscoveryStep:
         self.genius_discovery = GeniusDiscovery()
         self.rapedia_scraper = RapediaScraper() if RapediaScraper else None
         
-        # Configuration avec valeurs par défaut sûres
+        # Configuration
         self.config = {
-            'max_tracks_per_source': getattr(settings, 'discovery_max_tracks_per_source', 200),
-            'enable_rapedia': getattr(settings, 'discovery_enable_rapedia', True) and RapediaScraper is not None,
-            'enable_genius': getattr(settings, 'discovery_enable_genius', True),
-            'similarity_threshold': getattr(settings, 'discovery_similarity_threshold', 0.85),
-            'prefer_verified_sources': getattr(settings, 'discovery_prefer_verified_sources', True)
+            'max_tracks_per_source': settings.get('discovery.max_tracks_per_source', 200),
+            'enable_rapedia': settings.get('discovery.enable_rapedia', True) and RapediaScraper is not None,
+            'enable_genius': settings.get('discovery.enable_genius', True),
+            'similarity_threshold': settings.get('discovery.similarity_threshold', 0.85),
+            'prefer_verified_sources': settings.get('discovery.prefer_verified_sources', True)
         }
         
         self.logger.info(f"DiscoveryStep initialisé (Genius: {self.config['enable_genius']}, Rapedia: {self.config['enable_rapedia']})")
@@ -91,114 +91,90 @@ class DiscoveryStep:
             # Créer ou récupérer l'artiste en base
             artist = self._get_or_create_artist(clean_name)
             
-            # Créer ou mettre à jour la session si disponible
-            if session_id and self.session_manager:
-                try:
-                    session = self.session_manager.get_session(session_id)
-                    if session:
-                        session.current_step = "discovery_started"
-                        session.artist_name = clean_name
-                        self.session_manager.update_session(session)
-                except Exception as e:
-                    self.logger.warning(f"⚠️ Session update failed: {e}")
+            # Créer ou mettre à jour la session
+            if session_id:
+                session = self.session_manager.get_session(session_id)
+                if session:
+                    session.current_step = "discovery_started"
+                    session.artist_name = clean_name
+                    self.session_manager.update_session(session)
             
             # Découverte depuis Genius
             genius_tracks = []
             if self.config['enable_genius']:
                 self.logger.info("🎵 Découverte via Genius...")
-                try:
-                    genius_result = self.genius_discovery.discover_artist_tracks(clean_name, max_tracks)
-                    
-                    if genius_result.success:
-                        genius_tracks = self._convert_genius_tracks(genius_result.tracks, artist.id)
-                        stats.genius_found = len(genius_tracks)
-                        self.logger.info(f"✅ Genius: {stats.genius_found} morceaux trouvés")
-                    else:
-                        self.logger.warning(f"⚠️ Genius: {genius_result.error}")
-                except Exception as e:
-                    self.logger.error(f"❌ Erreur Genius discovery: {e}")
-                    # Continue sans Genius
+                genius_result = self.genius_discovery.discover_artist_tracks(clean_name, max_tracks)
+                
+                if genius_result.success:
+                    genius_tracks = self._convert_genius_tracks(genius_result.tracks, artist.id)
+                    stats.genius_found = len(genius_tracks)
+                    self.logger.info(f"✅ Genius: {stats.genius_found} morceaux trouvés")
+                else:
+                    self.logger.warning(f"⚠️ Genius: {genius_result.error}")
             
             # Découverte depuis Rapedia (optionnel)
             rapedia_tracks = []
             if self.config['enable_rapedia'] and self.rapedia_scraper:
                 self.logger.info("🎵 Découverte via Rapedia...")
                 try:
-                    # Simuler la découverte Rapedia (à implémenter selon votre scraper)
-                    rapedia_tracks = self._discover_from_rapedia(clean_name, max_tracks, artist.id)
+                    # Simuler la découverte Rapedia (implémentation dépend du scraper)
+                    rapedia_tracks = []  # À implémenter selon votre scraper
                     stats.rapedia_found = len(rapedia_tracks)
                     self.logger.info(f"✅ Rapedia: {stats.rapedia_found} morceaux trouvés")
                 except Exception as e:
-                    self.logger.error(f"❌ Erreur Rapedia discovery: {e}")
-                    # Continue sans Rapedia
+                    self.logger.warning(f"⚠️ Rapedia: {e}")
             
-            # Consolidation des tracks
+            # Consolidation et déduplication
             all_tracks = genius_tracks + rapedia_tracks
             stats.total_found = len(all_tracks)
             
-            if not all_tracks:
-                self.logger.warning(f"❌ Aucun morceau trouvé pour {artist_name}")
-                return [], stats
-            
-            # Déduplication
-            self.logger.info("🔄 Déduplication des morceaux...")
+            # Déduplication basée sur le titre et l'artiste
             unique_tracks = self._deduplicate_tracks(all_tracks)
-            stats.duplicates_removed = len(all_tracks) - len(unique_tracks)
+            stats.duplicates_removed = stats.total_found - len(unique_tracks)
             stats.final_count = len(unique_tracks)
             
             # Sauvegarde en base de données
-            self.logger.info("💾 Sauvegarde des morceaux en base...")
-            saved_tracks = self._save_tracks_to_database(unique_tracks)
-            
-            # Mise à jour de la session
-            if session_id and self.session_manager:
+            saved_tracks = []
+            for track in unique_tracks:
                 try:
-                    session = self.session_manager.get_session(session_id)
-                    if session:
-                        session.total_tracks_found = stats.final_count
-                        session.tracks_processed = 0  # Pas encore traités
-                        session.current_step = "discovery_completed"
-                        self.session_manager.update_session(session)
+                    saved_track = self.database.save_track(track)
+                    saved_tracks.append(saved_track)
                 except Exception as e:
-                    self.logger.warning(f"⚠️ Session update failed: {e}")
+                    self.logger.error(f"Erreur sauvegarde track '{track.title}': {e}")
             
-            # Calcul du temps
+            # Mettre à jour les statistiques
+            if session_id:
+                session = self.session_manager.get_session(session_id)
+                if session:
+                    session.total_tracks_found = len(saved_tracks)
+                    session.current_step = "discovery_completed"
+                    self.session_manager.update_session(session)
+            
+            # Calculer le temps d'exécution
             end_time = datetime.now()
             stats.discovery_time_seconds = (end_time - start_time).total_seconds()
             
-            self.logger.info(f"✅ Découverte terminée: {stats.final_count} morceaux en {stats.discovery_time_seconds:.1f}s")
+            self.logger.info(f"✅ Découverte terminée: {stats.final_count} morceaux uniques en {stats.discovery_time_seconds:.1f}s")
             
             return saved_tracks, stats
             
         except Exception as e:
-            self.logger.error(f"❌ Erreur lors de la découverte pour {artist_name}: {e}")
-            
-            # Marquer la session comme échouée si possible
-            if session_id and self.session_manager:
-                try:
-                    self.session_manager.fail_session(session_id, str(e))
-                except:
-                    pass
-            
+            self.logger.error(f"❌ Erreur lors de la découverte: {e}")
             raise ExtractionError(f"Erreur découverte pour {artist_name}: {e}")
     
     def _get_or_create_artist(self, artist_name: str) -> Artist:
         """Récupère ou crée un artiste en base"""
-        try:
-            artist = self.database.get_artist_by_name(artist_name)
-        
-            if not artist:
-                artist = Artist(
-                    name=artist_name,
-                    created_at=datetime.now()
-                )
-                artist = self.database.save_artist(artist)
-                self.logger.info(f"✨ Nouvel artiste créé: {artist_name}")
-        
-            return artist
-        except Exception as e:
-            self.logger.error(f"❌ Erreur création/récupération artiste {artist_name}: {e}")
-            raise
+        artist = self.database.get_artist_by_name(artist_name)
+    
+        if not artist:
+            artist = Artist(
+                name=artist_name,
+                created_at=datetime.now()
+            )
+            artist = self.database.save_artist(artist)
+            self.logger.info(f"✨ Nouvel artiste créé: {artist_name}")
+    
+        return artist
     
     def _convert_genius_tracks(self, genius_tracks: List[Dict[str, Any]], artist_id: int) -> List[Track]:
         """Convertit les données Genius en entités Track"""
@@ -227,44 +203,6 @@ class DiscoveryStep:
         
         return tracks
     
-    def _discover_from_rapedia(self, artist_name: str, max_tracks: int, artist_id: int) -> List[Track]:
-        """Découverte depuis Rapedia (placeholder)"""
-        # Placeholder - à implémenter selon votre scraper Rapedia
-        try:
-            if self.rapedia_scraper:
-                # Exemple d'utilisation du scraper
-                rapedia_data = self.rapedia_scraper.scrape_artist(artist_name, max_tracks)
-                return self._convert_rapedia_tracks(rapedia_data, artist_id)
-            return []
-        except Exception as e:
-            self.logger.error(f"Erreur Rapedia: {e}")
-            return []
-    
-    def _convert_rapedia_tracks(self, rapedia_tracks: List[Dict[str, Any]], artist_id: int) -> List[Track]:
-        """Convertit les données Rapedia en entités Track"""
-        tracks = []
-        
-        for track_data in rapedia_tracks:
-            try:
-                track = Track(
-                    title=track_data.get('title', ''),
-                    artist_id=artist_id,
-                    artist_name=track_data.get('artist_name', ''),
-                    rapedia_url=track_data.get('url'),
-                    release_date=track_data.get('date'),
-                    album_name=track_data.get('album'),
-                    data_sources=[DataSource.RAPEDIA],
-                    extraction_status=ExtractionStatus.PENDING,
-                    created_at=datetime.now()
-                )
-                tracks.append(track)
-                
-            except Exception as e:
-                self.logger.error(f"Erreur conversion track Rapedia: {e}")
-                continue
-        
-        return tracks
-    
     def _deduplicate_tracks(self, tracks: List[Track]) -> List[Track]:
         """Supprime les doublons de la liste de tracks"""
         seen = set()
@@ -282,28 +220,10 @@ class DiscoveryStep:
         
         return unique_tracks
     
-    def _save_tracks_to_database(self, tracks: List[Track]) -> List[Track]:
-        """Sauvegarde les tracks en base de données"""
-        saved_tracks = []
-        
-        for track in tracks:
-            try:
-                saved_track = self.database.save_track(track)
-                saved_tracks.append(saved_track)
-            except Exception as e:
-                self.logger.error(f"Erreur sauvegarde track {track.title}: {e}")
-                continue
-        
-        self.logger.info(f"💾 {len(saved_tracks)}/{len(tracks)} morceaux sauvegardés")
-        return saved_tracks
-    
     def resume_discovery(self, session_id: str) -> Tuple[List[Track], DiscoveryStats]:
         """Reprend une découverte interrompue"""
         try:
             self.logger.info(f"🔄 Reprise de la découverte pour session: {session_id}")
-            
-            if not self.session_manager:
-                raise ExtractionError("SessionManager non disponible")
             
             session = self.session_manager.get_session(session_id)
             if not session:
@@ -325,9 +245,6 @@ class DiscoveryStep:
     def get_discovery_status(self, session_id: str) -> Dict[str, Any]:
         """Retourne le statut de la découverte pour une session"""
         try:
-            if not self.session_manager:
-                return {"error": "SessionManager non disponible"}
-                
             session = self.session_manager.get_session(session_id)
             if not session:
                 return {"error": "Session non trouvée"}

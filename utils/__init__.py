@@ -1,29 +1,29 @@
-# utils/__init__.py - Version optimisée et simplifiée
+# utils/__init__.py
 """Utilitaires et fonctions helper"""
 
 __all__ = []
 
-# Import direct des fonctions essentielles
+# Import automatique de toutes les fonctions disponibles de text_utils
 try:
-    from .text_utils import (
-        clean_artist_name,
-        normalize_text,
-        clean_track_title,
-        extract_featuring_artists,
-        calculate_similarity
-    )
-    __all__.extend([
-        'clean_artist_name',
-        'normalize_text', 
-        'clean_track_title',
-        'extract_featuring_artists',
-        'calculate_similarity'
-    ])
-    print("✅ Text utils essentiels importés")
+    import utils.text_utils as text_utils_module
+    
+    # Récupérer toutes les fonctions publiques
+    text_utils_functions = [
+        name for name in dir(text_utils_module) 
+        if not name.startswith('_') and callable(getattr(text_utils_module, name))
+    ]
+    
+    # Import dynamique des fonctions disponibles
+    for func_name in text_utils_functions:
+        globals()[func_name] = getattr(text_utils_module, func_name)
+        __all__.append(func_name)
+    
+    print(f"✅ Text utils importées: {text_utils_functions}")
+    
 except ImportError as e:
     print(f"⚠️ Erreur import text_utils: {e}")
 
-# Import conditionnel d'ExportManager
+# Imports conditionnels pour les modules optionnels (sans imports relatifs)
 try:
     from .export_utils import ExportManager
     __all__.append('ExportManager')
@@ -31,7 +31,7 @@ try:
 except ImportError as e:
     print(f"⚠️ ExportManager non disponible: {e}")
 
-# Fonction helper simplifiée
+# Fonction helper pour lister les utilitaires disponibles
 def get_available_utils():
     """Retourne la liste des utilitaires disponibles"""
     return __all__
