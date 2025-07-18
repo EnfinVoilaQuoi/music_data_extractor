@@ -1,26 +1,39 @@
-# config/settings.py
+# config/settings.py - VERSION OPTIMISÉE
 import os
 import yaml
 from pathlib import Path
 from typing import Dict, Any, Optional, List
+from functools import lru_cache
+import threading
 
 class Settings:
     """Configuration centralisée du projet Music Data Extractor"""
     
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls):
+        """Singleton thread-safe"""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+        return cls._instance
+    
     def __init__(self):
+        # Éviter la réinitialisation multiple du singleton
+        if hasattr(self, '_initialized'):
+            return
+        
         self.project_root = Path(__file__).parent.parent
         self.config_file = self.project_root / "config" / "default_config.yaml"
         self.credit_mappings_file = self.project_root / "config" / "credit_mappings.yaml"
         
-        # Chargement de la configuration
+        # Chargement de la configuration avec cache
         self.config = self._load_config()
         
-        # Variables d'environnement - Clés API
-        self.genius_api_key = os.getenv("GENIUS_API_KEY")
-        self.discogs_token = os.getenv("DISCOGS_TOKEN")
-        self.lastfm_api_key = os.getenv("LAST_FM_API_KEY")
-        self.spotify_client_id = os.getenv("SPOTIFY_CLIENT_ID")
-        self.spotify_client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
+        # Variables d'environnement - Mise en cache pour éviter les accès répétés
+        self._api_keys = self._load_api_keys()
         
         # Variables d'environnement - Configuration
         self.environment = os.getenv("MDE_ENV", "development")
@@ -29,23 +42,93 @@ class Settings:
         # Validation des clés API
         self._validate_api_keys()
         
-        # Chemins des dossiers
-        self.data_dir = self.project_root / "data"
-        self.cache_dir = self.data_dir / "cache"
-        self.sessions_dir = self.data_dir / "sessions"
-        self.exports_dir = self.data_dir / "exports"
-        self.logs_dir = self.project_root / "logs"
-        self.temp_dir = self.data_dir / "temp"
-        self.screenshots_dir = self.logs_dir / "screenshots"
+        # Chemins des dossiers - calculés une seule fois
+        self._paths = self._calculate_paths()
         
         # Création des dossiers si nécessaires
         self._ensure_directories()
         
         # Configuration dérivée
         self._setup_derived_config()
+        
+        self._initialized = True
     
+    @property
+    def genius_api_key(self) -> Optional[str]:
+        return self._api_keys.get('genius')
+    
+    @property
+    def discogs_token(self) -> Optional[str]:
+        return self._api_keys.get('discogs')
+    
+    @property
+    def lastfm_api_key(self) -> Optional[str]:
+        return self._api_keys.get('lastfm')
+    
+    @property
+    def spotify_client_id(self) -> Optional[str]:
+        return self._api_keys.get('spotify_id')
+    
+    @property
+    def spotify_client_secret(self) -> Optional[str]:
+        return self._api_keys.get('spotify_secret')
+    
+    @property
+    def data_dir(self) -> Path:
+        return self._paths['data_dir']
+    
+    @property
+    def cache_dir(self) -> Path:
+        return self._paths['cache_dir']
+    
+    @property
+    def sessions_dir(self) -> Path:
+        return self._paths['sessions_dir']
+    
+    @property
+    def exports_dir(self) -> Path:
+        return self._paths['exports_dir']
+    
+    @property
+    def logs_dir(self) -> Path:
+        return self._paths['logs_dir']
+    
+    @property
+    def temp_dir(self) -> Path:
+        return self._paths['temp_dir']
+    
+    @property
+    def screenshots_dir(self) -> Path:
+        return self._paths['screenshots_dir']
+    
+    def _load_api_keys(self) -> Dict[str, Optional[str]]:
+        """Charge toutes les clés API en une seule fois"""
+        return {
+            'genius': os.getenv("GENIUS_API_KEY"),
+            'discogs': os.getenv("DISCOGS_TOKEN"),
+            'lastfm': os.getenv("LAST_FM_API_KEY"),
+            'spotify_id': os.getenv("SPOTIFY_CLIENT_ID"),
+            'spotify_secret': os.getenv("SPOTIFY_CLIENT_SECRET")
+        }
+    
+    def _calculate_paths(self) -> Dict[str, Path]:
+        """Calcule tous les chemins en une seule fois"""
+        data_dir = self.project_root / "data"
+        logs_dir = self.project_root / "logs"
+        
+        return {
+            'data_dir': data_dir,
+            'cache_dir': data_dir / "cache",
+            'sessions_dir': data_dir / "sessions",
+            'exports_dir': data_dir / "exports",
+            'logs_dir': logs_dir,
+            'temp_dir': data_dir / "temp",
+            'screenshots_dir': logs_dir / "screenshots"
+        }
+    
+    @lru_cache(maxsize=1)
     def _load_config(self) -> Dict[str, Any]:
-        """Charge la configuration depuis le fichier YAML"""
+        """Charge la configuration depuis le fichier YAML avec cache"""
         try:
             if self.config_file.exists():
                 with open(self.config_file, 'r', encoding='utf-8') as f:
@@ -54,272 +137,194 @@ class Settings:
                 return config
             else:
                 print(f"⚠️ Fichier de config non trouvé: {self.config_file}")
+                print("📁 Utilisation de la configuration par défaut")
                 return self._get_default_config()
+                
         except Exception as e:
             print(f"❌ Erreur lors du chargement de la config: {e}")
+            print("📁 Utilisation de la configuration par défaut")
             return self._get_default_config()
     
+    @lru_cache(maxsize=1)
     def _get_default_config(self) -> Dict[str, Any]:
-        """Configuration par défaut si le fichier n'existe pas"""
+        """Configuration par défaut du projet - mise en cache"""
         return {
-            # Gestion des sessions
-            "sessions": {
-                "auto_save_interval": 60,
-                "max_sessions": 10,
-                "cleanup_after_days": 30,
-                "save_only_if_active": True,
-                "checkpoint_interval": 300  # 5 minutes
+            # Configuration des sessions
+            'sessions': {
+                'auto_save_interval': 60,  # secondes
+                'max_sessions': 10,
+                'cleanup_completed_after_days': 7,
+                'default_max_tracks': 200,
+                'pause_between_batches': 2.0
             },
             
-            # Découverte des morceaux
-            "discovery": {
-                "max_tracks_per_source": 200,
-                "enable_rapedia": True,
-                "enable_genius": True,
-                "similarity_threshold": 0.85,
-                "prefer_verified_sources": True,
-                "timeout_seconds": 30
+            # Configuration de performance
+            'performance': {
+                'concurrent_extractions': 3,
+                'batch_size': 15,
+                'request_timeout': 30,
+                'max_retries': 3,
+                'retry_delay': 5.0
             },
             
-            # Extraction des crédits
-            "credits": {
-                "expand_all_credits": True,
-                "wait_after_expand": 2,
-                "max_retries": 3,
-                "scroll_pause": 1,
-                "custom_patterns_file": "credit_mappings.yaml",
-                "detect_features": True,
-                "normalize_names": True
+            # Configuration du cache
+            'cache': {
+                'enabled': True,
+                'ttl_hours': 168,  # 7 jours
+                'max_size_mb': 500,
+                'cleanup_on_startup': False,
+                'compress_data': True
             },
             
-            # Résolution des albums
-            "albums": {
-                "prefer_spotify": True,
-                "fallback_to_discogs": True,
-                "detect_singles": True,
-                "min_tracks_for_album": 4,
-                "max_tracks_for_single": 3,
-                "group_by_year": True,
-                "resolve_missing_covers": True
+            # Configuration des albums
+            'albums': {
+                'prefer_spotify': True,
+                'fallback_to_discogs': True,
+                'match_threshold': 0.8,
+                'include_singles': True
             },
             
-            # Validation qualité
-            "quality": {
-                "check_missing_bpm": True,
-                "check_missing_producer": True,
-                "check_suspicious_duration": True,
-                "min_duration_seconds": 30,
-                "max_duration_seconds": 1800,
-                "require_album_info": False,
-                "flag_incomplete_credits": True,
-                "completeness_threshold": 0.7
+            # Configuration de qualité
+            'quality': {
+                'min_duration_seconds': 30,
+                'max_duration_seconds': 600,
+                'require_credits': False,
+                'skip_instrumentals': False
             },
             
             # Configuration Selenium
-            "selenium": {
-                "headless": True,
-                "timeout": 30,
-                "retry_failed_pages": 2,
-                "screenshot_on_error": True,
-                "browser": "chrome",
-                "window_size": "1920,1080",
-                "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "enable_javascript": True,
-                "load_images": False,
-                "page_load_strategy": "normal"
+            'selenium': {
+                'headless': True,
+                'window_size': [1920, 1080],
+                'implicit_wait': 10,
+                'page_load_timeout': 30,
+                'screenshot_on_error': True
             },
             
-            # Performance et optimisation
-            "performance": {
-                "batch_size": 10,
-                "concurrent_extractions": 3,
-                "cache_expire_days": 7,
-                "max_memory_mb": 512,
-                "enable_parallel_processing": True,
-                "thread_pool_size": 4,
-                "connection_pool_size": 10,
-                "request_timeout": 30
+            # Configuration des exports
+            'exports': {
+                'include_lyrics': True,
+                'include_raw_data': False,
+                'default_format': 'json',
+                'auto_cleanup_days': 30
             },
             
-            # Rate limiting par API
-            "rate_limits": {
-                "genius": {
-                    "requests_per_minute": 30,
-                    "requests_per_hour": 1000,
-                    "burst_limit": 5,
-                    "retry_after_seconds": 60
+            # Configuration du logging
+            'logging': {
+                'level': 'INFO',
+                'console_colors': True,
+                'file_rotation': 'daily',
+                'max_file_size_mb': 10,
+                'keep_files_days': 30
+            },
+            
+            # Configuration des rate limits
+            'rate_limits': {
+                'genius': {
+                    'requests_per_minute': 30,
+                    'burst_limit': 10
                 },
-                "spotify": {
-                    "requests_per_minute": 100,
-                    "requests_per_hour": 3000,
-                    "burst_limit": 10,
-                    "retry_after_seconds": 60
+                'spotify': {
+                    'requests_per_minute': 100,
+                    'burst_limit': 20
                 },
-                "discogs": {
-                    "requests_per_minute": 60,
-                    "requests_per_hour": 1000,
-                    "burst_limit": 5,
-                    "retry_after_seconds": 60
+                'discogs': {
+                    'requests_per_minute': 60,
+                    'burst_limit': 15
                 },
-                "tunebat": {
-                    "requests_per_minute": 20,
-                    "requests_per_hour": 500,
-                    "burst_limit": 3,
-                    "retry_after_seconds": 180
+                'lastfm': {
+                    'requests_per_minute': 300,
+                    'burst_limit': 50
                 },
-                "rapedia": {
-                    "requests_per_minute": 30,
-                    "requests_per_hour": 800,
-                    "burst_limit": 5,
-                    "retry_after_seconds": 60
+                'rapedia': {
+                    'requests_per_minute': 30,
+                    'burst_limit': 5
                 }
-            },
-            
-            # Cache et stockage
-            "cache": {
-                "enable_cache": True,
-                "cache_size_mb": 100,
-                "default_expire_hours": 24,
-                "api_cache_expire_hours": 168,  # 1 semaine
-                "scraping_cache_expire_hours": 72,  # 3 jours
-                "cleanup_on_startup": True,
-                "compress_cache": True
-            },
-            
-            # Logging
-            "logging": {
-                "level": "INFO",
-                "file_rotation": True,
-                "max_file_size_mb": 10,
-                "backup_count": 5,
-                "console_colors": True,
-                "log_api_calls": True,
-                "log_scraping_activity": True,
-                "session_specific_logs": True,
-                "performance_logs": False
-            },
-            
-            # Export et formats
-            "exports": {
-                "default_formats": ["json", "csv"],
-                "include_statistics": True,
-                "include_metadata": True,
-                "compress_exports": False,
-                "export_quality_reports": True,
-                "max_export_size_mb": 50,
-                "backup_exports": True
-            },
-            
-            # Interface utilisateur
-            "ui": {
-                "theme": "dark",
-                "show_progress_bars": True,
-                "auto_refresh_interval": 5,
-                "max_recent_sessions": 10,
-                "enable_notifications": True,
-                "compact_mode": False
-            },
-            
-            # Sécurité
-            "security": {
-                "validate_urls": True,
-                "sanitize_filenames": True,
-                "max_file_size_mb": 100,
-                "allowed_domains": [
-                    "genius.com",
-                    "spotify.com", 
-                    "discogs.com",
-                    "tunebat.com",
-                    "rapedia.com"
-                ],
-                "enable_ssl_verification": True
-            },
-            
-            # Fonctionnalités expérimentales
-            "experimental": {
-                "ai_credit_detection": False,
-                "advanced_deduplication": True,
-                "smart_retry_logic": True,
-                "predictive_caching": False,
-                "auto_quality_improvement": True
             }
         }
     
     def _validate_api_keys(self):
-        """Valide que les clés API nécessaires sont présentes"""
-        required_keys = {
-            "GENIUS_API_KEY": self.genius_api_key,
-        }
-        
+        """Valide et affiche le statut des clés API - optimisé"""
+        # Regroupement des vérifications pour efficacité
+        required_keys = {'genius': self.genius_api_key}
         optional_keys = {
-            "SPOTIFY_CLIENT_ID": self.spotify_client_id,
-            "SPOTIFY_CLIENT_SECRET": self.spotify_client_secret,
-            "DISCOGS_TOKEN": self.discogs_token,
-            "LAST_FM_API_KEY": self.lastfm_api_key
+            'spotify': self.spotify_client_id and self.spotify_client_secret,
+            'discogs': self.discogs_token,
+            'lastfm': self.lastfm_api_key
         }
         
-        # Vérifier les clés obligatoires
+        # Calcul unique des statistiques
         missing_required = [key for key, value in required_keys.items() if not value]
-        if missing_required:
-            print(f"❌ Clés API obligatoires manquantes: {', '.join(missing_required)}")
-            print("L'application ne pourra pas fonctionner correctement.")
-        
-        # Vérifier les clés optionnelles
         missing_optional = [key for key, value in optional_keys.items() if not value]
+        available_apis = len(required_keys) + len(optional_keys) - len(missing_required) - len(missing_optional)
+        total_apis = len(required_keys) + len(optional_keys)
+        
+        # Affichage groupé pour réduire les I/O
+        if missing_required:
+            print(f"❌ Clés API requises manquantes: {', '.join(missing_required)}")
+            print("⚠️ L'application ne fonctionnera pas correctement sans ces clés")
+        else:
+            print("✅ Toutes les clés API requises sont configurées")
+        
         if missing_optional:
             print(f"⚠️ Clés API optionnelles manquantes: {', '.join(missing_optional)}")
             print("Certaines fonctionnalités seront limitées.")
         
-        # Compter les APIs disponibles
-        available_apis = len([key for key, value in {**required_keys, **optional_keys}.items() if value])
-        total_apis = len(required_keys) + len(optional_keys)
         print(f"🔑 APIs configurées: {available_apis}/{total_apis}")
     
     def _ensure_directories(self):
-        """Crée les dossiers nécessaires s'ils n'existent pas"""
-        directories = [
-            self.data_dir,
-            self.cache_dir, 
-            self.sessions_dir,
-            self.exports_dir,
-            self.logs_dir,
-            self.temp_dir,
-            self.screenshots_dir
-        ]
+        """Crée les dossiers nécessaires - version optimisée"""
+        directories = list(self._paths.values())
         
+        # Création en lot avec gestion d'erreurs optimisée
         created_dirs = []
         for directory in directories:
             if not directory.exists():
-                directory.mkdir(parents=True, exist_ok=True)
-                created_dirs.append(directory.name)
+                try:
+                    directory.mkdir(parents=True, exist_ok=True)
+                    created_dirs.append(directory.name)
+                except OSError as e:
+                    print(f"❌ Erreur création dossier {directory.name}: {e}")
         
         if created_dirs:
             print(f"📁 Dossiers créés: {', '.join(created_dirs)}")
     
     def _setup_derived_config(self):
-        """Configure les paramètres dérivés de la configuration principale"""
-        # Mode debug global
+        """Configure les paramètres dérivés - version optimisée"""
+        # Éviter les setdefault répétés en groupant les modifications
         if self.debug_mode:
-            self.config.setdefault('logging', {})['level'] = 'DEBUG'
-            self.config.setdefault('selenium', {})['headless'] = False
-            self.config.setdefault('performance', {})['concurrent_extractions'] = 1
+            self.config.setdefault('logging', {}).update({
+                'level': 'DEBUG'
+            })
+            self.config.setdefault('selenium', {}).update({
+                'headless': False
+            })
+            self.config.setdefault('performance', {}).update({
+                'concurrent_extractions': 1
+            })
         
-        # Environnement de production
         if self.environment == "production":
-            self.config.setdefault('selenium', {})['headless'] = True
-            self.config.setdefault('logging', {})['console_colors'] = False
-            self.config.setdefault('cache', {})['cleanup_on_startup'] = True
+            self.config.setdefault('selenium', {}).update({
+                'headless': True
+            })
+            self.config.setdefault('logging', {}).update({
+                'console_colors': False
+            })
+            self.config.setdefault('cache', {}).update({
+                'cleanup_on_startup': True
+            })
         
-        # Configuration automatique selon les APIs disponibles
+        # Configuration conditionnelle des APIs
+        albums_config = self.config.setdefault('albums', {})
         if not self.spotify_client_id:
-            self.config.setdefault('albums', {})['prefer_spotify'] = False
-        
+            albums_config['prefer_spotify'] = False
         if not self.discogs_token:
-            self.config.setdefault('albums', {})['fallback_to_discogs'] = False
+            albums_config['fallback_to_discogs'] = False
     
+    @lru_cache(maxsize=128)
     def get(self, key: str, default=None):
         """
-        Récupère une valeur de configuration avec notation pointée.
+        Récupère une valeur de configuration avec cache LRU.
         
         Args:
             key: Clé de configuration (ex: "sessions.auto_save_interval")
@@ -341,12 +346,15 @@ class Settings:
     
     def set(self, key: str, value: Any):
         """
-        Définit une valeur de configuration avec notation pointée.
+        Définit une valeur de configuration avec invalidation du cache.
         
         Args:
             key: Clé de configuration (ex: "sessions.auto_save_interval")
             value: Nouvelle valeur
         """
+        # Invalider le cache LRU lors des modifications
+        self.get.cache_clear()
+        
         keys = key.split('.')
         config = self.config
         
@@ -360,43 +368,47 @@ class Settings:
         config[keys[-1]] = value
     
     def save_config(self, file_path: Optional[Path] = None):
-        """
-        Sauvegarde la configuration actuelle dans un fichier YAML.
-        
-        Args:
-            file_path: Chemin du fichier (par défaut: fichier de config principal)
-        """
+        """Sauvegarde optimisée de la configuration"""
         target_file = file_path or self.config_file
         
         try:
             # S'assurer que le dossier parent existe
             target_file.parent.mkdir(parents=True, exist_ok=True)
             
-            with open(target_file, 'w', encoding='utf-8') as f:
+            # Sauvegarde atomique via fichier temporaire
+            temp_file = target_file.with_suffix('.tmp')
+            with open(temp_file, 'w', encoding='utf-8') as f:
                 yaml.dump(self.config, f, default_flow_style=False, indent=2, allow_unicode=True)
             
+            # Renommage atomique
+            temp_file.replace(target_file)
             print(f"✅ Configuration sauvegardée dans {target_file}")
             
         except Exception as e:
             print(f"❌ Erreur lors de la sauvegarde de la config: {e}")
     
     def reload_config(self):
-        """Recharge la configuration depuis le fichier"""
+        """Recharge la configuration avec invalidation du cache"""
         old_config = self.config.copy()
+        
+        # Invalider les caches
+        self._load_config.cache_clear()
+        self.get.cache_clear()
+        
         self.config = self._load_config()
         self._setup_derived_config()
         
         print("🔄 Configuration rechargée")
         
-        # Retourner les changements pour logging
         return {
             'old': old_config,
             'new': self.config
         }
     
+    @lru_cache(maxsize=32)
     def get_api_config(self, api_name: str) -> Dict[str, Any]:
         """
-        Récupère la configuration complète pour une API spécifique.
+        Configuration API avec cache pour éviter les recalculs.
         
         Args:
             api_name: Nom de l'API (genius, spotify, discogs, etc.)
@@ -410,40 +422,47 @@ class Settings:
             'enabled': True
         }
         
-        # Ajouter les clés API spécifiques
-        if api_name == 'genius':
-            api_config['api_key'] = self.genius_api_key
-            api_config['enabled'] = bool(self.genius_api_key)
-        elif api_name == 'spotify':
-            api_config['client_id'] = self.spotify_client_id
-            api_config['client_secret'] = self.spotify_client_secret
-            api_config['enabled'] = bool(self.spotify_client_id and self.spotify_client_secret)
-        elif api_name == 'discogs':
-            api_config['token'] = self.discogs_token
-            api_config['enabled'] = bool(self.discogs_token)
-        elif api_name == 'lastfm':
-            api_config['api_key'] = self.lastfm_api_key
-            api_config['enabled'] = bool(self.lastfm_api_key)
+        # Mapping optimisé des clés API
+        api_key_mapping = {
+            'genius': ('api_key', self.genius_api_key),
+            'spotify': ('client_credentials', (self.spotify_client_id, self.spotify_client_secret)),
+            'discogs': ('token', self.discogs_token),
+            'lastfm': ('api_key', self.lastfm_api_key)
+        }
+        
+        if api_name in api_key_mapping:
+            key_type, key_value = api_key_mapping[api_name]
+            
+            if api_name == 'spotify':
+                api_config['client_id'] = key_value[0]
+                api_config['client_secret'] = key_value[1]
+                api_config['enabled'] = bool(key_value[0] and key_value[1])
+            else:
+                api_config[key_type] = key_value
+                api_config['enabled'] = bool(key_value)
         
         return api_config
     
+    @lru_cache(maxsize=1)
     def get_file_paths(self) -> Dict[str, Path]:
-        """Retourne tous les chemins de fichiers importants"""
+        """Retourne tous les chemins de fichiers - avec cache"""
         return {
             'project_root': self.project_root,
-            'data_dir': self.data_dir,
-            'cache_dir': self.cache_dir,
-            'sessions_dir': self.sessions_dir,
-            'exports_dir': self.exports_dir,
-            'logs_dir': self.logs_dir,
-            'temp_dir': self.temp_dir,
-            'screenshots_dir': self.screenshots_dir,
+            **self._paths,
             'config_file': self.config_file,
             'credit_mappings_file': self.credit_mappings_file
         }
     
     def get_system_info(self) -> Dict[str, Any]:
-        """Retourne les informations système pour diagnostic"""
+        """Informations système optimisées"""
+        # Calcul unique des états d'existence des fichiers
+        file_paths = self.get_file_paths()
+        directories_exist = {
+            name: path.exists() 
+            for name, path in file_paths.items()
+            if isinstance(path, Path) and name.endswith('_dir')
+        }
+        
         return {
             'environment': self.environment,
             'debug_mode': self.debug_mode,
@@ -455,23 +474,14 @@ class Settings:
                 'discogs': bool(self.discogs_token),
                 'lastfm': bool(self.lastfm_api_key)
             },
-            'directories_exist': {
-                name: path.exists() 
-                for name, path in self.get_file_paths().items()
-                if isinstance(path, Path)
-            }
+            'directories_exist': directories_exist
         }
     
     def validate_configuration(self) -> List[str]:
-        """
-        Valide la configuration et retourne une liste des problèmes trouvés.
-        
-        Returns:
-            Liste des messages d'erreur ou avertissements
-        """
+        """Validation optimisée de la configuration"""
         issues = []
         
-        # Validation des valeurs numériques
+        # Validation groupée des valeurs numériques
         numeric_checks = [
             ('sessions.auto_save_interval', 10, 3600),
             ('sessions.max_sessions', 1, 50),
@@ -481,32 +491,38 @@ class Settings:
             ('quality.max_duration_seconds', 300, 7200)
         ]
         
-        for key, min_val, max_val in numeric_checks:
-            value = self.get(key)
+        # Traitement en lot pour réduire les appels get()
+        values_to_check = {key: self.get(key) for key, _, _ in numeric_checks}
+        
+        for (key, min_val, max_val) in numeric_checks:
+            value = values_to_check[key]
             if value is not None:
                 if not isinstance(value, (int, float)) or value < min_val or value > max_val:
                     issues.append(f"Valeur invalide pour {key}: {value} (doit être entre {min_val} et {max_val})")
         
-        # Validation des chemins
+        # Validation groupée des chemins critiques
         critical_paths = ['data_dir', 'cache_dir', 'logs_dir']
         for path_name in critical_paths:
-            path = getattr(self, path_name, None)
+            path = self._paths.get(path_name)
             if path and not path.exists():
                 issues.append(f"Dossier manquant: {path_name} ({path})")
         
-        # Validation de la cohérence
-        if self.get('albums.prefer_spotify') and not self.spotify_client_id:
-            issues.append("albums.prefer_spotify activé mais clé API Spotify manquante")
+        # Validation de cohérence
+        cohérence_checks = [
+            ('albums.prefer_spotify', self.spotify_client_id, "clé API Spotify"),
+            ('albums.fallback_to_discogs', self.discogs_token, "token Discogs")
+        ]
         
-        if self.get('albums.fallback_to_discogs') and not self.discogs_token:
-            issues.append("albums.fallback_to_discogs activé mais token Discogs manquant")
+        for setting_key, required_value, description in cohérence_checks:
+            if self.get(setting_key) and not required_value:
+                issues.append(f"{setting_key} activé mais {description} manquante")
         
         return issues
 
-# Instance globale des settings
+# Instance globale des settings (Singleton)
 settings = Settings()
 
-# Fonction de convenance pour accès rapide
+# Fonctions de convenance pour accès rapide
 def get_setting(key: str, default=None):
     """Fonction de convenance pour récupérer une configuration"""
     return settings.get(key, default)

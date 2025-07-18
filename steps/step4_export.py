@@ -1,713 +1,888 @@
 # steps/step4_export.py
+"""Étape 4: Export optimisé multi-format des données traitées"""
+
+import logging
+import asyncio
 import json
 import csv
-import html
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Union
+import yaml
+from typing import Dict, List, Optional, Any, Tuple, Union
 from datetime import datetime
+from dataclasses import dataclass, field
+from pathlib import Path
+from functools import lru_cache
 import zipfile
-import tempfile
+import io
 
 from core.database import Database
-from models.entities import Artist, Album, Track, Credit, Session
-from models.enums import ExportFormat, AlbumType, CreditCategory
+from core.session_manager import SessionManager, get_session_manager
+from core.cache import smart_cache
+from core.exceptions import ExportError
+from models.entities import Artist, Track, Credit, Album, Session
+from models.enums import ExportFormat, QualityLevel, SessionStatus
 from config.settings import settings
-from utils.progress_tracker import ProgressTracker
-from utils.logging_config import get_session_logger
-from utils.export_utils import ExportUtils
+
+# Imports conditionnels pour les exporters
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    PANDAS_AVAILABLE = False
+    pd = None
+
+try:
+    from openpyxl import Workbook
+    OPENPYXL_AVAILABLE = True
+except ImportError:
+    OPENPYXL_AVAILABLE = False
+    Workbook = None
+
+try:
+    import xml.etree.ElementTree as ET
+    XML_AVAILABLE = True
+except ImportError:
+    XML_AVAILABLE = False
+    ET = None
+
+try:
+    from jinja2 import Template
+    JINJA2_AVAILABLE = True
+except ImportError:
+    JINJA2_AVAILABLE = False
+    Template = None
+
+@dataclass
+class ExportJob:
+    """Tâche d'export avec métadonnées"""
+    job_id: str
+    artist_name: str
+    formats: List[ExportFormat]
+    options: Dict[str, Any] = field(default_factory=dict)
+    created_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    status: str = "pending"  # pending, running, completed, failed
+    file_paths: List[str] = field(default_factory=list)
+    error_message: Optional[str] = None
+    
+    def __post_init__(self):
+        if self.created_at is None:
+            self.created_at = datetime.now()
+    
+    @property
+    def duration_seconds(self) -> Optional[float]:
+        if not self.started_at or not self.completed_at:
+            return None
+        return (self.completed_at - self.started_at).total_seconds()
+
+@dataclass
+class ExportStats:
+    """Statistiques détaillées de l'export"""
+    total_items: int = 0
+    exported_tracks: int = 0
+    exported_credits: int = 0
+    exported_albums: int = 0
+    exported_sessions: int = 0
+    
+    # Formats générés
+    formats_generated: List[str] = field(default_factory=list)
+    total_file_size_bytes: int = 0
+    compressed_size_bytes: int = 0
+    
+    # Performance
+    export_time_seconds: float = 0.0
+    cache_hits: int = 0
+    template_renderings: int = 0
+    
+    # Fichiers générés
+    files_created: List[str] = field(default_factory=list)
+    archive_created: Optional[str] = None
+    
+    @property
+    def compression_ratio(self) -> float:
+        """Taux de compression (0-1)"""
+        if self.total_file_size_bytes == 0:
+            return 0.0
+        return 1 - (self.compressed_size_bytes / self.total_file_size_bytes)
+    
+    @property
+    def export_rate(self) -> float:
+        """Éléments exportés par seconde"""
+        if self.export_time_seconds == 0:
+            return 0.0
+        return self.total_items / self.export_time_seconds
+    
+    @property
+    def average_file_size_mb(self) -> float:
+        """Taille moyenne des fichiers en MB"""
+        if not self.files_created:
+            return 0.0
+        return (self.total_file_size_bytes / len(self.files_created)) / (1024 * 1024)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convertit en dictionnaire pour export"""
+        return {
+            'total_items': self.total_items,
+            'exported_tracks': self.exported_tracks,
+            'exported_credits': self.exported_credits,
+            'exported_albums': self.exported_albums,
+            'exported_sessions': self.exported_sessions,
+            'formats_generated': self.formats_generated,
+            'total_file_size_bytes': self.total_file_size_bytes,
+            'total_file_size_mb': round(self.total_file_size_bytes / (1024 * 1024), 2),
+            'compressed_size_bytes': self.compressed_size_bytes,
+            'compressed_size_mb': round(self.compressed_size_bytes / (1024 * 1024), 2),
+            'compression_ratio': self.compression_ratio,
+            'export_time_seconds': self.export_time_seconds,
+            'cache_hits': self.cache_hits,
+            'template_renderings': self.template_renderings,
+            'files_created': self.files_created,
+            'archive_created': self.archive_created,
+            'export_rate': self.export_rate,
+            'average_file_size_mb': self.average_file_size_mb
+        }
 
 
-class Step4Export:
+class ExportStep:
     """
-    Étape 4: Export des données extraites en multiple formats.
+    Étape 4: Export optimisé multi-format des données traitées.
     
-    Formats supportés:
-    - JSON (détaillé et compact)
-    - CSV (tracks, credits, albums séparés)
-    - HTML (rapport visuel avec graphiques)
-    - Excel (multi-onglets)
-    - Formats pour infographies (stats JSON)
+    Responsabilités :
+    - Export vers multiples formats (JSON, CSV, Excel, HTML, XML, YAML)
+    - Génération de rapports visuels
+    - Compression et archivage automatiques
+    - Templates personnalisables
+    - Export incrémental et par lots
     """
     
-    def __init__(self, database: Database):
-        self.db = database
-        self.exports_dir = settings.exports_dir
-        self.exports_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(self, session_manager: Optional[SessionManager] = None, 
+                 database: Optional[Database] = None):
+        self.logger = logging.getLogger(__name__)
         
-    def execute(self, session: Session, progress_tracker: Optional[ProgressTracker] = None,
-                export_formats: Optional[List[ExportFormat]] = None) -> Dict[str, Any]:
-        """
-        Exécute l'étape d'export.
+        # Composants core
+        self.session_manager = session_manager or get_session_manager()
+        self.database = database or Database()
         
-        Args:
-            session: Session d'extraction
-            progress_tracker: Tracker de progression
-            export_formats: Formats d'export souhaités
-            
-        Returns:
-            Résultats de l'export avec chemins des fichiers
-        """
-        logger = get_session_logger(session.id, "export")
-        logger.info("🚀 Début de l'étape d'export")
+        # Configuration optimisée
+        self.config = self._load_optimized_config()
         
-        # Formats par défaut
-        if not export_formats:
-            export_formats = [ExportFormat.JSON, ExportFormat.CSV, ExportFormat.HTML]
+        # Cache pour templates et données
+        self._template_cache = {}
+        self._data_cache = {}
         
-        # Initialiser le tracker
-        if progress_tracker:
-            step_name = "export"
-            if step_name not in progress_tracker.steps:
-                progress_tracker.add_step(step_name, "Export des données", len(export_formats))
-            progress_tracker.start_step(step_name)
+        # Gestionnaire de jobs d'export
+        self._export_jobs = {}
         
-        try:
-            # Récupérer l'artiste et ses données
-            artist = self.db.get_artist_by_name(session.artist_name)
-            if not artist:
-                raise ValueError(f"Artiste '{session.artist_name}' non trouvé")
-            
-            logger.info(f"📊 Export des données pour {artist.name}")
-            
-            # Charger toutes les données
-            tracks = self.db.get_tracks_by_artist_id(artist.id)
-            albums = self.db.get_albums_by_artist_id(artist.id)
-            
-            logger.info(f"📈 Données à exporter: {len(tracks)} tracks, {len(albums)} albums")
-            
-            # Créer le dossier d'export pour cette session
-            export_folder = self._create_export_folder(session.id, artist.name)
-            
-            # Générer les statistiques
-            stats = self._generate_statistics(artist, tracks, albums)
-            
-            # Exporter dans chaque format demandé
-            exported_files = {}
-            
-            for i, format_type in enumerate(export_formats):
-                try:
-                    logger.info(f"📋 Export au format {format_type.value}")
-                    
-                    if format_type == ExportFormat.JSON:
-                        files = self._export_json(export_folder, artist, tracks, albums, stats)
-                        exported_files.update(files)
-                    
-                    elif format_type == ExportFormat.CSV:
-                        files = self._export_csv(export_folder, artist, tracks, albums)
-                        exported_files.update(files)
-                    
-                    elif format_type == ExportFormat.HTML:
-                        files = self._export_html(export_folder, artist, tracks, albums, stats)
-                        exported_files.update(files)
-                    
-                    elif format_type == ExportFormat.EXCEL:
-                        files = self._export_excel(export_folder, artist, tracks, albums, stats)
-                        exported_files.update(files)
-                    
-                    # Mise à jour progression
-                    if progress_tracker:
-                        progress_tracker.update_step_progress("export", i + 1)
-                    
-                    logger.info(f"✅ Export {format_type.value} terminé")
-                    
-                except Exception as e:
-                    logger.error(f"❌ Erreur export {format_type.value}: {e}")
-                    if progress_tracker:
-                        progress_tracker.add_step_error("export", f"Erreur {format_type.value}: {str(e)}")
-            
-            # Créer un fichier ZIP avec tous les exports
-            zip_file = self._create_zip_archive(export_folder, exported_files)
-            exported_files["archive"] = str(zip_file)
-            
-            # Finaliser
-            if progress_tracker:
-                progress_tracker.complete_step("export")
-            
-            logger.info(f"🎉 Export terminé - {len(exported_files)} fichiers créés")
-            
-            return {
-                "success": True,
-                "export_folder": str(export_folder),
-                "exported_files": exported_files,
-                "statistics": stats,
-                "formats": [f.value for f in export_formats]
-            }
-            
-        except Exception as e:
-            logger.error(f"💥 Erreur dans l'étape d'export: {e}")
-            if progress_tracker:
-                progress_tracker.fail_step("export", str(e))
-            
-            return {
-                "success": False,
-                "error": str(e),
-                "exported_files": {}
-            }
-    
-    def _create_export_folder(self, session_id: str, artist_name: str) -> Path:
-        """Crée le dossier d'export pour la session"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        folder_name = f"{artist_name}_{session_id}_{timestamp}"
-        # Nettoyer le nom de dossier
-        folder_name = "".join(c for c in folder_name if c.isalnum() or c in "._-")
+        # Templates par défaut
+        self._default_templates = self._load_default_templates()
         
-        export_folder = self.exports_dir / folder_name
-        export_folder.mkdir(parents=True, exist_ok=True)
-        
-        return export_folder
-    
-    def _generate_statistics(self, artist: Artist, tracks: List[Track], albums: List[Album]) -> Dict[str, Any]:
-        """Génère les statistiques complètes pour l'artiste"""
-        
-        # Statistiques générales
-        total_tracks = len(tracks)
-        total_albums = len(albums)
-        total_duration = sum(t.duration_seconds or 0 for t in tracks)
-        
-        # Statistiques par type d'album
-        albums_by_type = {}
-        for album_type in AlbumType:
-            count = len([a for a in albums if a.album_type == album_type])
-            if count > 0:
-                albums_by_type[album_type.value] = count
-        
-        # Statistiques de crédits
-        all_credits = []
-        for track in tracks:
-            all_credits.extend(track.credits)
-        
-        credits_by_category = {}
-        for category in CreditCategory:
-            count = len([c for c in all_credits if c.credit_category == category])
-            if count > 0:
-                credits_by_category[category.value] = count
-        
-        # Top collaborateurs
-        collaborators = {}
-        for track in tracks:
-            for credit in track.credits:
-                if credit.person_name and credit.person_name != artist.name:
-                    collaborators[credit.person_name] = collaborators.get(credit.person_name, 0) + 1
-        
-        top_collaborators = sorted(collaborators.items(), key=lambda x: x[1], reverse=True)[:10]
-        
-        # Producteurs récurrents
-        producers = {}
-        for track in tracks:
-            track_producers = track.get_producers()
-            for producer in track_producers:
-                if producer != artist.name:
-                    producers[producer] = producers.get(producer, 0) + 1
-        
-        top_producers = sorted(producers.items(), key=lambda x: x[1], reverse=True)[:10]
-        
-        # Statistiques par année
-        tracks_by_year = {}
-        for track in tracks:
-            year = track.release_year or "Unknown"
-            tracks_by_year[str(year)] = tracks_by_year.get(str(year), 0) + 1
-        
-        # Statistiques BPM
-        bpm_values = [t.bpm for t in tracks if t.bpm]
-        bpm_stats = {}
-        if bpm_values:
-            bpm_stats = {
-                "average": round(sum(bpm_values) / len(bpm_values), 1),
-                "min": min(bpm_values),
-                "max": max(bpm_values),
-                "count": len(bpm_values)
-            }
-        
-        # Compilation des statistiques
-        stats = {
-            "artist": {
-                "name": artist.name,
-                "total_tracks": total_tracks,
-                "total_albums": total_albums,
-                "total_duration_seconds": total_duration,
-                "total_duration_formatted": self._format_duration(total_duration),
-                "tracks_with_lyrics": len([t for t in tracks if t.has_lyrics]),
-                "tracks_with_bpm": len([t for t in tracks if t.bpm]),
-                "tracks_with_credits": len([t for t in tracks if t.credits])
-            },
-            "albums": {
-                "by_type": albums_by_type,
-                "total": total_albums
-            },
-            "credits": {
-                "total": len(all_credits),
-                "by_category": credits_by_category,
-                "unique_collaborators": len(collaborators),
-                "top_collaborators": top_collaborators,
-                "top_producers": top_producers
-            },
-            "timeline": {
-                "tracks_by_year": tracks_by_year,
-                "years_active": len([y for y in tracks_by_year.keys() if y != "Unknown"])
-            },
-            "audio": {
-                "bpm_statistics": bpm_stats,
-                "average_track_duration": round(total_duration / total_tracks, 1) if total_tracks > 0 else 0
-            },
-            "quality": {
-                "completeness_score": self._calculate_completeness_score(tracks),
-                "data_coverage": self._calculate_data_coverage(tracks)
-            }
+        # Statistiques de performance
+        self.performance_stats = {
+            'total_exports': 0,
+            'total_files_created': 0,
+            'total_size_generated_mb': 0.0,
+            'average_export_time': 0.0
         }
         
-        return stats
+        self.logger.info(f"ExportStep optimisé initialisé "
+                        f"(Pandas: {PANDAS_AVAILABLE}, "
+                        f"Excel: {OPENPYXL_AVAILABLE}, "
+                        f"Templates: {JINJA2_AVAILABLE})")
     
-    def _export_json(self, export_folder: Path, artist: Artist, tracks: List[Track], 
-                    albums: List[Album], stats: Dict[str, Any]) -> Dict[str, str]:
-        """Export au format JSON"""
-        files = {}
+    def _load_optimized_config(self) -> Dict[str, Any]:
+        """Charge la configuration optimisée"""
+        exports_dir = Path(settings.exports_dir)
+        exports_dir.mkdir(parents=True, exist_ok=True)
         
-        # Export complet détaillé
-        complete_data = {
-            "metadata": {
-                "export_date": datetime.now().isoformat(),
-                "format": "complete",
-                "version": "1.0"
-            },
-            "artist": artist.to_dict(),
-            "albums": [album.to_dict() for album in albums],
-            "tracks": [track.to_dict() for track in tracks],
-            "statistics": stats
+        return {
+            'exports_dir': exports_dir,
+            'include_lyrics': settings.get('exports.include_lyrics', True),
+            'include_raw_data': settings.get('exports.include_raw_data', False),
+            'include_metadata': settings.get('exports.include_metadata', True),
+            'include_quality_scores': settings.get('exports.include_quality_scores', True),
+            'compress_exports': settings.get('exports.compress_exports', True),
+            'create_archive': settings.get('exports.create_archive', True),
+            'cache_templates': settings.get('exports.cache_templates', True),
+            'auto_cleanup_days': settings.get('exports.auto_cleanup_days', 30),
+            'max_items_per_file': settings.get('exports.max_items_per_file', 10000),
+            'use_custom_templates': settings.get('exports.use_custom_templates', True),
+            'generate_summary': settings.get('exports.generate_summary', True),
+            'parallel_export': settings.get('exports.parallel_export', True)
         }
-        
-        complete_file = export_folder / f"{artist.name}_complete.json"
-        with open(complete_file, 'w', encoding='utf-8') as f:
-            json.dump(complete_data, f, indent=2, ensure_ascii=False)
-        files["json_complete"] = str(complete_file)
-        
-        # Export compact pour infographies
-        compact_data = {
-            "artist_name": artist.name,
-            "statistics": stats,
-            "tracks_summary": [
-                {
-                    "title": track.title,
-                    "album": track.album_title,
-                    "year": track.release_year,
-                    "duration": track.duration_seconds,
-                    "bpm": track.bpm,
-                    "producers": track.get_producers(),
-                    "featuring": track.featuring_artists,
-                    "credits_count": len(track.credits)
-                }
-                for track in tracks
-            ]
-        }
-        
-        compact_file = export_folder / f"{artist.name}_infographics.json"
-        with open(compact_file, 'w', encoding='utf-8') as f:
-            json.dump(compact_data, f, indent=2, ensure_ascii=False)
-        files["json_infographics"] = str(compact_file)
-        
-        # Export statistiques seules
-        stats_file = export_folder / f"{artist.name}_statistics.json"
-        with open(stats_file, 'w', encoding='utf-8') as f:
-            json.dump(stats, f, indent=2, ensure_ascii=False)
-        files["json_statistics"] = str(stats_file)
-        
-        return files
     
-    def _export_csv(self, export_folder: Path, artist: Artist, tracks: List[Track], 
-                   albums: List[Album]) -> Dict[str, str]:
-        """Export au format CSV"""
-        files = {}
+    def _load_default_templates(self) -> Dict[str, str]:
+        """Charge les templates par défaut"""
+        if not JINJA2_AVAILABLE:
+            return {}
         
-        # CSV des tracks
-        tracks_file = export_folder / f"{artist.name}_tracks.csv"
-        with open(tracks_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            
-            # En-têtes
-            headers = [
-                'title', 'album', 'track_number', 'release_year', 'duration_seconds',
-                'duration_formatted', 'bpm', 'key', 'has_lyrics', 'genius_url',
-                'producers', 'featuring_artists', 'credits_count', 'unique_collaborators'
-            ]
-            writer.writerow(headers)
-            
-            # Données des tracks
-            for track in tracks:
-                writer.writerow([
-                    track.title,
-                    track.album_title or '',
-                    track.track_number or '',
-                    track.release_year or '',
-                    track.duration_seconds or '',
-                    track.get_duration_formatted(),
-                    track.bpm or '',
-                    track.key or '',
-                    'Yes' if track.has_lyrics else 'No',
-                    track.genius_url or '',
-                    '; '.join(track.get_producers()),
-                    '; '.join(track.featuring_artists),
-                    len(track.credits),
-                    len(track.get_unique_collaborators())
-                ])
-        
-        files["csv_tracks"] = str(tracks_file)
-        
-        # CSV des crédits
-        credits_file = export_folder / f"{artist.name}_credits.csv"
-        with open(credits_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            
-            # En-têtes
-            headers = [
-                'track_title', 'track_album', 'credit_category', 'credit_type',
-                'person_name', 'instrument', 'is_primary', 'is_featuring', 'data_source'
-            ]
-            writer.writerow(headers)
-            
-            # Données des crédits
-            for track in tracks:
-                for credit in track.credits:
-                    writer.writerow([
-                        track.title,
-                        track.album_title or '',
-                        credit.credit_category.value if credit.credit_category else '',
-                        credit.credit_type.value,
-                        credit.person_name,
-                        credit.instrument or '',
-                        'Yes' if credit.is_primary else 'No',
-                        'Yes' if credit.is_featuring else 'No',
-                        credit.data_source.value
-                    ])
-        
-        files["csv_credits"] = str(credits_file)
-        
-        # CSV des albums
-        albums_file = export_folder / f"{artist.name}_albums.csv"
-        with open(albums_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            
-            # En-têtes
-            headers = [
-                'title', 'release_year', 'album_type', 'track_count',
-                'total_duration_seconds', 'duration_formatted', 'genre', 'label'
-            ]
-            writer.writerow(headers)
-            
-            # Données des albums
-            for album in albums:
-                writer.writerow([
-                    album.title,
-                    album.release_year or '',
-                    album.album_type.value if album.album_type else '',
-                    album.track_count or '',
-                    album.total_duration or '',
-                    album.get_duration_formatted(),
-                    album.genre or '',
-                    album.label or ''
-                ])
-        
-        files["csv_albums"] = str(albums_file)
-        
-        return files
-    
-    def _export_html(self, export_folder: Path, artist: Artist, tracks: List[Track],
-                    albums: List[Album], stats: Dict[str, Any]) -> Dict[str, str]:
-        """Export au format HTML avec rapport visuel"""
-        files = {}
-        
-        html_content = self._generate_html_report(artist, tracks, albums, stats)
-        
-        html_file = export_folder / f"{artist.name}_report.html"
-        with open(html_file, 'w', encoding='utf-8') as f:
-            f.write(html_content)
-        
-        files["html_report"] = str(html_file)
-        return files
-    
-    def _export_excel(self, export_folder: Path, artist: Artist, tracks: List[Track],
-                     albums: List[Album], stats: Dict[str, Any]) -> Dict[str, str]:
-        """Export au format Excel avec multiple onglets"""
-        files = {}
-        
-        try:
-            import pandas as pd
-            
-            excel_file = export_folder / f"{artist.name}_data.xlsx"
-            
-            with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
-                # Onglet Résumé
-                summary_data = {
-                    'Métrique': ['Nombre de tracks', 'Nombre d\'albums', 'Durée totale (h)', 
-                               'Tracks avec paroles', 'Tracks avec BPM', 'Collaborateurs uniques'],
-                    'Valeur': [
-                        stats['artist']['total_tracks'],
-                        stats['artist']['total_albums'],
-                        round(stats['artist']['total_duration_seconds'] / 3600, 1),
-                        stats['artist']['tracks_with_lyrics'],
-                        stats['artist']['tracks_with_bpm'],
-                        stats['credits']['unique_collaborators']
-                    ]
-                }
-                pd.DataFrame(summary_data).to_excel(writer, sheet_name='Résumé', index=False)
-                
-                # Onglet Tracks
-                tracks_data = []
-                for track in tracks:
-                    tracks_data.append({
-                        'Titre': track.title,
-                        'Album': track.album_title or '',
-                        'Numéro': track.track_number or '',
-                        'Année': track.release_year or '',
-                        'Durée (s)': track.duration_seconds or '',
-                        'BPM': track.bpm or '',
-                        'Clé': track.key or '',
-                        'Paroles': 'Oui' if track.has_lyrics else 'Non',
-                        'Producteurs': '; '.join(track.get_producers()),
-                        'Featuring': '; '.join(track.featuring_artists),
-                        'Nb Crédits': len(track.credits)
-                    })
-                pd.DataFrame(tracks_data).to_excel(writer, sheet_name='Tracks', index=False)
-                
-                # Onglet Albums
-                albums_data = []
-                for album in albums:
-                    albums_data.append({
-                        'Titre': album.title,
-                        'Année': album.release_year or '',
-                        'Type': album.album_type.value if album.album_type else '',
-                        'Nb Tracks': album.track_count or '',
-                        'Durée (s)': album.total_duration or '',
-                        'Genre': album.genre or '',
-                        'Label': album.label or ''
-                    })
-                pd.DataFrame(albums_data).to_excel(writer, sheet_name='Albums', index=False)
-                
-                # Onglet Crédits
-                credits_data = []
-                for track in tracks:
-                    for credit in track.credits:
-                        credits_data.append({
-                            'Track': track.title,
-                            'Album': track.album_title or '',
-                            'Catégorie': credit.credit_category.value if credit.credit_category else '',
-                            'Type': credit.credit_type.value,
-                            'Personne': credit.person_name,
-                            'Instrument': credit.instrument or '',
-                            'Source': credit.data_source.value
-                        })
-                pd.DataFrame(credits_data).to_excel(writer, sheet_name='Crédits', index=False)
-            
-            files["excel_data"] = str(excel_file)
-            
-        except ImportError:
-            print("⚠️ pandas non disponible, export Excel ignoré")
-        
-        return files
-    
-    def _generate_html_report(self, artist: Artist, tracks: List[Track],
-                             albums: List[Album], stats: Dict[str, Any]) -> str:
-        """Génère un rapport HTML complet"""
-        
-        html = f"""
+        return {
+            'html_report': """
 <!DOCTYPE html>
-<html lang="fr">
+<html>
 <head>
+    <title>{{ artist_name }} - Rapport d'extraction</title>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Rapport d'extraction - {html.escape(artist.name)}</title>
     <style>
-        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }}
-        .container {{ max-width: 1200px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }}
-        h1 {{ color: #2c3e50; border-bottom: 3px solid #3498db; padding-bottom: 10px; }}
-        h2 {{ color: #34495e; margin-top: 30px; }}
-        .stats-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin: 20px 0; }}
-        .stat-card {{ background: #ecf0f1; padding: 20px; border-radius: 8px; text-align: center; }}
-        .stat-number {{ font-size: 2em; font-weight: bold; color: #3498db; }}
-        .stat-label {{ color: #7f8c8d; margin-top: 5px; }}
-        table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }}
-        th, td {{ padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }}
-        th {{ background-color: #3498db; color: white; }}
-        tr:nth-child(even) {{ background-color: #f9f9f9; }}
-        .progress-bar {{ background: #ecf0f1; height: 20px; border-radius: 10px; overflow: hidden; margin: 5px 0; }}
-        .progress-fill {{ height: 100%; background: #3498db; transition: width 0.3s ease; }}
-        .album-type {{ display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 0.8em; margin: 2px; }}
-        .album {{ background: #3498db; color: white; }}
-        .ep {{ background: #e74c3c; color: white; }}
-        .single {{ background: #f39c12; color: white; }}
-        .mixtape {{ background: #9b59b6; color: white; }}
-        .footer {{ margin-top: 40px; text-align: center; color: #7f8c8d; font-size: 0.9em; }}
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .header { background: #f4f4f4; padding: 20px; border-radius: 5px; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; }
+        .stat-card { background: white; border: 1px solid #ddd; padding: 15px; border-radius: 5px; }
+        .track-list { margin-top: 20px; }
+        .track { border-bottom: 1px solid #eee; padding: 10px 0; }
+        .credits { font-size: 0.9em; color: #666; margin-top: 5px; }
+        .quality-high { color: #28a745; }
+        .quality-medium { color: #ffc107; }
+        .quality-low { color: #dc3545; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>📊 Rapport d'extraction - {html.escape(artist.name)}</h1>
-        <p><strong>Date d'export:</strong> {datetime.now().strftime('%d/%m/%Y à %H:%M')}</p>
-        
-        <h2>📈 Statistiques générales</h2>
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-number">{stats['artist']['total_tracks']}</div>
-                <div class="stat-label">Tracks totaux</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number">{stats['artist']['total_albums']}</div>
-                <div class="stat-label">Albums</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number">{stats['artist']['total_duration_formatted']}</div>
-                <div class="stat-label">Durée totale</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number">{stats['credits']['unique_collaborators']}</div>
-                <div class="stat-label">Collaborateurs</div>
-            </div>
+    <div class="header">
+        <h1>{{ artist_name }}</h1>
+        <p>Rapport généré le {{ export_date }}</p>
+    </div>
+    
+    <div class="stats">
+        <div class="stat-card">
+            <h3>Morceaux</h3>
+            <p><strong>{{ tracks|length }}</strong> morceaux extraits</p>
         </div>
+        <div class="stat-card">
+            <h3>Crédits</h3>
+            <p><strong>{{ credits|length }}</strong> crédits trouvés</p>
+        </div>
+        <div class="stat-card">
+            <h3>Qualité</h3>
+            <p>Score moyen: <strong>{{ average_quality_score|round(1) }}/100</strong></p>
+        </div>
+    </div>
+    
+    <div class="track-list">
+        <h2>Liste des morceaux</h2>
+        {% for track in tracks %}
+        <div class="track">
+            <h4>{{ track.title }}</h4>
+            {% if track.album_name %}<p><em>Album: {{ track.album_name }}</em></p>{% endif %}
+            {% if track.duration_formatted %}<p>Durée: {{ track.duration_formatted }}</p>{% endif %}
+            {% if track.quality_score %}
+                <p class="quality-{{ 'high' if track.quality_score >= 80 else 'medium' if track.quality_score >= 60 else 'low' }}">
+                    Qualité: {{ track.quality_score|round(1) }}/100
+                </p>
+            {% endif %}
+            {% if track.credits %}
+                <div class="credits">
+                    <strong>Crédits:</strong>
+                    {% for credit in track.credits %}
+                        {{ credit.person_name }} ({{ credit.credit_type.replace('_', ' ').title() }}){% if not loop.last %}, {% endif %}
+                    {% endfor %}
+                </div>
+            {% endif %}
+        </div>
+        {% endfor %}
+    </div>
+</body>
+</html>
+            """,
+            
+            'summary_template': """
+# {{ artist_name }} - Résumé d'extraction
+
+**Date d'export:** {{ export_date }}
+**Formats générés:** {{ formats_generated|join(', ') }}
+
+## Statistiques
+
+- **Morceaux:** {{ tracks|length }}
+- **Crédits:** {{ credits|length }}
+- **Albums:** {{ albums|length }}
+- **Score qualité moyen:** {{ average_quality_score|round(1) }}/100
+
+## Répartition qualité
+
+- **Haute qualité:** {{ high_quality_count }} morceaux
+- **Qualité moyenne:** {{ medium_quality_count }} morceaux  
+- **Faible qualité:** {{ low_quality_count }} morceaux
+
+## Top contributeurs
+
+{% for contributor in top_contributors[:10] %}
+- **{{ contributor.name }}:** {{ contributor.credit_count }} crédits
+{% endfor %}
+
+---
+*Généré par Music Data Extractor*
+            """
+        }
+    
+    @smart_cache.cache_result("artist_export", expire_days=1)
+    async def export_artist_data(self, artist_name: str,
+                                formats: List[Union[str, ExportFormat]],
+                                options: Optional[Dict[str, Any]] = None,
+                                progress_callback: Optional[callable] = None) -> Tuple[List[str], ExportStats]:
+        """
+        Exporte toutes les données d'un artiste vers les formats spécifiés.
         
-        <h2>🎵 Répartition par type d'album</h2>
-        <div class="stats-grid">
+        Args:
+            artist_name: Nom de l'artiste
+            formats: Liste des formats d'export
+            options: Options d'export (optionnel)
+            progress_callback: Callback de progression
+            
+        Returns:
+            Tuple[List[str], ExportStats]: Chemins des fichiers générés et statistiques
+        """
+        start_time = datetime.now()
+        stats = ExportStats()
+        options = options or {}
+        
+        # Normalisation des formats
+        export_formats = self._normalize_formats(formats)
+        if not export_formats:
+            raise ExportError("Aucun format d'export valide spécifié")
+        
+        try:
+            # Création du job d'export
+            job_id = f"export_{artist_name}_{start_time.strftime('%Y%m%d_%H%M%S')}"
+            export_job = ExportJob(
+                job_id=job_id,
+                artist_name=artist_name,
+                formats=export_formats,
+                options=options
+            )
+            
+            self._export_jobs[job_id] = export_job
+            export_job.started_at = start_time
+            export_job.status = "running"
+            
+            self.logger.info(f"📤 Export démarré pour {artist_name}: {[f.value for f in export_formats]}")
+            
+            # Récupération des données
+            export_data = await self._gather_export_data(artist_name, options, stats)
+            if not export_data:
+                raise ExportError(f"Aucune donnée trouvée pour l'artiste '{artist_name}'")
+            
+            # Création du dossier d'export
+            export_dir = self._create_export_directory(artist_name, job_id)
+            
+            # Export parallèle vers tous les formats
+            if self.config['parallel_export'] and len(export_formats) > 1:
+                file_paths = await self._export_parallel_formats(
+                    export_data, export_formats, export_dir, stats, progress_callback
+                )
+            else:
+                file_paths = await self._export_sequential_formats(
+                    export_data, export_formats, export_dir, stats, progress_callback
+                )
+            
+            # Génération du résumé
+            if self.config['generate_summary']:
+                summary_path = await self._generate_summary_report(
+                    export_data, export_dir, stats
+                )
+                file_paths.append(summary_path)
+            
+            # Création d'une archive si demandé
+            if self.config['create_archive'] and len(file_paths) > 1:
+                archive_path = await self._create_export_archive(
+                    file_paths, export_dir, artist_name
+                )
+                stats.archive_created = str(archive_path)
+                stats.compressed_size_bytes = archive_path.stat().st_size
+            
+            # Finalisation
+            end_time = datetime.now()
+            stats.export_time_seconds = (end_time - start_time).total_seconds()
+            stats.files_created = [str(p) for p in file_paths]
+            stats.formats_generated = [f.value for f in export_formats]
+            
+            export_job.completed_at = end_time
+            export_job.status = "completed"
+            export_job.file_paths = stats.files_created
+            
+            # Mise à jour des stats globales
+            self._update_performance_stats(stats)
+            
+            self.logger.info(f"✅ Export terminé pour {artist_name}: "
+                           f"{len(file_paths)} fichiers générés "
+                           f"({stats.total_file_size_bytes / (1024*1024):.1f} MB) "
+                           f"en {stats.export_time_seconds:.2f}s")
+            
+            return stats.files_created, stats
+            
+        except Exception as e:
+            export_job.status = "failed"
+            export_job.error_message = str(e)
+            self.logger.error(f"❌ Erreur export pour {artist_name}: {e}")
+            raise ExportError(f"Échec export: {e}")
+    
+    def _normalize_formats(self, formats: List[Union[str, ExportFormat]]) -> List[ExportFormat]:
+        """Normalise la liste des formats d'export"""
+        normalized = []
+        
+        for fmt in formats:
+            if isinstance(fmt, str):
+                try:
+                    export_format = ExportFormat(fmt.lower())
+                    normalized.append(export_format)
+                except ValueError:
+                    self.logger.warning(f"Format d'export inconnu: {fmt}")
+            elif isinstance(fmt, ExportFormat):
+                normalized.append(fmt)
+        
+        return normalized
+    
+    async def _gather_export_data(self, artist_name: str, 
+                                options: Dict[str, Any], 
+                                stats: ExportStats) -> Dict[str, Any]:
+        """Rassemble toutes les données à exporter"""
+        
+        # Récupération de l'artiste
+        artist = self.database.get_artist_by_name(artist_name)
+        if not artist:
+            return {}
+        
+        # Récupération des données associées
+        tracks = self.database.get_tracks_by_artist(artist.id)
+        credits = self.database.get_credits_by_artist(artist.id)
+        albums = self.database.get_albums_by_artist(artist.id)
+        sessions = self.database.get_sessions_by_artist(artist_name)
+        
+        # Filtrage selon les options
+        if not options.get('include_failed_extractions', True):
+            tracks = [t for t in tracks if t.extraction_status != 'failed']
+        
+        if options.get('min_quality_score'):
+            min_score = options['min_quality_score']
+            tracks = [t for t in tracks if t.quality_score >= min_score]
+        
+        # Statistiques
+        stats.total_items = len(tracks) + len(credits) + len(albums)
+        stats.exported_tracks = len(tracks)
+        stats.exported_credits = len(credits)
+        stats.exported_albums = len(albums)
+        stats.exported_sessions = len(sessions)
+        
+        # Préparation des données d'export
+        export_data = {
+            'artist': artist.to_dict(),
+            'tracks': [self._prepare_track_for_export(t, options) for t in tracks],
+            'credits': [self._prepare_credit_for_export(c, options) for c in credits],
+            'albums': [self._prepare_album_for_export(a, options) for a in albums],
+            'sessions': [self._prepare_session_for_export(s, options) for s in sessions],
+            'metadata': {
+                'export_date': datetime.now().isoformat(),
+                'artist_name': artist_name,
+                'total_tracks': len(tracks),
+                'total_credits': len(credits),
+                'total_albums': len(albums),
+                'average_quality_score': sum(t.quality_score or 0 for t in tracks) / max(len(tracks), 1),
+                'options': options
+            }
+        }
+        
+        # Enrichissement avec données dérivées
+        export_data.update(self._calculate_derived_data(export_data))
+        
+        return export_data
+    
+    def _prepare_track_for_export(self, track: Track, options: Dict[str, Any]) -> Dict[str, Any]:
+        """Prépare un morceau pour l'export"""
+        track_data = track.to_dict()
+        
+        # Filtrage des données selon les options
+        if not options.get('include_lyrics', self.config['include_lyrics']):
+            track_data.pop('lyrics', None)
+        
+        if not options.get('include_raw_data', self.config['include_raw_data']):
+            track_data.pop('metadata', None)
+        
+        # Ajout de données calculées
+        track_data['has_complete_credits'] = bool(track.credits and len(track.credits) > 2)
+        track_data['quality_category'] = self._get_quality_category(track.quality_score)
+        
+        return track_data
+    
+    def _prepare_credit_for_export(self, credit: Credit, options: Dict[str, Any]) -> Dict[str, Any]:
+        """Prépare un crédit pour l'export"""
+        credit_data = credit.to_dict()
+        
+        # Ajout de données enrichies
+        credit_data['category_display'] = credit.credit_category.value.replace('_', ' ').title()
+        credit_data['type_display'] = credit.credit_type.value.replace('_', ' ').title()
+        
+        return credit_data
+    
+    def _prepare_album_for_export(self, album: Album, options: Dict[str, Any]) -> Dict[str, Any]:
+        """Prépare un album pour l'export"""
+        return album.to_dict()
+    
+    def _prepare_session_for_export(self, session: Session, options: Dict[str, Any]) -> Dict[str, Any]:
+        """Prépare une session pour l'export"""
+        session_data = session.to_dict()
+        
+        # Filtrage des métadonnées sensibles
+        if 'metadata' in session_data and not options.get('include_raw_data', False):
+            filtered_metadata = {k: v for k, v in session_data['metadata'].items() 
+                               if not k.startswith('_') and k != 'error_details'}
+            session_data['metadata'] = filtered_metadata
+        
+        return session_data
+    
+    def _calculate_derived_data(self, export_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Calcule des données dérivées pour l'export"""
+        tracks = export_data['tracks']
+        credits = export_data['credits']
+        
+        # Top contributeurs
+        contributor_counts = {}
+        for credit in credits:
+            name = credit['person_name']
+            contributor_counts[name] = contributor_counts.get(name, 0) + 1
+        
+        top_contributors = [
+            {'name': name, 'credit_count': count}
+            for name, count in sorted(contributor_counts.items(), key=lambda x: x[1], reverse=True)
+        ]
+        
+        # Répartition qualité
+        quality_distribution = {'high': 0, 'medium': 0, 'low': 0}
+        for track in tracks:
+            category = self._get_quality_category(track.get('quality_score', 0))
+            quality_distribution[category] += 1
+        
+        # Statistiques par type de crédit
+        credit_type_stats = {}
+        for credit in credits:
+            credit_type = credit['credit_type']
+            credit_type_stats[credit_type] = credit_type_stats.get(credit_type, 0) + 1
+        
+        return {
+            'top_contributors': top_contributors,
+            'quality_distribution': quality_distribution,
+            'high_quality_count': quality_distribution['high'],
+            'medium_quality_count': quality_distribution['medium'],
+            'low_quality_count': quality_distribution['low'],
+            'credit_type_stats': credit_type_stats,
+            'most_common_credit_type': max(credit_type_stats.items(), key=lambda x: x[1])[0] if credit_type_stats else None
+        }
+    
+    @lru_cache(maxsize=128)
+    def _get_quality_category(self, score: Optional[float]) -> str:
+        """Retourne la catégorie de qualité - avec cache"""
+        if not score:
+            return 'low'
+        if score >= 80:
+            return 'high'
+        elif score >= 60:
+            return 'medium'
+        else:
+            return 'low'
+    
+    def _create_export_directory(self, artist_name: str, job_id: str) -> Path:
+        """Crée le dossier d'export"""
+        # Normalisation du nom d'artiste pour le système de fichiers
+        safe_artist_name = "".join(c for c in artist_name if c.isalnum() or c in (' ', '-', '_')).strip()
+        safe_artist_name = safe_artist_name.replace(' ', '_')
+        
+        export_dir = self.config['exports_dir'] / f"{safe_artist_name}_{job_id}"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        
+        return export_dir
+    
+    async def _export_parallel_formats(self, export_data: Dict[str, Any],
+                                     formats: List[ExportFormat],
+                                     export_dir: Path,
+                                     stats: ExportStats,
+                                     progress_callback: Optional[callable] = None) -> List[Path]:
+        """Exporte vers plusieurs formats en parallèle"""
+        
+        loop = asyncio.get_event_loop()
+        
+        # Créer les tâches d'export
+        tasks = []
+        for fmt in formats:
+            task = loop.run_in_executor(
+                None,
+                self._export_single_format,
+                export_data, fmt, export_dir, stats
+            )
+            tasks.append(task)
+        
+        # Exécuter en parallèle
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        file_paths = []
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                self.logger.error(f"❌ Erreur export {formats[i].value}: {result}")
+            else:
+                file_paths.append(result)
+                if progress_callback:
+                    progress = ((i + 1) / len(formats)) * 90  # 90% de la progression
+                    progress_callback("export", int(progress), 100)
+        
+        return file_paths
+    
+    async def _export_sequential_formats(self, export_data: Dict[str, Any],
+                                       formats: List[ExportFormat],
+                                       export_dir: Path,
+                                       stats: ExportStats,
+                                       progress_callback: Optional[callable] = None) -> List[Path]:
+        """Exporte vers plusieurs formats de manière séquentielle"""
+        
+        file_paths = []
+        
+        for i, fmt in enumerate(formats):
+            try:
+                file_path = self._export_single_format(export_data, fmt, export_dir, stats)
+                file_paths.append(file_path)
+                
+                if progress_callback:
+                    progress = ((i + 1) / len(formats)) * 90
+                    progress_callback("export", int(progress), 100)
+                    
+            except Exception as e:
+                self.logger.error(f"❌ Erreur export {fmt.value}: {e}")
+        
+        return file_paths
+    
+    def _export_single_format(self, export_data: Dict[str, Any],
+                            format_type: ExportFormat,
+                            export_dir: Path,
+                            stats: ExportStats) -> Path:
+        """Exporte vers un format unique"""
+        
+        artist_name = export_data['metadata']['artist_name']
+        safe_name = "".join(c for c in artist_name if c.isalnum() or c in (' ', '-', '_')).strip().replace(' ', '_')
+        
+        # Dispatch vers la méthode appropriée
+        export_methods = {
+            ExportFormat.JSON: self._export_json,
+            ExportFormat.CSV: self._export_csv,
+            ExportFormat.EXCEL: self._export_excel,
+            ExportFormat.HTML: self._export_html,
+            ExportFormat.XML: self._export_xml,
+            ExportFormat.YAML: self._export_yaml
+        }
+        
+        method = export_methods.get(format_type)
+        if not method:
+            raise ExportError(f"Format d'export non supporté: {format_type.value}")
+        
+        file_path = method(export_data, export_dir, safe_name)
+        
+        # Mise à jour des statistiques
+        if file_path.exists():
+            file_size = file_path.stat().st_size
+            stats.total_file_size_bytes += file_size
+        
+        return file_path
+    
+    def _export_json(self, export_data: Dict[str, Any], export_dir: Path, safe_name: str) -> Path:
+        """Export au format JSON"""
+        file_path = export_dir / f"{safe_name}_export.json"
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(export_data, f, indent=2, ensure_ascii=False, default=str)
+        
+        self.logger.info(f"✅ Export JSON: {file_path}")
+        return file_path
+    
+    def _export_csv(self, export_data: Dict[str, Any], export_dir: Path, safe_name: str) -> Path:
+        """Export au format CSV (multiple files)"""
+        files_created = []
+        
+        # Export des morceaux
+        tracks_file = export_dir / f"{safe_name}_tracks.csv"
+        with open(tracks_file, 'w', newline='', encoding='utf-8') as f:
+            if export_data['tracks']:
+                writer = csv.DictWriter(f, fieldnames=export_data['tracks'][0].keys())
+                writer.writeheader()
+                writer.writerows(export_data['tracks'])
+        files_created.append(tracks_file)
+        
+        # Export des crédits
+        credits_file = export_dir / f"{safe_name}_credits.csv"
+        with open(credits_file, 'w', newline='', encoding='utf-8') as f:
+            if export_data['credits']:
+                writer = csv.DictWriter(f, fieldnames=export_data['credits'][0].keys())
+                writer.writeheader()
+                writer.writerows(export_data['credits'])
+        files_created.append(credits_file)
+        
+        # Export des albums
+        albums_file = export_dir / f"{safe_name}_albums.csv"
+        with open(albums_file, 'w', newline='', encoding='utf-8') as f:
+            if export_data['albums']:
+                writer = csv.DictWriter(f, fieldnames=export_data['albums'][0].keys())
+                writer.writeheader()
+                writer.writerows(export_data['albums'])
+        files_created.append(albums_file)
+        
+        self.logger.info(f"✅ Export CSV: {len(files_created)} fichiers créés")
+        return files_created[0]  # Retourner le fichier principal
+    
+    def _export_excel(self, export_data: Dict[str, Any], export_dir: Path, safe_name: str) -> Path:
+        """Export au format Excel"""
+        if not PANDAS_AVAILABLE or not OPENPYXL_AVAILABLE:
+            raise ExportError("Pandas et openpyxl requis pour l'export Excel")
+        
+        file_path = export_dir / f"{safe_name}_export.xlsx"
+        
+        with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+            # Feuille artiste
+            artist_df = pd.DataFrame([export_data['artist']])
+            artist_df.to_excel(writer, sheet_name='Artiste', index=False)
+            
+            # Feuille morceaux
+            if export_data['tracks']:
+                tracks_df = pd.DataFrame(export_data['tracks'])
+                tracks_df.to_excel(writer, sheet_name='Morceaux', index=False)
+            
+            # Feuille crédits
+            if export_data['credits']:
+                credits_df = pd.DataFrame(export_data['credits'])
+                credits_df.to_excel(writer, sheet_name='Crédits', index=False)
+            
+            # Feuille albums
+            if export_data['albums']:
+                albums_df = pd.DataFrame(export_data['albums'])
+                albums_df.to_excel(writer, sheet_name='Albums', index=False)
+            
+            # Feuille statistiques
+            stats_data = {
+                'Métrique': ['Total morceaux', 'Total crédits', 'Total albums', 'Score qualité moyen'],
+                'Valeur': [
+                    len(export_data['tracks']),
+                    len(export_data['credits']),
+                    len(export_data['albums']),
+                    export_data['metadata']['average_quality_score']
+                ]
+            }
+            stats_df = pd.DataFrame(stats_data)
+            stats_df.to_excel(writer, sheet_name='Statistiques', index=False)
+        
+        self.logger.info(f"✅ Export Excel: {file_path}")
+        return file_path
+    
+    def _export_html(self, export_data: Dict[str, Any], export_dir: Path, safe_name: str) -> Path:
+        """Export au format HTML avec template"""
+        file_path = export_dir / f"{safe_name}_report.html"
+        
+        if JINJA2_AVAILABLE and 'html_report' in self._default_templates:
+            # Utiliser le template Jinja2
+            template = Template(self._default_templates['html_report'])
+            html_content = template.render(**export_data)
+        else:
+            # Template HTML simple fallback
+            html_content = self._generate_simple_html_report(export_data)
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        
+        self.logger.info(f"✅ Export HTML: {file_path}")
+        return file_path
+    
+    def _export_xml(self, export_data: Dict[str, Any], export_dir: Path, safe_name: str) -> Path:
+        """Export au format XML"""
+        if not XML_AVAILABLE:
+            raise ExportError("Module xml.etree.ElementTree requis pour l'export XML")
+        
+        file_path = export_dir / f"{safe_name}_export.xml"
+        
+        # Création de la structure XML
+        root = ET.Element("music_data")
+        root.set("artist", export_data['metadata']['artist_name'])
+        root.set("export_date", export_data['metadata']['export_date'])
+        
+        # Artiste
+        artist_elem = ET.SubElement(root, "artist")
+        for key, value in export_data['artist'].items():
+            if value is not None:
+                elem = ET.SubElement(artist_elem, key)
+                elem.text = str(value)
+        
+        # Morceaux
+        tracks_elem = ET.SubElement(root, "tracks")
+        for track in export_data['tracks']:
+            track_elem = ET.SubElement(tracks_elem, "track")
+            for key, value in track.items():
+                if value is not None and key != 'metadata':
+                    elem = ET.SubElement(track_elem, key)
+                    elem.text = str(value)
+        
+        # Crédits
+        credits_elem = ET.SubElement(root, "credits")
+        for credit in export_data['credits']:
+            credit_elem = ET.SubElement(credits_elem, "credit")
+            for key, value in credit.items():
+                if value is not None:
+                    elem = ET.SubElement(credit_elem, key)
+                    elem.text = str(value)
+        
+        # Sauvegarde
+        tree = ET.ElementTree(root)
+        tree.write(file_path, encoding='utf-8', xml_declaration=True)
+        
+        self.logger.info(f"✅ Export XML: {file_path}")
+        return file_path
+    
+    def _export_yaml(self, export_data: Dict[str, Any], export_dir: Path, safe_name: str) -> Path:
+        """Export au format YAML"""
+        file_path = export_dir / f"{safe_name}_export.yaml"
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            yaml.dump(export_data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        
+        self.logger.info(f"✅ Export YAML: {file_path}")
+        return file_path
+    
+    def _generate_simple_html_report(self, export_data: Dict[str, Any]) -> str:
+        """Génère un rapport HTML simple (fallback)"""
+        artist_name = export_data['metadata']['artist_name']
+        export_date = export_data['metadata']['export_date']
+        
+        html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>{artist_name} - Rapport d'extraction</title>
+    <meta charset="UTF-8">
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; }}
+        .header {{ background: #f4f4f4; padding: 20px; }}
+        .stats {{ margin: 20px 0; }}
+        .track {{ border-bottom: 1px solid #eee; padding: 10px 0; }}
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>{artist_name}</h1>
+        <p>Rapport généré le {export_date}</p>
+    </div>
+    
+    <div class="stats">
+        <h2>Statistiques</h2>
+        <ul>
+            <li>Morceaux: {len(export_data['tracks'])}</li>
+            <li>Crédits: {len(export_data['credits'])}</li>
+            <li>Albums: {len(export_data['albums'])}</li>
+        </ul>
+    </div>
+    
+    <div class="tracks">
+        <h2>Morceaux</h2>
         """
         
-        for album_type, count in stats['albums']['by_type'].items():
+        for track in export_data['tracks'][:50]:  # Limiter à 50 pour la performance
             html += f"""
-            <div class="stat-card">
-                <div class="stat-number">{count}</div>
-                <div class="stat-label">{album_type.title()}</div>
-            </div>
+        <div class="track">
+            <h4>{track.get('title', 'Titre inconnu')}</h4>
+            <p>Album: {track.get('album_name', 'N/A')}</p>
+            <p>Durée: {track.get('duration_formatted', 'N/A')}</p>
+        </div>
             """
         
         html += """
-        </div>
-        
-        <h2>🏆 Top Collaborateurs</h2>
-        <table>
-            <thead>
-                <tr><th>Collaborateur</th><th>Nombre de tracks</th><th>Pourcentage</th></tr>
-            </thead>
-            <tbody>
-        """
-        
-        total_tracks = stats['artist']['total_tracks']
-        for collaborator, count in stats['credits']['top_collaborators'][:10]:
-            percentage = (count / total_tracks * 100) if total_tracks > 0 else 0
-            html += f"""
-                <tr>
-                    <td>{html.escape(collaborator)}</td>
-                    <td>{count}</td>
-                    <td>
-                        <div class="progress-bar">
-                            <div class="progress-fill" style="width: {percentage}%"></div>
-                        </div>
-                        {percentage:.1f}%
-                    </td>
-                </tr>
-            """
-        
-        html += """
-            </tbody>
-        </table>
-        
-        <h2>🎛️ Top Producteurs</h2>
-        <table>
-            <thead>
-                <tr><th>Producteur</th><th>Nombre de tracks</th><th>Pourcentage</th></tr>
-            </thead>
-            <tbody>
-        """
-        
-        for producer, count in stats['credits']['top_producers'][:10]:
-            percentage = (count / total_tracks * 100) if total_tracks > 0 else 0
-            html += f"""
-                <tr>
-                    <td>{html.escape(producer)}</td>
-                    <td>{count}</td>
-                    <td>
-                        <div class="progress-bar">
-                            <div class="progress-fill" style="width: {percentage}%"></div>
-                        </div>
-                        {percentage:.1f}%
-                    </td>
-                </tr>
-            """
-        
-        html += """
-            </tbody>
-        </table>
-        
-        <h2>📅 Timeline</h2>
-        <table>
-            <thead>
-                <tr><th>Année</th><th>Nombre de tracks</th><th>Répartition</th></tr>
-            </thead>
-            <tbody>
-        """
-        
-        max_tracks_year = max(stats['timeline']['tracks_by_year'].values()) if stats['timeline']['tracks_by_year'] else 1
-        for year, count in sorted(stats['timeline']['tracks_by_year'].items()):
-            percentage = (count / max_tracks_year * 100)
-            html += f"""
-                <tr>
-                    <td>{year}</td>
-                    <td>{count}</td>
-                    <td>
-                        <div class="progress-bar">
-                            <div class="progress-fill" style="width: {percentage}%"></div>
-                        </div>
-                    </td>
-                </tr>
-            """
-        
-        # Statistiques audio si disponibles
-        bpm_stats = stats['audio']['bpm_statistics']
-        if bmp_stats:
-            html += f"""
-        </tbody>
-        </table>
-        
-        <h2>🎵 Statistiques Audio</h2>
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-number">{bpm_stats.get('average', 'N/A')}</div>
-                <div class="stat-label">BPM moyen</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number">{bpm_stats.get('min', 'N/A')}</div>
-                <div class="stat-label">BPM min</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number">{bmp_stats.get('max', 'N/A')}</div>
-                <div class="stat-label">BPM max</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number">{bmp_stats.get('count', 'N/A')}</div>
-                <div class="stat-label">Tracks avec BPM</div>
-            </div>
-        </div>
-            """
-        
-        html += f"""
-        
-        <h2>✅ Qualité des données</h2>
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-number">{stats['quality']['completeness_score']:.1f}%</div>
-                <div class="stat-label">Score de complétude</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number">{stats['artist']['tracks_with_lyrics']}</div>
-                <div class="stat-label">Tracks avec paroles</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number">{stats['artist']['tracks_with_bpm']}</div>
-                <div class="stat-label">Tracks avec BPM</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-number">{stats['artist']['tracks_with_credits']}</div>
-                <div class="stat-label">Tracks avec crédits</div>
-            </div>
-        </div>
-        
-        <div class="footer">
-            <p>Rapport généré par Music Data Extractor | {datetime.now().strftime('%d/%m/%Y à %H:%M')}</p>
-        </div>
     </div>
 </body>
 </html>
@@ -715,77 +890,174 @@ class Step4Export:
         
         return html
     
-    def _create_zip_archive(self, export_folder: Path, exported_files: Dict[str, str]) -> Path:
-        """Crée une archive ZIP avec tous les fichiers exportés"""
-        zip_path = export_folder / f"{export_folder.name}.zip"
+    async def _generate_summary_report(self, export_data: Dict[str, Any],
+                                     export_dir: Path,
+                                     stats: ExportStats) -> Path:
+        """Génère un rapport de résumé"""
+        file_path = export_dir / "RESUME.md"
         
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            for file_type, file_path in exported_files.items():
-                if file_type != "archive":  # Éviter la récursion
-                    file_path_obj = Path(file_path)
-                    if file_path_obj.exists():
-                        # Ajouter le fichier avec un nom relatif
-                        arcname = file_path_obj.name
-                        zipf.write(file_path, arcname)
-        
-        return zip_path
-    
-    def _format_duration(self, seconds: int) -> str:
-        """Formate une durée en secondes vers un format lisible"""
-        if seconds is None or seconds <= 0:
-            return "0:00"
-        
-        hours = seconds // 3600
-        minutes = (seconds % 3600) // 60
-        secs = seconds % 60
-        
-        if hours > 0:
-            return f"{hours}:{minutes:02d}:{secs:02d}"
+        if JINJA2_AVAILABLE and 'summary_template' in self._default_templates:
+            template = Template(self._default_templates['summary_template'])
+            summary_content = template.render(
+                **export_data,
+                formats_generated=stats.formats_generated
+            )
         else:
-            return f"{minutes}:{secs:02d}"
+            # Fallback simple
+            summary_content = f"""
+# {export_data['metadata']['artist_name']} - Résumé d'extraction
+
+**Date d'export:** {export_data['metadata']['export_date']}
+**Formats générés:** {', '.join(stats.formats_generated)}
+
+## Statistiques
+
+- **Morceaux:** {len(export_data['tracks'])}
+- **Crédits:** {len(export_data['credits'])}
+- **Albums:** {len(export_data['albums'])}
+
+---
+*Généré par Music Data Extractor*
+            """
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(summary_content)
+        
+        self.logger.info(f"✅ Résumé généré: {file_path}")
+        return file_path
     
-    def _calculate_completeness_score(self, tracks: List[Track]) -> float:
-        """Calcule un score de complétude des données"""
-        if not tracks:
-            return 0.0
+    async def _create_export_archive(self, file_paths: List[Path],
+                                   export_dir: Path,
+                                   artist_name: str) -> Path:
+        """Crée une archive ZIP des fichiers exportés"""
+        safe_name = "".join(c for c in artist_name if c.isalnum() or c in (' ', '-', '_')).strip().replace(' ', '_')
+        archive_path = export_dir / f"{safe_name}_complete_export.zip"
         
-        total_score = 0
-        for track in tracks:
-            track_score = 0
-            max_score = 7  # Nombre de critères
-            
-            # Critères de complétude
-            if track.duration_seconds:
-                track_score += 1
-            if track.bpm:
-                track_score += 1
-            if track.album_title:
-                track_score += 1
-            if track.release_year:
-                track_score += 1
-            if track.credits:
-                track_score += 1
-            if track.has_lyrics:
-                track_score += 1
-            if track.featuring_artists:
-                track_score += 0.5  # Bonus pour featuring
-            
-            total_score += (track_score / max_score)
+        with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for file_path in file_paths:
+                if file_path.exists():
+                    # Utiliser seulement le nom du fichier dans l'archive
+                    arcname = file_path.name
+                    zipf.write(file_path, arcname)
         
-        return (total_score / len(tracks)) * 100
+        self.logger.info(f"✅ Archive créée: {archive_path} ({archive_path.stat().st_size / (1024*1024):.1f} MB)")
+        return archive_path
     
-    def _calculate_data_coverage(self, tracks: List[Track]) -> Dict[str, float]:
-        """Calcule la couverture des données par catégorie"""
-        if not tracks:
-            return {}
+    def _update_performance_stats(self, stats: ExportStats):
+        """Met à jour les statistiques de performance globales"""
+        self.performance_stats['total_exports'] += 1
+        self.performance_stats['total_files_created'] += len(stats.files_created)
+        self.performance_stats['total_size_generated_mb'] += stats.total_file_size_bytes / (1024 * 1024)
         
-        total = len(tracks)
+        # Moyenne mobile du temps d'export
+        current_avg = self.performance_stats['average_export_time']
+        total_count = self.performance_stats['total_exports']
+        
+        new_avg = ((current_avg * (total_count - 1)) + stats.export_time_seconds) / total_count
+        self.performance_stats['average_export_time'] = new_avg
+    
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Retourne les statistiques de performance"""
+        return {
+            **self.performance_stats,
+            'formats_available': {
+                'json': True,
+                'csv': True,
+                'excel': PANDAS_AVAILABLE and OPENPYXL_AVAILABLE,
+                'html': True,
+                'xml': XML_AVAILABLE,
+                'yaml': True
+            },
+            'template_features': {
+                'jinja2_templates': JINJA2_AVAILABLE,
+                'custom_templates': self.config['use_custom_templates']
+            },
+            'config': self.config,
+            'active_jobs': len([j for j in self._export_jobs.values() if j.status == 'running']),
+            'completed_jobs': len([j for j in self._export_jobs.values() if j.status == 'completed'])
+        }
+    
+    def get_export_job_status(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Retourne le statut d'un job d'export"""
+        job = self._export_jobs.get(job_id)
+        if not job:
+            return None
         
         return {
-            "duration": (len([t for t in tracks if t.duration_seconds]) / total) * 100,
-            "bpm": (len([t for t in tracks if t.bpm]) / total) * 100,
-            "albums": (len([t for t in tracks if t.album_title]) / total) * 100,
-            "lyrics": (len([t for t in tracks if t.has_lyrics]) / total) * 100,
-            "credits": (len([t for t in tracks if t.credits]) / total) * 100,
-            "featuring": (len([t for t in tracks if t.featuring_artists]) / total) * 100
+            'job_id': job.job_id,
+            'artist_name': job.artist_name,
+            'status': job.status,
+            'formats': [f.value for f in job.formats],
+            'created_at': job.created_at.isoformat() if job.created_at else None,
+            'started_at': job.started_at.isoformat() if job.started_at else None,
+            'completed_at': job.completed_at.isoformat() if job.completed_at else None,
+            'duration_seconds': job.duration_seconds,
+            'file_paths': job.file_paths,
+            'error_message': job.error_message
         }
+    
+    def list_export_jobs(self, status_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Liste tous les jobs d'export"""
+        jobs = []
+        for job in self._export_jobs.values():
+            if status_filter and job.status != status_filter:
+                continue
+            jobs.append(self.get_export_job_status(job.job_id))
+        
+        return sorted(jobs, key=lambda x: x['created_at'], reverse=True)
+    
+    def cleanup_old_exports(self, days: Optional[int] = None) -> int:
+        """Nettoie les anciens exports"""
+        cleanup_days = days or self.config['auto_cleanup_days']
+        if cleanup_days <= 0:
+            return 0
+        
+        cutoff_date = datetime.now() - timedelta(days=cleanup_days)
+        exports_dir = self.config['exports_dir']
+        
+        cleaned_count = 0
+        
+        try:
+            for export_subdir in exports_dir.iterdir():
+                if export_subdir.is_dir():
+                    # Vérifier la date de création du dossier
+                    creation_time = datetime.fromtimestamp(export_subdir.stat().st_ctime)
+                    
+                    if creation_time < cutoff_date:
+                        # Supprimer le dossier et son contenu
+                        import shutil
+                        shutil.rmtree(export_subdir)
+                        cleaned_count += 1
+                        self.logger.info(f"🗑️ Dossier d'export nettoyé: {export_subdir.name}")
+        
+        except Exception as e:
+            self.logger.error(f"❌ Erreur nettoyage exports: {e}")
+        
+        # Nettoyer aussi les jobs terminés anciens
+        old_job_ids = [
+            job_id for job_id, job in self._export_jobs.items()
+            if job.completed_at and job.completed_at < cutoff_date
+        ]
+        
+        for job_id in old_job_ids:
+            del self._export_jobs[job_id]
+        
+        if cleaned_count > 0:
+            self.logger.info(f"🧹 Nettoyage terminé: {cleaned_count} exports supprimés")
+        
+        return cleaned_count
+    
+    def reset_performance_stats(self):
+        """Remet à zéro les statistiques de performance"""
+        self.performance_stats = {
+            'total_exports': 0,
+            'total_files_created': 0,
+            'total_size_generated_mb': 0.0,
+            'average_export_time': 0.0
+        }
+        
+        self._template_cache.clear()
+        self._data_cache.clear()
+        self._export_jobs.clear()
+        
+        self.logger.info("🔄 Statistiques d'export remises à zéro")
