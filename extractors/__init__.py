@@ -142,6 +142,7 @@ def create_extractor(extractor_type: str, **kwargs) -> Optional[Any]:
     Returns:
         Instance de l'extracteur ou None si échec
     """
+    # Mapping des types vers les classes
     extractor_mapping = {
         'genius_scraper': 'GeniusWebScraper',
         'genius': 'GeniusWebScraper',
@@ -187,58 +188,36 @@ def get_extractor_capabilities(extractor_type: str) -> Dict[str, Any]:
         Dictionnaire des capacités
     """
     capabilities = {
-        'genius_scraper': {
-            'supports_lyrics': True,
-            'supports_credits': True,
-            'supports_albums': True,
-            'requires_selenium': True,
-            'can_expand_hidden_credits': True,
-            'data_quality': 'high',
-            'extraction_speed': 'slow'
-        },
-        'rapedia_scraper': {
-            'supports_lyrics': False,
-            'supports_credits': True,
-            'supports_albums': True,
-            'requires_selenium': False,
-            'language_focus': 'french_rap',
-            'data_quality': 'very_high',
-            'extraction_speed': 'medium'
-        },
-        'spotify_extractor': {
-            'supports_lyrics': False,
-            'supports_credits': False,
-            'supports_albums': True,
-            'supports_audio_features': True,
-            'requires_api_key': True,
-            'data_quality': 'medium',
-            'extraction_speed': 'fast'
-        },
-        'lastfm_extractor': {
-            'supports_lyrics': False,
-            'supports_credits': False,
-            'supports_albums': True,
-            'supports_tags': True,
-            'requires_api_key': True,
-            'data_quality': 'medium',
-            'extraction_speed': 'fast'
-        },
-        'discogs_extractor': {
-            'supports_lyrics': False,
-            'supports_credits': True,
-            'supports_albums': True,
-            'supports_release_info': True,
-            'requires_api_key': True,
-            'data_quality': 'high',
-            'extraction_speed': 'medium'
-        }
+        'available': False,
+        'features': [],
+        'data_sources': [],
+        'output_formats': []
     }
     
-    return capabilities.get(extractor_type.lower(), {})
+    try:
+        extractor = create_extractor(extractor_type)
+        if extractor:
+            capabilities['available'] = True
+            
+            # Détection des méthodes disponibles
+            methods = [method for method in dir(extractor) if not method.startswith('_')]
+            capabilities['features'] = methods
+            
+            # Extraction des capacités spécifiques si disponibles
+            if hasattr(extractor, 'get_supported_sources'):
+                capabilities['data_sources'] = extractor.get_supported_sources()
+            
+            if hasattr(extractor, 'get_output_formats'):
+                capabilities['output_formats'] = extractor.get_output_formats()
+                
+    except Exception as e:
+        logger.debug(f"Erreur évaluation capacités {extractor_type}: {e}")
+    
+    return capabilities
 
-def run_extraction_diagnostics() -> Dict[str, Any]:
+def run_extractor_diagnostics() -> Dict[str, Any]:
     """
-    Exécute un diagnostic complet du module extractors.
+    Lance des diagnostics complets sur tous les extracteurs.
     
     Returns:
         Rapport de diagnostic détaillé
@@ -254,155 +233,157 @@ def run_extraction_diagnostics() -> Dict[str, Any]:
         'import_status': get_import_stats(),
         'system_info': {
             'python_version': sys.version,
-            'selenium_available': _check_selenium_availability(),
-            'required_dependencies': _check_dependencies()
+            'required_packages': _check_required_packages()
         }
     }
     
     # Test de création des extracteurs
-    extraction_tests = {}
-    for extractor_type in ['genius_scraper', 'rapedia_scraper', 'spotify_extractor', 'lastfm_extractor', 'discogs_extractor']:
+    extractor_tests = {}
+    all_types = ['genius', 'rapedia', 'spotify', 'lastfm', 'discogs']
+    
+    for extractor_type in all_types:
         try:
             extractor = create_extractor(extractor_type)
-            extraction_tests[extractor_type] = {
+            extractor_tests[extractor_type] = {
                 'creation_success': extractor is not None,
-                'class_available': any(extractor_type.replace('_', '').title().replace('Extractor', 'Extractor').replace('Scraper', 'Scraper') in name 
-                                     for name in __all__),
                 'capabilities': get_extractor_capabilities(extractor_type)
             }
         except Exception as e:
-            extraction_tests[extractor_type] = {
+            extractor_tests[extractor_type] = {
                 'creation_success': False,
                 'error': str(e),
                 'capabilities': {}
             }
     
-    diagnostics['extraction_tests'] = extraction_tests
+    diagnostics['extractor_tests'] = extractor_tests
     
     return diagnostics
 
-def _check_selenium_availability() -> bool:
-    """Vérifie la disponibilité de Selenium"""
-    try:
-        import selenium
-        return True
-    except ImportError:
-        return False
-
-def _check_dependencies() -> Dict[str, bool]:
-    """Vérifie la disponibilité des dépendances requises"""
-    dependencies = {
-        'requests': False,
-        'beautifulsoup4': False,
-        'selenium': False,
-        'webdriver_manager': False,
-        'lxml': False
-    }
+def _check_required_packages() -> Dict[str, bool]:
+    """Vérifie la disponibilité des packages requis"""
+    packages = {}
     
-    for dep in dependencies:
+    # Packages essentiels
+    for package in ['requests', 'beautifulsoup4', 'lxml']:
         try:
-            if dep == 'beautifulsoup4':
-                import bs4
-            elif dep == 'webdriver_manager':
-                import webdriver_manager
-            else:
-                importlib.import_module(dep)
-            dependencies[dep] = True
+            importlib.import_module(package.replace('beautifulsoup4', 'bs4'))
+            packages[package] = True
         except ImportError:
-            pass
+            packages[package] = False
     
-    return dependencies
+    # Packages optionnels
+    for package in ['selenium', 'spotipy', 'pylast']:
+        try:
+            importlib.import_module(package)
+            packages[package] = True
+        except ImportError:
+            packages[package] = False
+    
+    return packages
 
-# ===== CONFIGURATION ET VALIDATION =====
-
-def validate_extraction_setup() -> Tuple[bool, List[str]]:
+def validate_extractor_setup() -> Tuple[bool, List[str]]:
     """
-    Valide la configuration du module extractors.
+    Valide la configuration du module extracteurs.
     
     Returns:
         Tuple (configuration_valide, liste_problèmes)
     """
     issues = []
     
-    # Vérifier qu'au moins un scraper principal est disponible
-    if not any(scraper in __all__ for scraper in ['GeniusWebScraper', 'RapediaScraper']):
-        issues.append("Aucun scraper principal (Genius/Rapedia) disponible")
+    # Vérifier qu'au moins un extracteur principal est disponible
+    if not any(extractor in __all__ for extractor in ['GeniusWebScraper', 'RapediaScraper']):
+        issues.append("Aucun extracteur principal (Genius/Rapedia) disponible")
     
     # Vérifier la cohérence des imports
-    if len(__all__) == 0:
-        issues.append("Aucun module d'extraction disponible")
+    if len(get_available_extractors()) == 0:
+        issues.append("Aucun extracteur disponible")
     
     # Vérifier les dépendances critiques
-    dependencies = _check_dependencies()
-    if not dependencies['requests']:
+    required_packages = _check_required_packages()
+    if not required_packages.get('requests', False):
         issues.append("Module 'requests' manquant (requis pour HTTP)")
     
-    if not dependencies['beautifulsoup4']:
+    if not required_packages.get('beautifulsoup4', False):
         issues.append("Module 'beautifulsoup4' manquant (requis pour parsing HTML)")
     
     # Avertissements pour dépendances optionnelles
-    if not dependencies['selenium']:
-        logger.warning("⚠️ Selenium non disponible - scrapers avancés limités")
-    
-    if not dependencies['webdriver_manager']:
-        logger.warning("⚠️ WebDriver Manager non disponible - gestion automatique des drivers limitée")
+    if not required_packages.get('selenium', False):
+        logger.warning("⚠️ Selenium non disponible - extracteurs avancés (Genius) limités")
     
     return len(issues) == 0, issues
 
-def get_extraction_pipeline() -> List[str]:
+# ===== FONCTIONS DE BATCH ET UTILITAIRES =====
+
+def batch_extract_data(sources: List[Dict[str, str]], extractor_type: str, max_workers: int = 3, **kwargs) -> List[Dict[str, Any]]:
     """
-    Retourne l'ordre recommandé d'exécution des extracteurs.
+    Extrait des données de plusieurs sources en parallèle.
     
+    Args:
+        sources: Liste de dictionnaires {'url': '...', 'type': '...'}
+        extractor_type: Type d'extracteur à utiliser
+        max_workers: Nombre de workers parallèles
+        **kwargs: Arguments additionnels pour l'extracteur
+        
     Returns:
-        Liste ordonnée des extracteurs
+        Liste des résultats d'extraction
     """
-    pipeline = []
+    results = []
     
-    # 1. Scrapers web (données de haute qualité)
-    if 'GeniusWebScraper' in __all__:
-        pipeline.append('genius_scraper')
-    if 'RapediaScraper' in __all__:
-        pipeline.append('rapedia_scraper')
+    for source in sources:
+        try:
+            extractor = create_extractor(extractor_type, **kwargs)
+            if extractor:
+                # Méthode générique d'extraction
+                if hasattr(extractor, 'extract_from_url'):
+                    result = extractor.extract_from_url(source['url'])
+                elif hasattr(extractor, 'scrape_url'):
+                    result = extractor.scrape_url(source['url'])
+                elif hasattr(extractor, 'extract_data'):
+                    result = extractor.extract_data(source['url'])
+                else:
+                    result = {'success': False, 'error': 'No extraction method found'}
+                
+                if result:
+                    result['source'] = source
+                    results.append(result)
+                
+            else:
+                results.append({
+                    'source': source,
+                    'success': False,
+                    'error': 'Extractor creation failed'
+                })
+                
+        except Exception as e:
+            results.append({
+                'source': source,
+                'success': False,
+                'error': str(e)
+            })
     
-    # 2. API extractors (métadonnées additionnelles)
-    if 'SpotifyExtractor' in __all__:
-        pipeline.append('spotify_extractor')
-    if 'DiscogsExtractor' in __all__:
-        pipeline.append('discogs_extractor')
-    if 'LastFMExtractor' in __all__:
-        pipeline.append('lastfm_extractor')
-    
-    # 3. Processors (enrichissement)
-    if 'LyricsProcessor' in __all__:
-        pipeline.append('lyrics_processor')
-    if 'CreditParser' in __all__:
-        pipeline.append('credit_parser')
-    if 'MetadataEnricher' in __all__:
-        pipeline.append('metadata_enricher')
-    
-    return pipeline
+    return results
 
 # ===== INITIALISATION =====
 
 # Validation automatique au chargement
-_setup_valid, _setup_issues = validate_extraction_setup()
+_setup_valid, _setup_issues = validate_extractor_setup()
 
 if not _setup_valid:
-    logger.warning("⚠️ Problèmes détectés dans la configuration extractors:")
+    logger.warning("⚠️ Problèmes détectés dans la configuration extracteurs:")
     for issue in _setup_issues:
         logger.warning(f"  - {issue}")
+else:
+    logger.info(f"✅ Module extracteurs initialisé: {len(get_available_extractors())} extracteurs disponibles")
 
-logger.info(f"✅ Module extractors initialisé: {len(__all__)} classes disponibles")
-
-# Export des fonctions utilitaires
+# Export final
 __all__.extend([
     'get_available_extractors',
-    'get_web_scrapers',
+    'get_web_scrapers', 
     'get_api_extractors',
-    'get_import_stats', 
+    'get_import_stats',
     'create_extractor',
     'get_extractor_capabilities',
-    'run_extraction_diagnostics',
-    'validate_extraction_setup',
-    'get_extraction_pipeline'
+    'run_extractor_diagnostics',
+    'validate_extractor_setup',
+    'batch_extract_data'
 ])
