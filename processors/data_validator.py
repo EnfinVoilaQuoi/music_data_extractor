@@ -1,16 +1,22 @@
-# processors/data_validator.py
+# processors/data_validator.py - VERSION CORRIGÉE
+"""
+Validateur de données pour l'extraction musicale.
+Détecte les incohérences, valide la qualité et propose des corrections.
+"""
+
 import logging
 import re
 from typing import Dict, List, Optional, Any, Set, Tuple
 from datetime import datetime
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 
-from ..models.entities import Track, Credit, Artist, Album, QualityReport
-from ..models.enums import CreditType, CreditCategory, DataSource, QualityLevel, AlbumType
-from ..core.database import Database
-from ..config.settings import settings
-from ..utils.text_utils import validate_artist_name, similarity_ratio
+from models.entities import Track, Credit, Artist, Album, QualityReport
+from models.enums import CreditType, CreditCategory, DataSource, QualityLevel, AlbumType
+from core.database import Database
+from config.settings import settings
+from utils.text_utils import validate_artist_name, similarity_ratio
 
 class ValidationLevel(Enum):
     """Niveaux de validation"""
@@ -61,89 +67,166 @@ class ValidationStats:
 class DataValidator:
     """
     Validateur de données pour l'extraction musicale.
-    
-    Responsabilités :
-    - Validation de l'intégrité des données
-    - Détection d'anomalies et d'incohérences
-    - Calcul de scores de qualité
-    - Génération de rapports de validation
+    Utilise des règles configurables et des patterns pour détecter les problèmes.
     """
     
-    def __init__(self, database: Optional[Database] = None, validation_level: ValidationLevel = ValidationLevel.STANDARD):
+    def __init__(self, validation_level: ValidationLevel = ValidationLevel.STANDARD):
         self.logger = logging.getLogger(__name__)
-        self.database = database or Database()
         self.validation_level = validation_level
+        self.database = Database()
         
-        # Configuration de validation
-        self.config = {
-            'min_track_duration': settings.get('quality.min_duration_seconds', 30),
-            'max_track_duration': settings.get('quality.max_duration_seconds', 1800),
-            'min_bpm': settings.get('validation.min_bpm', 40),
-            'max_bpm': settings.get('validation.max_bpm', 300),
-            'require_producer': settings.get('validation.require_producer', True),
-            'require_duration': settings.get('validation.require_duration', False),
-            'similarity_threshold': settings.get('validation.similarity_threshold', 0.85)
+        # Configuration des seuils selon le niveau de validation
+        self.config = self._load_validation_config()
+        
+        # Patterns de validation (compilation unique)
+        self.validation_patterns = self._compile_validation_patterns()
+        
+        # Cache pour éviter la revalidation
+        self._cache = {}
+        
+        # Statistiques de session
+        self.session_stats = ValidationStats()
+        
+        self.logger.info(f"DataValidator initialisé - Niveau: {validation_level.value}")
+    
+    def _load_validation_config(self) -> Dict[str, Any]:
+        """Charge la configuration de validation selon le niveau"""
+        base_config = {
+            'min_track_duration': 15,       # Durée minimale en secondes
+            'max_track_duration': 600,      # Durée maximale en secondes
+            'min_bpm': 60,                  # BPM minimum
+            'max_bpm': 200,                 # BPM maximum
+            'min_title_length': 1,          # Longueur minimale du titre
+            'max_title_length': 200,        # Longueur maximale du titre
+            'quality_threshold': 70.0,      # Seuil de qualité acceptable
+            'similarity_threshold': 0.85,   # Seuil de similarité pour doublons
+            'auto_fix_enabled': True,       # Auto-correction activée
+            'strict_validation': False      # Validation stricte
         }
         
-        # Patterns de validation
-        self.validation_patterns = self._load_validation_patterns()
+        # Ajustements selon le niveau
+        if self.validation_level == ValidationLevel.STRICT:
+            base_config.update({
+                'min_track_duration': 30,
+                'quality_threshold': 80.0,
+                'strict_validation': True
+            })
+        elif self.validation_level == ValidationLevel.PARANOID:
+            base_config.update({
+                'min_track_duration': 45,
+                'quality_threshold': 90.0,
+                'strict_validation': True,
+                'similarity_threshold': 0.90
+            })
         
-        self.logger.info(f"DataValidator initialisé (niveau: {validation_level.value})")
+        return base_config
     
-    def _load_validation_patterns(self) -> Dict[str, Any]:
-        """Charge les patterns de validation"""
+    def _compile_validation_patterns(self) -> Dict[str, Any]:
+        """Compile les patterns de validation pour optimiser les performances"""
         return {
+            'title': {
+                'suspicious_patterns': [
+                    r'^[^a-zA-Z0-9]+$',          # Que des caractères spéciaux
+                    r'^\s*$',                     # Que des espaces
+                    r'^(test|debug|temp)',        # Mots de test
+                    r'[<>{}]',                    # Balises HTML/XML
+                    r'(javascript|script)',       # Code suspect
+                ],
+                'invalid_chars': re.compile(r'[<>{}|\\^`\[\]]'),
+                'normalization': re.compile(r'\s+')
+            },
             'artist_name': {
-                'invalid_patterns': [
-                    r'^unknown\s*artist',
-                    r'^various\s*artists?',
-                    r'^compilation',
-                    r'^soundtrack',
-                    r'^\[.*\]$',
-                    r'^\d+$',
-                    r'^feat\.?\s',
-                    r'^ft\.?\s'
-                ],
                 'suspicious_patterns': [
-                    r'^\w{1}$',  # Un seul caractère
-                    r'^\d+\w*$',  # Commence par des chiffres
-                    r'^[^a-zA-Z]*$'  # Pas de lettres
-                ]
-            },
-            'track_title': {
-                'invalid_patterns': [
-                    r'^track\s*\d+',
-                    r'^untitled',
-                    r'^unknown',
-                    r'^test',
-                    r'^\s*$'
+                    r'^[^a-zA-Z0-9\s\-\'\.]+$',  # Que des caractères spéciaux
+                    r'^(unknown|n\/a|none|null|undefined)',  # Valeurs nulles
+                    r'^[0-9]+$',                  # Que des chiffres
                 ],
-                'suspicious_patterns': [
-                    r'^\d+\.$',  # Juste un numéro
-                    r'^[^a-zA-Z]*$'  # Pas de lettres
-                ]
+                'required_chars': re.compile(r'[a-zA-Z]'),  # Au moins une lettre
             },
-            'album_title': {
-                'invalid_patterns': [
-                    r'^unknown\s*album',
-                    r'^untitled',
-                    r'^various',
-                    r'^\s*$'
-                ]
+            'external_ids': {
+                'spotify_id': re.compile(r'^[a-zA-Z0-9]{22}$'),
+                'genius_id': re.compile(r'^\d+$'),
+                'youtube_id': re.compile(r'^[a-zA-Z0-9_-]{11}$')
             },
-            'urls': {
-                'genius_pattern': r'^https?://genius\.com/.*',
-                'spotify_pattern': r'^https?://open\.spotify\.com/.*',
-                'lastfm_pattern': r'^https?://www\.last\.fm/.*'
+            'years': {
+                'active_years': re.compile(r'^\d{4}(-\d{4})?$'),
+                'release_year': re.compile(r'^(19|20)\d{2}$')
             }
         }
     
+    # ===== MÉTHODES PRINCIPALES DE VALIDATION =====
+    
     def validate_track(self, track: Track) -> ValidationResult:
         """
-        Valide un morceau complet.
+        Valide un track complet.
         
         Args:
-            track: Morceau à valider
+            track: Track à valider
+            
+        Returns:
+            ValidationResult: Résultat de la validation
+        """
+        cache_key = f"track_{track.id}_{hash(str(track))}"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+        
+        issues = []
+        
+        # Validation du titre
+        issues.extend(self._validate_track_title(track))
+        
+        # Validation de l'artiste
+        issues.extend(self._validate_track_artist(track))
+        
+        # Validation des données audio
+        issues.extend(self._validate_audio_data(track))
+        
+        # Validation des crédits (si présents)
+        if hasattr(track, 'credits') and track.credits:
+            issues.extend(self._validate_track_credits(track))
+        
+        # Validation des informations d'album
+        issues.extend(self._validate_track_album_info(track))
+        
+        # Validation technique (selon niveau)
+        if self.validation_level in [ValidationLevel.STRICT, ValidationLevel.PARANOID]:
+            issues.extend(self._validate_track_technical_data(track))
+        
+        # Calcul du score de qualité
+        quality_score = self._calculate_quality_score(track, issues)
+        quality_level = self._determine_quality_level(quality_score)
+        
+        # Détermination de la validité
+        is_valid = not any(issue.type == IssueType.CRITICAL for issue in issues)
+        
+        # Mise à jour des statistiques
+        self._update_validation_stats(is_valid, issues)
+        
+        result = ValidationResult(
+            entity_type="track",
+            entity_id=track.id,
+            is_valid=is_valid,
+            quality_score=quality_score,
+            quality_level=quality_level,
+            issues=issues,
+            metadata={
+                'validation_level': self.validation_level.value,
+                'timestamp': datetime.now().isoformat(),
+                'auto_fixes_available': self._count_auto_fixable_issues(issues)
+            }
+        )
+        
+        # Mise en cache
+        self._cache[cache_key] = result
+        
+        return result
+    
+    def validate_artist(self, artist: Artist) -> ValidationResult:
+        """
+        Valide un artiste.
+        
+        Args:
+            artist: Artiste à valider
             
         Returns:
             ValidationResult: Résultat de la validation
@@ -151,130 +234,160 @@ class DataValidator:
         issues = []
         
         try:
-            # Validation des champs obligatoires
-            issues.extend(self._validate_track_required_fields(track))
-            
-            # Validation du titre
-            issues.extend(self._validate_track_title(track))
-            
-            # Validation de l'artiste
-            issues.extend(self._validate_track_artist(track))
-            
-            # Validation des données audio
-            issues.extend(self._validate_audio_data(track))
-            
-            # Validation des crédits
-            issues.extend(self._validate_track_credits(track))
-            
-            # Validation des featuring
-            issues.extend(self._validate_featuring_artists(track))
-            
-            # Validation des URLs
-            issues.extend(self._validate_track_urls(track))
-            
-            # Validation de l'album
-            issues.extend(self._validate_track_album_info(track))
-            
-            # Validation des données techniques
-            if self.validation_level in [ValidationLevel.STRICT, ValidationLevel.PARANOID]:
-                issues.extend(self._validate_track_technical_data(track))
-            
-            # Calcul du score de qualité
-            quality_score = self._calculate_track_quality_score(track, issues)
-            quality_level = self._determine_quality_level(quality_score)
-            
-            # Détermination de la validité
-            critical_issues = [i for i in issues if i.type == IssueType.CRITICAL]
-            is_valid = len(critical_issues) == 0
-            
-            return ValidationResult(
-                entity_type="track",
-                entity_id=track.id,
-                is_valid=is_valid,
-                quality_score=quality_score,
-                quality_level=quality_level,
-                issues=issues,
-                metadata={
-                    'title': track.title,
-                    'artist': track.artist_name,
-                    'credits_count': len(track.credits),
-                    'duration': track.duration_seconds
-                }
-            )
-            
-        except Exception as e:
-            self.logger.error(f"Erreur validation track '{track.title}': {e}")
-            return ValidationResult(
-                entity_type="track",
-                entity_id=track.id,
-                is_valid=False,
-                quality_score=0.0,
-                quality_level=QualityLevel.VERY_POOR,
-                issues=[ValidationIssue(
+            # Validation du nom
+            if not artist.name or not artist.name.strip():
+                issues.append(ValidationIssue(
                     type=IssueType.CRITICAL,
-                    category="system",
-                    message=f"Erreur lors de la validation: {e}"
-                )],
-                metadata={}
-            )
+                    category="required_field",
+                    message="Nom d'artiste manquant",
+                    field="name"
+                ))
+            elif not validate_artist_name(artist.name):
+                issues.append(ValidationIssue(
+                    type=IssueType.CRITICAL,
+                    category="invalid_name",
+                    message=f"Nom d'artiste invalide: '{artist.name}'",
+                    field="name"
+                ))
+            
+            # Validation des IDs externes
+            if artist.genius_id and not str(artist.genius_id).isdigit():
+                issues.append(ValidationIssue(
+                    type=IssueType.WARNING,
+                    category="invalid_external_id",
+                    message="ID Genius invalide",
+                    field="genius_id"
+                ))
+            
+            if artist.spotify_id and not self.validation_patterns['external_ids']['spotify_id'].match(artist.spotify_id):
+                issues.append(ValidationIssue(
+                    type=IssueType.WARNING,
+                    category="invalid_external_id",
+                    message="ID Spotify invalide",
+                    field="spotify_id"
+                ))
+            
+            # Validation des années d'activité
+            if artist.active_years:
+                if not self.validation_patterns['years']['active_years'].match(artist.active_years):
+                    issues.append(ValidationIssue(
+                        type=IssueType.WARNING,
+                        category="invalid_years",
+                        message=f"Format d'années d'activité invalide: '{artist.active_years}'",
+                        field="active_years",
+                        suggested_fix="Format attendu: YYYY ou YYYY-YYYY"
+                    ))
+        
+        except Exception as e:
+            self.logger.error(f"Erreur validation artiste {artist.name}: {e}")
+            issues.append(ValidationIssue(
+                type=IssueType.CRITICAL,
+                category="validation_error",
+                message=f"Erreur lors de la validation: {str(e)}"
+            ))
+        
+        # Calcul du score et résultat
+        quality_score = self._calculate_artist_quality_score(artist, issues)
+        quality_level = self._determine_quality_level(quality_score)
+        is_valid = not any(issue.type == IssueType.CRITICAL for issue in issues)
+        
+        return ValidationResult(
+            entity_type="artist",
+            entity_id=getattr(artist, 'id', None),
+            is_valid=is_valid,
+            quality_score=quality_score,
+            quality_level=quality_level,
+            issues=issues,
+            metadata={
+                'validation_level': self.validation_level.value,
+                'timestamp': datetime.now().isoformat()
+            }
+        )
     
-    def _validate_track_required_fields(self, track: Track) -> List[ValidationIssue]:
-        """Valide les champs obligatoires d'un track"""
+    def validate_credit(self, credit: Credit) -> ValidationResult:
+        """
+        Valide un crédit.
+        
+        Args:
+            credit: Crédit à valider
+            
+        Returns:
+            ValidationResult: Résultat de la validation
+        """
         issues = []
         
-        if not track.title or not track.title.strip():
+        # Validation du nom de personne
+        if not credit.person_name or not credit.person_name.strip():
             issues.append(ValidationIssue(
                 type=IssueType.CRITICAL,
                 category="required_field",
-                message="Titre manquant",
-                field="title",
-                suggested_fix="Ajouter un titre valide"
+                message="Nom de personne manquant",
+                field="person_name"
             ))
         
-        if not track.artist_name or not track.artist_name.strip():
+        # Validation du rôle
+        if not credit.role or not credit.role.strip():
             issues.append(ValidationIssue(
                 type=IssueType.CRITICAL,
                 category="required_field",
-                message="Nom d'artiste manquant",
-                field="artist_name",
-                suggested_fix="Ajouter le nom de l'artiste"
+                message="Rôle manquant",
+                field="role"
             ))
-        
-        if not track.artist_id:
+        elif credit.role not in [ct.value for ct in CreditType]:
             issues.append(ValidationIssue(
                 type=IssueType.WARNING,
-                category="required_field",
-                message="ID d'artiste manquant",
-                field="artist_id",
-                suggested_fix="Associer le track à un artiste"
+                category="unknown_role",
+                message=f"Rôle non reconnu: '{credit.role}'",
+                field="role",
+                suggested_fix="Utiliser un rôle standard ou ajouter à la liste"
             ))
         
-        return issues
+        # Validation de la cohérence track/album
+        if not credit.track_id and not credit.album_id:
+            issues.append(ValidationIssue(
+                type=IssueType.CRITICAL,
+                category="missing_reference",
+                message="Crédit non lié à un track ou album",
+                field="track_id"
+            ))
+        
+        quality_score = self._calculate_credit_quality_score(credit, issues)
+        quality_level = self._determine_quality_level(quality_score)
+        is_valid = not any(issue.type == IssueType.CRITICAL for issue in issues)
+        
+        return ValidationResult(
+            entity_type="credit",
+            entity_id=getattr(credit, 'id', None),
+            is_valid=is_valid,
+            quality_score=quality_score,
+            quality_level=quality_level,
+            issues=issues,
+            metadata={
+                'validation_level': self.validation_level.value,
+                'timestamp': datetime.now().isoformat()
+            }
+        )
+    
+    # ===== MÉTHODES DE VALIDATION SPÉCIALISÉES =====
     
     def _validate_track_title(self, track: Track) -> List[ValidationIssue]:
         """Valide le titre d'un track"""
         issues = []
         
         if not track.title:
+            issues.append(ValidationIssue(
+                type=IssueType.CRITICAL,
+                category="required_field",
+                message="Titre manquant",
+                field="title"
+            ))
             return issues
         
         title = track.title.strip()
         
-        # Validation contre les patterns invalides
-        for pattern in self.validation_patterns['track_title']['invalid_patterns']:
+        # Validation contre patterns suspects
+        for pattern in self.validation_patterns['title']['suspicious_patterns']:
             if re.match(pattern, title, re.IGNORECASE):
-                issues.append(ValidationIssue(
-                    type=IssueType.CRITICAL,
-                    category="invalid_title",
-                    message=f"Titre invalide: '{title}'",
-                    field="title",
-                    suggested_fix="Corriger le titre du morceau"
-                ))
-                break
-        
-        # Validation contre les patterns suspects
-        for pattern in self.validation_patterns['track_title']['suspicious_patterns']:
-            if re.match(pattern, title):
                 issues.append(ValidationIssue(
                     type=IssueType.WARNING,
                     category="suspicious_title",
@@ -285,14 +398,14 @@ class DataValidator:
                 break
         
         # Validation de la longueur
-        if len(title) < 1:
+        if len(title) < self.config['min_title_length']:
             issues.append(ValidationIssue(
                 type=IssueType.CRITICAL,
                 category="title_length",
                 message="Titre trop court",
                 field="title"
             ))
-        elif len(title) > 200:
+        elif len(title) > self.config['max_title_length']:
             issues.append(ValidationIssue(
                 type=IssueType.WARNING,
                 category="title_length",
@@ -323,7 +436,7 @@ class DataValidator:
         
         # Validation contre patterns suspects
         for pattern in self.validation_patterns['artist_name']['suspicious_patterns']:
-            if re.match(pattern, artist_name):
+            if re.match(pattern, artist_name, re.IGNORECASE):
                 issues.append(ValidationIssue(
                     type=IssueType.WARNING,
                     category="suspicious_artist",
@@ -353,17 +466,8 @@ class DataValidator:
                     type=IssueType.WARNING,
                     category="suspicious_duration",
                     message=f"Durée très longue: {track.duration_seconds}s",
-                    field="duration_seconds",
-                    suggested_fix="Vérifier la durée du morceau"
+                    field="duration_seconds"
                 ))
-        elif self.config['require_duration']:
-            issues.append(ValidationIssue(
-                type=IssueType.WARNING,
-                category="missing_data",
-                message="Durée manquante",
-                field="duration_seconds",
-                suggested_fix="Ajouter la durée du morceau"
-            ))
         
         # Validation du BPM
         if track.bpm is not None:
@@ -376,210 +480,34 @@ class DataValidator:
                     suggested_fix="Vérifier le BPM du morceau"
                 ))
         
-        # Validation de la clé musicale
-        if track.key:
-            valid_keys = [
-                'C', 'C#', 'Db', 'D', 'D#', 'Eb', 'E', 'F', 'F#', 'Gb', 
-                'G', 'G#', 'Ab', 'A', 'A#', 'Bb', 'B',
-                'Cm', 'C#m', 'Dm', 'D#m', 'Em', 'Fm', 'F#m', 'Gm', 
-                'G#m', 'Am', 'A#m', 'Bm'
-            ]
-            if track.key not in valid_keys:
-                issues.append(ValidationIssue(
-                    type=IssueType.WARNING,
-                    category="invalid_key",
-                    message=f"Clé musicale invalide: '{track.key}'",
-                    field="key",
-                    suggested_fix="Corriger la clé musicale"
-                ))
-        
         return issues
     
     def _validate_track_credits(self, track: Track) -> List[ValidationIssue]:
         """Valide les crédits d'un track"""
         issues = []
         
-        if not track.credits:
-            if self.config['require_producer']:
-                issues.append(ValidationIssue(
-                    type=IssueType.WARNING,
-                    category="missing_credits",
-                    message="Aucun crédit trouvé",
-                    field="credits",
-                    suggested_fix="Ajouter les crédits du morceau"
-                ))
-            return issues
-        
-        # Vérifier la présence d'un producteur
-        has_producer = any(
-            credit.credit_category == CreditCategory.PRODUCER 
-            for credit in track.credits
-        )
-        
-        if not has_producer and self.config['require_producer']:
+        credits = getattr(track, 'credits', [])
+        if not credits:
             issues.append(ValidationIssue(
-                type=IssueType.WARNING,
-                category="missing_producer",
-                message="Aucun producteur identifié",
+                type=IssueType.INFO,
+                category="missing_credits",
+                message="Aucun crédit trouvé",
                 field="credits",
-                suggested_fix="Ajouter le producteur du morceau"
+                suggested_fix="Ajouter les crédits de production"
             ))
-        
-        # Validation individuelle des crédits
-        credit_names = set()
-        for i, credit in enumerate(track.credits):
-            credit_issues = self._validate_credit(credit, i)
-            issues.extend(credit_issues)
-            
-            # Détection de doublons de crédits
-            credit_key = (credit.person_name.lower(), credit.credit_type)
-            if credit_key in credit_names:
-                issues.append(ValidationIssue(
-                    type=IssueType.INFO,
-                    category="duplicate_credit",
-                    message=f"Crédit en double: {credit.person_name} ({credit.credit_type.value})",
-                    field=f"credits[{i}]",
-                    suggested_fix="Supprimer le crédit en double"
-                ))
-            else:
-                credit_names.add(credit_key)
-        
-        return issues
-    
-    def _validate_credit(self, credit: Credit, index: int) -> List[ValidationIssue]:
-        """Valide un crédit individuel"""
-        issues = []
-        
-        # Validation du nom de la personne
-        if not credit.person_name or not credit.person_name.strip():
-            issues.append(ValidationIssue(
-                type=IssueType.CRITICAL,
-                category="invalid_credit",
-                message="Nom de créditeur manquant",
-                field=f"credits[{index}].person_name",
-                suggested_fix="Ajouter le nom du créditeur"
-            ))
-        elif not validate_artist_name(credit.person_name):
-            issues.append(ValidationIssue(
-                type=IssueType.WARNING,
-                category="invalid_credit",
-                message=f"Nom de créditeur suspect: '{credit.person_name}'",
-                field=f"credits[{index}].person_name"
-            ))
-        
-        # Validation de la cohérence catégorie/type
-        if credit.credit_category and credit.credit_type:
-            expected_category = self._get_expected_category_for_type(credit.credit_type)
-            if expected_category and expected_category != credit.credit_category:
+        else:
+            # Vérification de la présence d'un producteur
+            has_producer = any(
+                credit.role in ['Producer', 'Executive Producer', 'Co-Producer'] 
+                for credit in credits
+            )
+            if not has_producer:
                 issues.append(ValidationIssue(
                     type=IssueType.WARNING,
-                    category="inconsistent_credit",
-                    message=f"Incohérence catégorie/type: {credit.credit_category.value}/{credit.credit_type.value}",
-                    field=f"credits[{index}]",
-                    suggested_fix=f"Corriger la catégorie vers {expected_category.value}"
-                ))
-        
-        return issues
-    
-    def _get_expected_category_for_type(self, credit_type: CreditType) -> Optional[CreditCategory]:
-        """Retourne la catégorie attendue pour un type de crédit"""
-        type_to_category = {
-            CreditType.PRODUCER: CreditCategory.PRODUCER,
-            CreditType.EXECUTIVE_PRODUCER: CreditCategory.PRODUCER,
-            CreditType.CO_PRODUCER: CreditCategory.PRODUCER,
-            CreditType.MIXING: CreditCategory.TECHNICAL,
-            CreditType.MASTERING: CreditCategory.TECHNICAL,
-            CreditType.RECORDING: CreditCategory.TECHNICAL,
-            CreditType.FEATURING: CreditCategory.FEATURING,
-            CreditType.LEAD_VOCALS: CreditCategory.VOCAL,
-            CreditType.BACKING_VOCALS: CreditCategory.VOCAL,
-            CreditType.RAP: CreditCategory.VOCAL,
-            CreditType.SONGWRITER: CreditCategory.COMPOSER,
-            CreditType.COMPOSER: CreditCategory.COMPOSER,
-            CreditType.GUITAR: CreditCategory.INSTRUMENT,
-            CreditType.PIANO: CreditCategory.INSTRUMENT,
-            CreditType.DRUMS: CreditCategory.INSTRUMENT,
-            CreditType.BASS: CreditCategory.INSTRUMENT,
-            CreditType.SAXOPHONE: CreditCategory.INSTRUMENT,
-            CreditType.SAMPLE: CreditCategory.SAMPLE,
-            CreditType.INTERPOLATION: CreditCategory.SAMPLE
-        }
-        return type_to_category.get(credit_type)
-    
-    def _validate_featuring_artists(self, track: Track) -> List[ValidationIssue]:
-        """Valide les artistes en featuring"""
-        issues = []
-        
-        if not track.featuring_artists:
-            return issues
-        
-        for i, featuring in enumerate(track.featuring_artists):
-            if not featuring or not featuring.strip():
-                issues.append(ValidationIssue(
-                    type=IssueType.WARNING,
-                    category="invalid_featuring",
-                    message="Artiste featuring vide",
-                    field=f"featuring_artists[{i}]",
-                    suggested_fix="Supprimer l'entrée vide"
-                ))
-            elif not validate_artist_name(featuring):
-                issues.append(ValidationIssue(
-                    type=IssueType.WARNING,
-                    category="invalid_featuring",
-                    message=f"Nom d'artiste featuring suspect: '{featuring}'",
-                    field=f"featuring_artists[{i}]"
-                ))
-            
-            # Vérifier que l'artiste featuring n'est pas l'artiste principal
-            if featuring.lower() == track.artist_name.lower():
-                issues.append(ValidationIssue(
-                    type=IssueType.INFO,
-                    category="redundant_featuring",
-                    message=f"Artiste principal en featuring: '{featuring}'",
-                    field=f"featuring_artists[{i}]",
-                    suggested_fix="Supprimer l'artiste principal des featuring"
-                ))
-        
-        # Vérifier les doublons
-        seen = set()
-        for i, featuring in enumerate(track.featuring_artists):
-            if featuring.lower() in seen:
-                issues.append(ValidationIssue(
-                    type=IssueType.INFO,
-                    category="duplicate_featuring",
-                    message=f"Artiste featuring en double: '{featuring}'",
-                    field=f"featuring_artists[{i}]",
-                    suggested_fix="Supprimer le doublon"
-                ))
-            else:
-                seen.add(featuring.lower())
-        
-        return issues
-    
-    def _validate_track_urls(self, track: Track) -> List[ValidationIssue]:
-        """Valide les URLs d'un track"""
-        issues = []
-        
-        # Validation URL Genius
-        if track.genius_url:
-            if not re.match(self.validation_patterns['urls']['genius_pattern'], track.genius_url):
-                issues.append(ValidationIssue(
-                    type=IssueType.WARNING,
-                    category="invalid_url",
-                    message="URL Genius invalide",
-                    field="genius_url",
-                    suggested_fix="Corriger l'URL Genius"
-                ))
-        
-        # Validation URL Last.fm
-        if track.lastfm_url:
-            if not re.match(self.validation_patterns['urls']['lastfm_pattern'], track.lastfm_url):
-                issues.append(ValidationIssue(
-                    type=IssueType.WARNING,
-                    category="invalid_url",
-                    message="URL Last.fm invalide",
-                    field="lastfm_url",
-                    suggested_fix="Corriger l'URL Last.fm"
+                    category="missing_producer",
+                    message="Aucun producteur identifié",
+                    field="credits",
+                    suggested_fix="Ajouter les crédits de production"
                 ))
         
         return issues
@@ -644,7 +572,7 @@ class DataValidator:
                 field="genius_id"
             ))
         
-        if track.spotify_id and not re.match(r'^[a-zA-Z0-9]{22}$', track.spotify_id):
+        if track.spotify_id and not self.validation_patterns['external_ids']['spotify_id'].match(track.spotify_id):
             issues.append(ValidationIssue(
                 type=IssueType.WARNING,
                 category="invalid_external_id",
@@ -654,39 +582,73 @@ class DataValidator:
         
         return issues
     
-    def _calculate_track_quality_score(self, track: Track, issues: List[ValidationIssue]) -> float:
-        """Calcule le score de qualité d'un track"""
-        base_score = 50.0
+    # ===== CALCULS DE QUALITÉ =====
+    
+    def _calculate_quality_score(self, track: Track, issues: List[ValidationIssue]) -> float:
+        """Calcule le score de qualité d'un track (0-100)"""
+        base_score = 100.0
         
-        # Bonus pour les données présentes
-        if track.title and track.title.strip():
-            base_score += 10
-        if track.artist_name and validate_artist_name(track.artist_name):
-            base_score += 10
-        if track.duration_seconds:
-            base_score += 8
-        if track.bpm:
-            base_score += 7
-        if track.credits:
-            base_score += 10
-            # Bonus pour producteur
-            if any(c.credit_category == CreditCategory.PRODUCER for c in track.credits):
-                base_score += 5
-        if track.album_title:
-            base_score += 5
-        if track.lyrics:
-            base_score += 3
-        if track.key:
-            base_score += 2
-        
-        # Malus pour les problèmes
+        # Pénalités selon le type d'issue
         for issue in issues:
             if issue.type == IssueType.CRITICAL:
-                base_score -= 15
+                base_score -= 30.0
             elif issue.type == IssueType.WARNING:
-                base_score -= 5
+                base_score -= 10.0
             elif issue.type == IssueType.INFO:
-                base_score -= 1
+                base_score -= 5.0
+            elif issue.type == IssueType.SUGGESTION:
+                base_score -= 2.0
+        
+        # Bonus pour données complètes
+        completeness_bonus = 0.0
+        if track.title and len(track.title.strip()) > 0:
+            completeness_bonus += 5.0
+        if track.artist_name and len(track.artist_name.strip()) > 0:
+            completeness_bonus += 5.0
+        if track.duration_seconds:
+            completeness_bonus += 3.0
+        if track.bpm:
+            completeness_bonus += 3.0
+        if getattr(track, 'lyrics', None):
+            completeness_bonus += 4.0
+        
+        base_score += completeness_bonus
+        
+        return max(0.0, min(100.0, base_score))
+    
+    def _calculate_artist_quality_score(self, artist: Artist, issues: List[ValidationIssue]) -> float:
+        """Calcule le score de qualité d'un artiste"""
+        base_score = 100.0
+        
+        for issue in issues:
+            if issue.type == IssueType.CRITICAL:
+                base_score -= 40.0
+            elif issue.type == IssueType.WARNING:
+                base_score -= 15.0
+            elif issue.type == IssueType.INFO:
+                base_score -= 5.0
+        
+        # Bonus pour données complètes
+        if artist.name and len(artist.name.strip()) > 0:
+            base_score += 10.0
+        if getattr(artist, 'genius_id', None):
+            base_score += 5.0
+        if getattr(artist, 'spotify_id', None):
+            base_score += 5.0
+        
+        return max(0.0, min(100.0, base_score))
+    
+    def _calculate_credit_quality_score(self, credit: Credit, issues: List[ValidationIssue]) -> float:
+        """Calcule le score de qualité d'un crédit"""
+        base_score = 100.0
+        
+        for issue in issues:
+            if issue.type == IssueType.CRITICAL:
+                base_score -= 35.0
+            elif issue.type == IssueType.WARNING:
+                base_score -= 15.0
+            elif issue.type == IssueType.INFO:
+                base_score -= 5.0
         
         return max(0.0, min(100.0, base_score))
     
@@ -694,535 +656,154 @@ class DataValidator:
         """Détermine le niveau de qualité basé sur le score"""
         if score >= 90:
             return QualityLevel.EXCELLENT
-        elif score >= 75:
+        elif score >= 80:
             return QualityLevel.GOOD
-        elif score >= 50:
+        elif score >= 70:
             return QualityLevel.AVERAGE
-        elif score >= 25:
+        elif score >= 50:
             return QualityLevel.POOR
         else:
             return QualityLevel.VERY_POOR
     
-    def validate_artist_tracks(self, artist_id: int) -> List[ValidationResult]:
-        """Valide tous les tracks d'un artiste"""
-        try:
-            tracks = self.database.get_tracks_by_artist_id(artist_id)
-            results = []
-            
-            for track in tracks:
-                result = self.validate_track(track)
-                results.append(result)
-            
-            self.logger.info(f"Validation terminée pour l'artiste {artist_id}: {len(results)} tracks validés")
-            return results
-            
-        except Exception as e:
-            self.logger.error(f"Erreur validation artiste {artist_id}: {e}")
-            return []
+    # ===== MÉTHODES UTILITAIRES =====
     
-    def create_quality_report(self, track: Track, validation_result: ValidationResult) -> QualityReport:
-        """Crée un rapport de qualité basé sur la validation"""
-        report = QualityReport(
-            track_id=track.id,
-            quality_score=validation_result.quality_score,
-            quality_level=validation_result.quality_level
-        )
+    def _update_validation_stats(self, is_valid: bool, issues: List[ValidationIssue]):
+        """Met à jour les statistiques de validation"""
+        self.session_stats.total_validated += 1
         
-        # Analyser les critères de qualité
-        report.has_producer = any(
-            c.credit_category == CreditCategory.PRODUCER for c in track.credits
-        )
-        report.has_bpm = track.bpm is not None
-        report.has_duration = track.duration_seconds is not None
-        report.has_valid_duration = (
-            track.duration_seconds is not None and 
-            self.config['min_track_duration'] <= track.duration_seconds <= self.config['max_track_duration']
-        )
-        report.has_album_info = track.album_title is not None
-        report.has_lyrics = track.has_lyrics
-        report.has_credits = len(track.credits) > 0
+        if is_valid:
+            self.session_stats.valid_entities += 1
+        else:
+            self.session_stats.invalid_entities += 1
         
-        # Ajouter les problèmes détectés
-        for issue in validation_result.issues:
-            if issue.type in [IssueType.CRITICAL, IssueType.WARNING]:
-                report.add_issue(f"{issue.category}: {issue.message}")
-        
-        # Calculer le score final
-        report.calculate_score()
-        
-        return report
+        for issue in issues:
+            if issue.type == IssueType.CRITICAL:
+                self.session_stats.critical_issues += 1
+            elif issue.type == IssueType.WARNING:
+                self.session_stats.warnings += 1
+            elif issue.type == IssueType.SUGGESTION:
+                self.session_stats.suggestions += 1
     
-    def generate_validation_summary(self, results: List[ValidationResult]) -> ValidationStats:
-        """Génère un résumé des résultats de validation"""
-        stats = ValidationStats()
+    def _count_auto_fixable_issues(self, issues: List[ValidationIssue]) -> int:
+        """Compte les issues qui peuvent être corrigées automatiquement"""
+        auto_fixable_categories = [
+            'title_length', 'suspicious_title', 'missing_album_title',
+            'invalid_track_number', 'suspicious_duration'
+        ]
         
-        stats.total_validated = len(results)
-        stats.valid_entities = sum(1 for r in results if r.is_valid)
-        stats.invalid_entities = stats.total_validated - stats.valid_entities
-        
-        # Compter les types de problèmes
-        for result in results:
-            for issue in result.issues:
-                if issue.type == IssueType.CRITICAL:
-                    stats.critical_issues += 1
-                elif issue.type == IssueType.WARNING:
-                    stats.warnings += 1
-                elif issue.type == IssueType.SUGGESTION:
-                    stats.suggestions += 1
-        
-        # Calculer le score moyen
-        if results:
-            total_score = sum(r.quality_score for r in results)
-            stats.average_quality_score = total_score / len(results)
-        
-        return stats
+        return sum(1 for issue in issues if issue.category in auto_fixable_categories)
     
-    def validate_album(self, album: Album) -> ValidationResult:
+    @lru_cache(maxsize=256)
+    def check_duplicate_tracks(self, track1_signature: str, track2_signature: str) -> float:
+        """Vérifie si deux tracks sont des doublons (avec cache)"""
+        return similarity_ratio(track1_signature, track2_signature)
+    
+    # ===== MÉTHODES PUBLIQUES D'ANALYSE =====
+    
+    def batch_validate(self, entities: List[Any]) -> Dict[str, List[ValidationResult]]:
         """
-        Valide un album.
+        Valide une liste d'entités en lot.
         
         Args:
-            album: Album à valider
+            entities: Liste d'entités à valider
             
         Returns:
-            ValidationResult: Résultat de la validation
+            Dictionnaire des résultats par type d'entité
         """
-        issues = []
-        
-        try:
-            # Validation des champs obligatoires
-            if not album.title or not album.title.strip():
-                issues.append(ValidationIssue(
-                    type=IssueType.CRITICAL,
-                    category="required_field",
-                    message="Titre d'album manquant",
-                    field="title"
-                ))
-            
-            if not album.artist_name:
-                issues.append(ValidationIssue(
-                    type=IssueType.WARNING,
-                    category="required_field",
-                    message="Nom d'artiste manquant",
-                    field="artist_name"
-                ))
-            
-            # Validation du titre d'album
-            if album.title:
-                for pattern in self.validation_patterns['album_title']['invalid_patterns']:
-                    if re.match(pattern, album.title, re.IGNORECASE):
-                        issues.append(ValidationIssue(
-                            type=IssueType.CRITICAL,
-                            category="invalid_title",
-                            message=f"Titre d'album invalide: '{album.title}'",
-                            field="title"
-                        ))
-                        break
-            
-            # Validation des dates
-            if album.release_date:
-                # Validation format de date basique
-                if not re.match(r'^\d{4}(-\d{2}(-\d{2})?)?, album.release_date):
-                    issues.append(ValidationIssue(
-                        type=IssueType.WARNING,
-                        category="invalid_date",
-                        message=f"Format de date suspect: '{album.release_date}'",
-                        field="release_date"
-                    ))
-            
-            # Validation cohérence release_year
-            if album.release_year:
-                if album.release_year < 1900 or album.release_year > datetime.now().year + 1:
-                    issues.append(ValidationIssue(
-                        type=IssueType.WARNING,
-                        category="invalid_year",
-                        message=f"Année de sortie suspecte: {album.release_year}",
-                        field="release_year"
-                    ))
-            
-            # Validation du nombre de tracks
-            if album.track_count is not None:
-                if album.track_count < 1 or album.track_count > 100:
-                    issues.append(ValidationIssue(
-                        type=IssueType.WARNING,
-                        category="invalid_track_count",
-                        message=f"Nombre de tracks suspect: {album.track_count}",
-                        field="track_count"
-                    ))
-                
-                # Validation cohérence type d'album / nombre de tracks
-                if album.album_type:
-                    expected_range = self._get_expected_track_range(album.album_type)
-                    if expected_range and not (expected_range[0] <= album.track_count <= expected_range[1]):
-                        issues.append(ValidationIssue(
-                            type=IssueType.INFO,
-                            category="type_track_mismatch",
-                            message=f"Incohérence type/nombre de tracks: {album.album_type.value} avec {album.track_count} tracks",
-                            field="album_type",
-                            suggested_fix="Vérifier le type d'album"
-                        ))
-            
-            # Validation de la durée totale
-            if album.total_duration:
-                if album.total_duration < 60 or album.total_duration > 10800:  # 1min à 3h
-                    issues.append(ValidationIssue(
-                        type=IssueType.WARNING,
-                        category="invalid_duration",
-                        message=f"Durée totale suspecte: {album.total_duration}s",
-                        field="total_duration"
-                    ))
-            
-            # Validation des IDs externes
-            if album.spotify_id and not re.match(r'^[a-zA-Z0-9]{22}, album.spotify_id):
-                issues.append(ValidationIssue(
-                    type=IssueType.WARNING,
-                    category="invalid_external_id",
-                    message="ID Spotify invalide",
-                    field="spotify_id"
-                ))
-            
-            # Calcul du score de qualité
-            quality_score = self._calculate_album_quality_score(album, issues)
-            quality_level = self._determine_quality_level(quality_score)
-            
-            is_valid = not any(issue.type == IssueType.CRITICAL for issue in issues)
-            
-            return ValidationResult(
-                entity_type="album",
-                entity_id=album.id,
-                is_valid=is_valid,
-                quality_score=quality_score,
-                quality_level=quality_level,
-                issues=issues,
-                metadata={
-                    'title': album.title,
-                    'artist': album.artist_name,
-                    'track_count': album.track_count,
-                    'album_type': album.album_type.value if album.album_type else None
-                }
-            )
-            
-        except Exception as e:
-            self.logger.error(f"Erreur validation album '{album.title}': {e}")
-            return ValidationResult(
-                entity_type="album",
-                entity_id=album.id,
-                is_valid=False,
-                quality_score=0.0,
-                quality_level=QualityLevel.VERY_POOR,
-                issues=[ValidationIssue(
-                    type=IssueType.CRITICAL,
-                    category="system",
-                    message=f"Erreur lors de la validation: {e}"
-                )],
-                metadata={}
-            )
-    
-    def _get_expected_track_range(self, album_type: AlbumType) -> Optional[Tuple[int, int]]:
-        """Retourne la plage attendue de tracks pour un type d'album"""
-        ranges = {
-            AlbumType.SINGLE: (1, 3),
-            AlbumType.EP: (4, 8),
-            AlbumType.ALBUM: (8, 50),
-            AlbumType.COMPILATION: (10, 100),
-            AlbumType.MIXTAPE: (5, 30),
-            AlbumType.LIVE: (5, 50)
+        results = {
+            'tracks': [],
+            'artists': [],
+            'credits': [],
+            'albums': []
         }
-        return ranges.get(album_type)
+        
+        for entity in entities:
+            try:
+                if isinstance(entity, Track):
+                    results['tracks'].append(self.validate_track(entity))
+                elif isinstance(entity, Artist):
+                    results['artists'].append(self.validate_artist(entity))
+                elif isinstance(entity, Credit):
+                    results['credits'].append(self.validate_credit(entity))
+                elif isinstance(entity, Album):
+                    # Note: validate_album à implémenter si nécessaire
+                    pass
+                    
+            except Exception as e:
+                self.logger.error(f"Erreur validation entité {type(entity).__name__}: {e}")
+        
+        return results
     
-    def _calculate_album_quality_score(self, album: Album, issues: List[ValidationIssue]) -> float:
-        """Calcule le score de qualité d'un album"""
-        base_score = 50.0
-        
-        # Bonus pour les données présentes
-        if album.title and album.title.strip():
-            base_score += 15
-        if album.artist_name:
-            base_score += 10
-        if album.release_date:
-            base_score += 10
-        if album.album_type:
-            base_score += 8
-        if album.track_count:
-            base_score += 7
-        if album.total_duration:
-            base_score += 5
-        if album.genre:
-            base_score += 3
-        if album.label:
-            base_score += 2
-        
-        # Malus pour les problèmes
-        for issue in issues:
-            if issue.type == IssueType.CRITICAL:
-                base_score -= 20
-            elif issue.type == IssueType.WARNING:
-                base_score -= 7
-            elif issue.type == IssueType.INFO:
-                base_score -= 2
-        
-        return max(0.0, min(100.0, base_score))
-    
-    def validate_artist(self, artist: Artist) -> ValidationResult:
+    def generate_quality_report(self, validation_results: List[ValidationResult]) -> QualityReport:
         """
-        Valide un artiste.
+        Génère un rapport de qualité basé sur les résultats de validation.
         
         Args:
-            artist: Artiste à valider
+            validation_results: Liste des résultats de validation
             
         Returns:
-            ValidationResult: Résultat de la validation
+            QualityReport: Rapport de qualité complet
         """
-        issues = []
+        if not validation_results:
+            return QualityReport()
         
-        try:
-            # Validation du nom
-            if not artist.name or not artist.name.strip():
-                issues.append(ValidationIssue(
-                    type=IssueType.CRITICAL,
-                    category="required_field",
-                    message="Nom d'artiste manquant",
-                    field="name"
-                ))
-            elif not validate_artist_name(artist.name):
-                issues.append(ValidationIssue(
-                    type=IssueType.CRITICAL,
-                    category="invalid_name",
-                    message=f"Nom d'artiste invalide: '{artist.name}'",
-                    field="name"
-                ))
-            
-            # Validation des IDs externes
-            if artist.genius_id and not str(artist.genius_id).isdigit():
-                issues.append(ValidationIssue(
-                    type=IssueType.WARNING,
-                    category="invalid_external_id",
-                    message="ID Genius invalide",
-                    field="genius_id"
-                ))
-            
-            if artist.spotify_id and not re.match(r'^[a-zA-Z0-9]{22}, artist.spotify_id):
-                issues.append(ValidationIssue(
-                    type=IssueType.WARNING,
-                    category="invalid_external_id",
-                    message="ID Spotify invalide",
-                    field="spotify_id"
-                ))
-            
-            # Validation des années d'activité
-            if artist.active_years:
-                if not re.match(r'^\d{4}(-\d{4})?( - present)?, artist.active_years):
-                    issues.append(ValidationIssue(
-                        type=IssueType.INFO,
-                        category="invalid_years",
-                        message=f"Format années d'activité suspect: '{artist.active_years}'",
-                        field="active_years"
-                    ))
-            
-            # Calcul du score de qualité
-            quality_score = self._calculate_artist_quality_score(artist, issues)
-            quality_level = self._determine_quality_level(quality_score)
-            
-            is_valid = not any(issue.type == IssueType.CRITICAL for issue in issues)
-            
-            return ValidationResult(
-                entity_type="artist",
-                entity_id=artist.id,
-                is_valid=is_valid,
-                quality_score=quality_score,
-                quality_level=quality_level,
-                issues=issues,
-                metadata={
-                    'name': artist.name,
-                    'genre': artist.genre.value if artist.genre else None,
-                    'total_tracks': artist.total_tracks
-                }
-            )
-            
-        except Exception as e:
-            self.logger.error(f"Erreur validation artiste '{artist.name}': {e}")
-            return ValidationResult(
-                entity_type="artist",
-                entity_id=artist.id,
-                is_valid=False,
-                quality_score=0.0,
-                quality_level=QualityLevel.VERY_POOR,
-                issues=[ValidationIssue(
-                    type=IssueType.CRITICAL,
-                    category="system",
-                    message=f"Erreur lors de la validation: {e}"
-                )],
-                metadata={}
-            )
-    
-    def _calculate_artist_quality_score(self, artist: Artist, issues: List[ValidationIssue]) -> float:
-        """Calcule le score de qualité d'un artiste"""
-        base_score = 50.0
+        # Calcul des statistiques globales
+        total_entities = len(validation_results)
+        valid_entities = sum(1 for r in validation_results if r.is_valid)
+        average_score = sum(r.quality_score for r in validation_results) / total_entities
         
-        # Bonus pour les données présentes
-        if artist.name and validate_artist_name(artist.name):
-            base_score += 20
-        if artist.genius_id:
-            base_score += 10
-        if artist.spotify_id:
-            base_score += 10
-        if artist.genre:
-            base_score += 5
-        if artist.country:
-            base_score += 3
-        if artist.active_years:
-            base_score += 2
-        
-        # Malus pour les problèmes
-        for issue in issues:
-            if issue.type == IssueType.CRITICAL:
-                base_score -= 25
-            elif issue.type == IssueType.WARNING:
-                base_score -= 10
-            elif issue.type == IssueType.INFO:
-                base_score -= 3
-        
-        return max(0.0, min(100.0, base_score))
-    
-    def batch_validate(self, entity_type: str, entity_ids: List[int]) -> List[ValidationResult]:
-        """
-        Valide plusieurs entités en lot.
-        
-        Args:
-            entity_type: Type d'entité ('track', 'album', 'artist')
-            entity_ids: Liste des IDs à valider
-            
-        Returns:
-            Liste des résultats de validation
-        """
-        results = []
-        
-        try:
-            self.logger.info(f"Début validation par lot: {len(entity_ids)} {entity_type}s")
-            
-            for entity_id in entity_ids:
-                try:
-                    if entity_type == 'track':
-                        # Récupérer le track (méthode à ajouter à Database)
-                        with self.database.get_connection() as conn:
-                            cursor = conn.execute("SELECT * FROM tracks WHERE id = ?", (entity_id,))
-                            row = cursor.fetchone()
-                            if row:
-                                track = self.database._row_to_track(row)
-                                track.credits = self.database.get_credits_by_track_id(track.id)
-                                track.featuring_artists = self.database.get_features_by_track_id(track.id)
-                                result = self.validate_track(track)
-                                results.append(result)
-                    
-                    elif entity_type == 'artist':
-                        # Récupérer l'artiste (méthode à ajouter à Database)
-                        with self.database.get_connection() as conn:
-                            cursor = conn.execute("SELECT * FROM artists WHERE id = ?", (entity_id,))
-                            row = cursor.fetchone()
-                            if row:
-                                from ..models.enums import Genre
-                                artist = Artist(
-                                    id=row['id'],
-                                    name=row['name'],
-                                    genius_id=row['genius_id'],
-                                    spotify_id=row['spotify_id'],
-                                    discogs_id=row['discogs_id'],
-                                    genre=Genre(row['genre']) if row['genre'] else None,
-                                    country=row['country'],
-                                    active_years=row['active_years']
-                                )
-                                result = self.validate_artist(artist)
-                                results.append(result)
-                    
-                    # Albums validation pourrait être ajoutée ici
-                    
-                except Exception as e:
-                    self.logger.error(f"Erreur validation {entity_type} {entity_id}: {e}")
-                    results.append(ValidationResult(
-                        entity_type=entity_type,
-                        entity_id=entity_id,
-                        is_valid=False,
-                        quality_score=0.0,
-                        quality_level=QualityLevel.VERY_POOR,
-                        issues=[ValidationIssue(
-                            type=IssueType.CRITICAL,
-                            category="system",
-                            message=f"Erreur lors de la validation: {e}"
-                        )],
-                        metadata={}
-                    ))
-            
-            self.logger.info(f"Validation par lot terminée: {len(results)} résultats")
-            return results
-            
-        except Exception as e:
-            self.logger.error(f"Erreur validation par lot: {e}")
-            return results
-    
-    def generate_detailed_report(self, results: List[ValidationResult]) -> Dict[str, Any]:
-        """
-        Génère un rapport détaillé de validation.
-        
-        Args:
-            results: Résultats de validation
-            
-        Returns:
-            Rapport détaillé
-        """
-        stats = self.generate_validation_summary(results)
-        
-        # Analyse par catégorie de problème
+        # Analyse des problèmes par catégorie
         issue_categories = {}
-        for result in results:
+        for result in validation_results:
             for issue in result.issues:
-                category = issue.category
-                if category not in issue_categories:
-                    issue_categories[category] = {
+                if issue.category not in issue_categories:
+                    issue_categories[issue.category] = {
                         'count': 0,
-                        'critical': 0,
-                        'warning': 0,
-                        'info': 0,
+                        'severity': issue.type.value,
                         'examples': []
                     }
-                
-                issue_categories[category]['count'] += 1
-                issue_categories[category][issue.type.value] += 1
-                
-                if len(issue_categories[category]['examples']) < 3:
-                    issue_categories[category]['examples'].append(issue.message)
+                issue_categories[issue.category]['count'] += 1
+                if len(issue_categories[issue.category]['examples']) < 3:
+                    issue_categories[issue.category]['examples'].append(issue.message)
         
-        # Distribution des scores de qualité
-        score_distribution = {
-            'excellent': 0,
-            'good': 0,
-            'average': 0,
-            'poor': 0,
-            'very_poor': 0
-        }
+        # Distribution des scores
+        score_ranges = {'0-50': 0, '50-70': 0, '70-85': 0, '85-95': 0, '95-100': 0}
+        for result in validation_results:
+            score = result.quality_score
+            if score < 50:
+                score_ranges['0-50'] += 1
+            elif score < 70:
+                score_ranges['50-70'] += 1
+            elif score < 85:
+                score_ranges['70-85'] += 1
+            elif score < 95:
+                score_ranges['85-95'] += 1
+            else:
+                score_ranges['95-100'] += 1
         
-        for result in results:
-            score_distribution[result.quality_level.value] += 1
+        score_distribution = {k: (v / total_entities) * 100 for k, v in score_ranges.items()}
         
-        # Top problèmes
+        # Top 5 des problèmes les plus fréquents
         top_issues = sorted(
             issue_categories.items(),
             key=lambda x: x[1]['count'],
             reverse=True
-        )[:10]
+        )[:5]
         
         return {
-            'summary': {
-                'total_validated': stats.total_validated,
-                'valid_entities': stats.valid_entities,
-                'invalid_entities': stats.invalid_entities,
-                'validation_rate': (stats.valid_entities / stats.total_validated * 100) if stats.total_validated > 0 else 0,
-                'average_quality_score': round(stats.average_quality_score, 2)
+            'total_entities': total_entities,
+            'valid_entities': valid_entities,
+            'validation_rate': (valid_entities / total_entities) * 100,
+            'average_quality_score': round(average_score, 2),
+            'quality_distribution': {
+                'excellent': len([r for r in validation_results if r.quality_level == QualityLevel.EXCELLENT]),
+                'good': len([r for r in validation_results if r.quality_level == QualityLevel.GOOD]),
+                'average': len([r for r in validation_results if r.quality_level == QualityLevel.AVERAGE]),
+                'poor': len([r for r in validation_results if r.quality_level == QualityLevel.POOR]),
+                'very_poor': len([r for r in validation_results if r.quality_level == QualityLevel.VERY_POOR])
             },
-            'issues': {
-                'critical': stats.critical_issues,
-                'warnings': stats.warnings,
-                'suggestions': stats.suggestions,
-                'by_category': issue_categories
+            'issue_categories': {
+                category: data for category, data in issue_categories.items()
             },
             'quality_distribution': score_distribution,
             'top_issues': top_issues,
@@ -1255,3 +836,33 @@ class DataValidator:
                     recommendations.append("Corriger les IDs externes malformés")
         
         return recommendations
+    
+    def get_session_stats(self) -> ValidationStats:
+        """Retourne les statistiques de la session actuelle"""
+        if self.session_stats.total_validated > 0:
+            self.session_stats.average_quality_score = (
+                self.session_stats.valid_entities / self.session_stats.total_validated
+            ) * 100
+        
+        return self.session_stats
+    
+    def clear_cache(self):
+        """Vide le cache de validation"""
+        self._cache.clear()
+        self.logger.info("Cache de validation vidé")
+    
+    def health_check(self) -> Dict[str, Any]:
+        """Effectue un diagnostic de santé du validateur"""
+        return {
+            'validation_level': self.validation_level.value,
+            'cache_size': len(self._cache),
+            'patterns_compiled': len(self.validation_patterns),
+            'session_stats': {
+                'total_validated': self.session_stats.total_validated,
+                'success_rate': (
+                    self.session_stats.valid_entities / max(self.session_stats.total_validated, 1)
+                ) * 100
+            },
+            'config': self.config,
+            'status': 'healthy'
+        }

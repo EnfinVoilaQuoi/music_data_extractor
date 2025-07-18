@@ -1,251 +1,232 @@
-# utils/logging_config.py
+# utils/logging_config.py - VERSION CORRIGÉE
+"""
+Configuration optimisée du système de logging pour Music Data Extractor.
+Gestion des logs par session, niveaux configurables et nettoyage automatique.
+"""
+
 import logging
 import logging.handlers
-from pathlib import Path
-from typing import Optional, Dict, Any
-from datetime import datetime
 import sys
-import os
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Dict, Optional, Any, List
+from functools import lru_cache
+import threading
+import json
 
-from ..config.settings import settings
-
-
-class ColoredFormatter(logging.Formatter):
-    """Formatter avec couleurs pour la console"""
-    
-    # Codes couleurs ANSI
-    COLORS = {
-        'DEBUG': '\033[36m',      # Cyan
-        'INFO': '\033[32m',       # Vert
-        'WARNING': '\033[33m',    # Jaune
-        'ERROR': '\033[31m',      # Rouge
-        'CRITICAL': '\033[35m',   # Magenta
-        'RESET': '\033[0m'        # Reset
-    }
-    
-    def format(self, record):
-        # Ajouter la couleur au niveau de log
-        level_color = self.COLORS.get(record.levelname, self.COLORS['RESET'])
-        record.levelname_colored = f"{level_color}{record.levelname}{self.COLORS['RESET']}"
-        
-        # Formatter avec couleur
-        return super().format(record)
-
-
-class SessionAwareFilter(logging.Filter):
-    """Filtre qui ajoute l'ID de session aux logs"""
-    
-    def __init__(self, session_id: Optional[str] = None):
-        super().__init__()
-        self.session_id = session_id
-    
-    def filter(self, record):
-        # Ajouter l'ID de session au record
-        record.session_id = getattr(record, 'session_id', self.session_id or 'NO_SESSION')
-        return True
-
+from config.settings import settings
 
 class MusicDataLogger:
-    """Gestionnaire de logging centralisé pour Music Data Extractor"""
+    """
+    Gestionnaire de logging optimisé pour Music Data Extractor.
+    Supporte les logs par session, rotation automatique et nettoyage.
+    """
     
     def __init__(self):
         self.logs_dir = settings.logs_dir
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        self.logs_dir.mkdir(exist_ok=True)
         
-        # Configuration par défaut
-        self.log_level = logging.INFO
-        self.max_file_size = 10 * 1024 * 1024  # 10MB
-        self.backup_count = 5
-        self.date_format = "%Y-%m-%d %H:%M:%S"
+        # Configuration du logging
+        self.log_level = getattr(logging, settings.get('logging.level', 'INFO').upper())
+        self.max_file_size = settings.get('logging.max_file_size', 10 * 1024 * 1024)  # 10MB
+        self.backup_count = settings.get('logging.backup_count', 5)
+        self.retention_days = settings.get('logging.retention_days', 30)
         
-        # Loggers configurés
-        self._configured_loggers: Dict[str, logging.Logger] = {}
+        # Cache des loggers
+        self._loggers_cache = {}
+        self._lock = threading.Lock()
         
-        # Configuration initiale
-        self._setup_root_logger()
+        # Configuration des formatters
+        self._setup_formatters()
+        
+        # Configuration du logger principal
+        self._setup_main_logger()
+        
+        # Statistiques de logging
+        self.stats = {
+            'logs_created': 0,
+            'total_log_entries': 0,
+            'errors_logged': 0,
+            'warnings_logged': 0,
+            'sessions_logged': set()
+        }
     
-    def _setup_root_logger(self):
-        """Configure le logger racine"""
-        root_logger = logging.getLogger('music_data_extractor')
-        root_logger.setLevel(self.log_level)
+    def _setup_formatters(self):
+        """Configure les formatters pour différents types de logs"""
+        
+        # Formatter détaillé pour les fichiers
+        self.detailed_formatter = logging.Formatter(
+            fmt='%(asctime)s | %(name)s | %(levelname)s | %(funcName)s:%(lineno)d | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        
+        # Formatter simple pour la console
+        self.console_formatter = logging.Formatter(
+            fmt='%(asctime)s | %(levelname)s | %(message)s',
+            datefmt='%H:%M:%S'
+        )
+        
+        # Formatter pour les sessions
+        self.session_formatter = logging.Formatter(
+            fmt='%(asctime)s | %(levelname)s | %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        
+        # Formatter JSON pour les logs structurés
+        self.json_formatter = JsonFormatter()
+    
+    def _setup_main_logger(self):
+        """Configure le logger principal de l'application"""
+        
+        # Logger racine pour l'application
+        main_logger = logging.getLogger('music_data_extractor')
+        main_logger.setLevel(self.log_level)
         
         # Éviter la duplication des handlers
-        if root_logger.handlers:
-            return
+        if main_logger.handlers:
+            main_logger.handlers.clear()
         
-        # Handler console avec couleurs
+        # Handler pour fichier principal avec rotation
+        main_file_handler = logging.handlers.RotatingFileHandler(
+            filename=self.logs_dir / 'music_data_extractor.log',
+            maxBytes=self.max_file_size,
+            backupCount=self.backup_count,
+            encoding='utf-8'
+        )
+        main_file_handler.setLevel(self.log_level)
+        main_file_handler.setFormatter(self.detailed_formatter)
+        
+        # Handler console
         console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(logging.INFO)
-        console_formatter = ColoredFormatter(
-            fmt='%(asctime)s | %(levelname_colored)s | %(name)s | %(message)s',
-            datefmt=self.date_format
-        )
-        console_handler.setFormatter(console_formatter)
-        root_logger.addHandler(console_handler)
+        console_handler.setLevel(max(self.log_level, logging.INFO))  # Au minimum INFO sur console
+        console_handler.setFormatter(self.console_formatter)
         
-        # Handler fichier général avec rotation
-        general_log_file = self.logs_dir / "music_extractor.log"
-        file_handler = logging.handlers.RotatingFileHandler(
-            general_log_file,
-            maxBytes=self.max_file_size,
-            backupCount=self.backup_count,
-            encoding='utf-8'
-        )
-        file_handler.setLevel(logging.DEBUG)
-        file_formatter = logging.Formatter(
-            fmt='%(asctime)s | %(levelname)-8s | %(name)-20s | %(session_id)-15s | %(message)s',
-            datefmt=self.date_format
-        )
-        file_handler.setFormatter(file_formatter)
-        file_handler.addFilter(SessionAwareFilter())
-        root_logger.addHandler(file_handler)
+        # Ajout des handlers
+        main_logger.addHandler(main_file_handler)
+        main_logger.addHandler(console_handler)
         
-        # Handler erreurs séparé
-        error_log_file = self.logs_dir / "errors.log"
-        error_handler = logging.handlers.RotatingFileHandler(
-            error_log_file,
-            maxBytes=self.max_file_size,
-            backupCount=self.backup_count,
-            encoding='utf-8'
-        )
-        error_handler.setLevel(logging.ERROR)
-        error_handler.setFormatter(file_formatter)
-        error_handler.addFilter(SessionAwareFilter())
-        root_logger.addHandler(error_handler)
+        # Éviter la propagation vers le logger racine
+        main_logger.propagate = False
         
-        self._configured_loggers['root'] = root_logger
+        self._loggers_cache['main'] = main_logger
     
+    @lru_cache(maxsize=128)
     def get_logger(self, name: str, session_id: Optional[str] = None) -> logging.Logger:
         """
-        Récupère ou crée un logger spécialisé.
+        Récupère ou crée un logger avec cache.
         
         Args:
-            name: Nom du logger (ex: 'genius_extractor', 'database')
-            session_id: ID de session pour traçabilité
+            name: Nom du logger
+            session_id: ID de session optionnel
             
         Returns:
             Logger configuré
         """
-        logger_key = f"{name}_{session_id}" if session_id else name
+        cache_key = f"{name}_{session_id}" if session_id else name
         
-        if logger_key in self._configured_loggers:
-            return self._configured_loggers[logger_key]
-        
-        # Créer un nouveau logger
-        logger = logging.getLogger(f"music_data_extractor.{name}")
-        logger.setLevel(self.log_level)
-        
-        # Ajouter un filtre de session si fourni
-        if session_id:
-            session_filter = SessionAwareFilter(session_id)
-            for handler in logger.handlers:
-                handler.addFilter(session_filter)
-        
-        self._configured_loggers[logger_key] = logger
-        return logger
+        with self._lock:
+            if cache_key in self._loggers_cache:
+                return self._loggers_cache[cache_key]
+            
+            # Création du nouveau logger
+            logger = logging.getLogger(cache_key)
+            logger.setLevel(self.log_level)
+            
+            # Éviter la duplication des handlers
+            if logger.handlers:
+                logger.handlers.clear()
+            
+            # Handler pour fichier spécifique
+            if session_id:
+                log_filename = f"{name}_{session_id}.log"
+            else:
+                log_filename = f"{name}.log"
+            
+            file_handler = logging.handlers.RotatingFileHandler(
+                filename=self.logs_dir / log_filename,
+                maxBytes=self.max_file_size,
+                backupCount=self.backup_count,
+                encoding='utf-8'
+            )
+            file_handler.setLevel(self.log_level)
+            file_handler.setFormatter(self.detailed_formatter)
+            
+            logger.addHandler(file_handler)
+            logger.propagate = False
+            
+            self._loggers_cache[cache_key] = logger
+            self.stats['logs_created'] += 1
+            
+            return logger
     
     def get_session_logger(self, session_id: str, component: str = "session") -> logging.Logger:
         """
-        Crée un logger spécifique à une session avec fichier dédié.
+        Crée un logger dédié pour une session.
         
         Args:
-            session_id: ID de la session
-            component: Composant (ex: 'extraction', 'discovery')
+            session_id: Identifiant unique de la session
+            component: Composant de la session
             
         Returns:
-            Logger avec fichier de session dédié
+            Logger de session configuré
         """
-        logger_name = f"session.{session_id}.{component}"
+        logger_name = f"session_{component}"
+        session_logger = self.get_logger(logger_name, session_id)
         
-        if logger_name in self._configured_loggers:
-            return self._configured_loggers[logger_name]
+        # Ajout à la liste des sessions trackées
+        self.stats['sessions_logged'].add(session_id)
         
-        # Créer le logger de session
-        logger = logging.getLogger(f"music_data_extractor.{logger_name}")
-        logger.setLevel(logging.DEBUG)
-        
-        # Fichier de log spécifique à la session
-        session_log_file = self.logs_dir / f"session_{session_id}_{component}.log"
-        session_handler = logging.FileHandler(session_log_file, encoding='utf-8')
-        session_handler.setLevel(logging.DEBUG)
-        
-        session_formatter = logging.Formatter(
-            fmt='%(asctime)s | %(levelname)-8s | %(message)s',
-            datefmt=self.date_format
-        )
-        session_handler.setFormatter(session_formatter)
-        logger.addHandler(session_handler)
-        
-        # Ajouter le filtre de session
-        session_filter = SessionAwareFilter(session_id)
-        session_handler.addFilter(session_filter)
-        
-        self._configured_loggers[logger_name] = logger
-        return logger
-    
-    def get_extraction_logger(self, session_id: str, extractor_name: str) -> logging.Logger:
-        """
-        Logger spécialisé pour un extracteur spécifique.
-        
-        Args:
-            session_id: ID de session
-            extractor_name: Nom de l'extracteur (genius, spotify, etc.)
-            
-        Returns:
-            Logger configuré pour l'extracteur
-        """
-        return self.get_session_logger(session_id, f"extraction_{extractor_name}")
-    
-    def get_scraper_logger(self, session_id: str, scraper_name: str) -> logging.Logger:
-        """
-        Logger spécialisé pour un scraper web.
-        
-        Args:
-            session_id: ID de session
-            scraper_name: Nom du scraper (genius_scraper, tunebat, etc.)
-            
-        Returns:
-            Logger configuré pour le scraper
-        """
-        return self.get_session_logger(session_id, f"scraper_{scraper_name}")
-    
-    def get_database_logger(self, session_id: Optional[str] = None) -> logging.Logger:
-        """Logger spécialisé pour les opérations de base de données"""
-        return self.get_logger("database", session_id)
+        return session_logger
     
     def set_debug_mode(self, enabled: bool = True):
-        """Active/désactive le mode debug pour tous les loggers"""
+        """
+        Active ou désactive le mode debug sur tous les loggers.
+        
+        Args:
+            enabled: True pour activer le debug
+        """
         new_level = logging.DEBUG if enabled else logging.INFO
+        
+        with self._lock:
+            for logger in self._loggers_cache.values():
+                logger.setLevel(new_level)
+                for handler in logger.handlers:
+                    handler.setLevel(new_level)
+        
         self.log_level = new_level
         
-        # Mettre à jour tous les loggers existants
-        for logger in self._configured_loggers.values():
-            logger.setLevel(new_level)
-        
-        print(f"🔧 Mode debug {'activé' if enabled else 'désactivé'}")
+        main_logger = logging.getLogger('music_data_extractor')
+        main_logger.info(f"🔧 Mode debug {'activé' if enabled else 'désactivé'}")
     
-    def log_extraction_start(self, session_id: str, artist_name: str, logger: Optional[logging.Logger] = None):
+    # ===== MÉTHODES DE LOGGING SPÉCIALISÉES =====
+    
+    def log_extraction_start(self, session_id: str, artist_name: str, 
+                           logger: Optional[logging.Logger] = None):
         """Log le début d'une extraction"""
         if not logger:
             logger = self.get_session_logger(session_id, "extraction")
         
-        logger.info(f"🚀 DÉBUT EXTRACTION | Artiste: {artist_name}")
-        logger.info(f"📋 Session ID: {session_id}")
-        logger.info(f"🕐 Timestamp: {datetime.now().isoformat()}")
+        logger.info(f"🚀 DÉBUT EXTRACTION: {artist_name}")
+        logger.info(f"📅 Session: {session_id}")
+        logger.info(f"⏰ Heure: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        self.stats['total_log_entries'] += 3
     
-    def log_extraction_end(self, session_id: str, artist_name: str, success: bool, 
-                          stats: Optional[Dict[str, Any]] = None, logger: Optional[logging.Logger] = None):
+    def log_extraction_end(self, session_id: str, artist_name: str, 
+                          tracks_found: int, success: bool,
+                          logger: Optional[logging.Logger] = None):
         """Log la fin d'une extraction"""
         if not logger:
             logger = self.get_session_logger(session_id, "extraction")
         
-        status = "✅ SUCCÈS" if success else "❌ ÉCHEC"
-        logger.info(f"{status} EXTRACTION | Artiste: {artist_name}")
+        status_emoji = "✅" if success else "❌"
+        status_text = "SUCCÈS" if success else "ÉCHEC"
         
-        if stats:
-            logger.info(f"📊 Statistiques:")
-            for key, value in stats.items():
-                logger.info(f"   {key}: {value}")
+        logger.info(f"{status_emoji} FIN EXTRACTION: {artist_name}")
+        logger.info(f"📊 Tracks trouvés: {tracks_found}")
+        logger.info(f"🎯 Statut: {status_text}")
+        
+        self.stats['total_log_entries'] += 3
     
     def log_step_progress(self, session_id: str, step_name: str, current: int, total: int,
                          logger: Optional[logging.Logger] = None):
@@ -255,6 +236,8 @@ class MusicDataLogger:
         
         percentage = (current / total * 100) if total > 0 else 0
         logger.info(f"📈 {step_name}: {current}/{total} ({percentage:.1f}%)")
+        
+        self.stats['total_log_entries'] += 1
     
     def log_error_with_context(self, session_id: str, error: Exception, context: Dict[str, Any],
                               logger: Optional[logging.Logger] = None):
@@ -269,6 +252,9 @@ class MusicDataLogger:
         
         # Log la stack trace en debug
         logger.debug(f"🔍 Stack trace:", exc_info=True)
+        
+        self.stats['errors_logged'] += 1
+        self.stats['total_log_entries'] += 2 + len(context)
     
     def log_api_call(self, session_id: str, api_name: str, endpoint: str, 
                     response_code: Optional[int] = None, duration: Optional[float] = None,
@@ -285,55 +271,104 @@ class MusicDataLogger:
         
         if response_code and response_code >= 400:
             logger.warning(log_msg)
+            self.stats['warnings_logged'] += 1
         else:
             logger.debug(log_msg)
+        
+        self.stats['total_log_entries'] += 1
     
     def log_scraping_activity(self, session_id: str, scraper_name: str, url: str,
                              success: bool, data_extracted: Optional[Dict[str, Any]] = None,
                              logger: Optional[logging.Logger] = None):
         """Log une activité de scraping"""
         if not logger:
-            logger = self.get_scraper_logger(session_id, scraper_name)
+            logger = self.get_session_logger(session_id, f"scraper_{scraper_name}")
         
-        status = "✅" if success else "❌"
-        logger.info(f"{status} SCRAPING | {scraper_name} | {url}")
+        status_emoji = "✅" if success else "❌"
+        logger.info(f"{status_emoji} SCRAPING {scraper_name}")
+        logger.debug(f"🔗 URL: {url}")
         
         if data_extracted:
-            logger.debug(f"📦 Données extraites: {list(data_extracted.keys())}")
+            logger.debug(f"📦 Données extraites: {len(data_extracted)} éléments")
+        
+        self.stats['total_log_entries'] += 2
     
-    def log_database_operation(self, session_id: str, operation: str, table: str,
-                              records_affected: Optional[int] = None, duration: Optional[float] = None,
+    def log_validation_results(self, session_id: str, entity_type: str, 
+                              total_validated: int, errors_found: int,
                               logger: Optional[logging.Logger] = None):
-        """Log une opération de base de données"""
+        """Log les résultats de validation"""
         if not logger:
-            logger = self.get_database_logger(session_id)
+            logger = self.get_session_logger(session_id, "validation")
         
-        log_msg = f"🗃️ DB {operation.upper()} | {table}"
-        if records_affected is not None:
-            log_msg += f" | {records_affected} enregistrements"
-        if duration:
-            log_msg += f" | {duration:.3f}s"
+        success_rate = ((total_validated - errors_found) / total_validated * 100) if total_validated > 0 else 0
         
-        logger.debug(log_msg)
+        logger.info(f"🔍 VALIDATION {entity_type.upper()}")
+        logger.info(f"📊 Total validé: {total_validated}")
+        logger.info(f"⚠️ Erreurs trouvées: {errors_found}")
+        logger.info(f"✅ Taux de succès: {success_rate:.1f}%")
+        
+        self.stats['total_log_entries'] += 4
     
-    def cleanup_old_logs(self, days_to_keep: int = 30):
-        """Nettoie les anciens fichiers de log"""
-        cutoff_date = datetime.now().timestamp() - (days_to_keep * 24 * 60 * 60)
+    # ===== MÉTHODES DE GESTION DES LOGS =====
+    
+    def cleanup_old_logs(self, days_to_keep: int = 30) -> int:
+        """
+        Supprime les logs anciens.
         
+        Args:
+            days_to_keep: Nombre de jours à conserver
+            
+        Returns:
+            Nombre de fichiers supprimés
+        """
+        cutoff_date = datetime.now() - timedelta(days=days_to_keep)
         deleted_count = 0
+        
         for log_file in self.logs_dir.glob("*.log*"):
-            if log_file.stat().st_mtime < cutoff_date:
-                try:
+            try:
+                file_time = datetime.fromtimestamp(log_file.stat().st_mtime)
+                if file_time < cutoff_date:
                     log_file.unlink()
                     deleted_count += 1
-                except OSError as e:
-                    print(f"❌ Erreur suppression {log_file}: {e}")
+            except Exception as e:
+                # Utiliser le logger principal pour cette erreur
+                main_logger = logging.getLogger('music_data_extractor')
+                main_logger.warning(f"Erreur suppression log {log_file}: {e}")
         
-        if deleted_count > 0:
-            print(f"🧹 {deleted_count} anciens fichiers de log supprimés")
+        main_logger = logging.getLogger('music_data_extractor')
+        main_logger.info(f"🧹 {deleted_count} anciens logs supprimés")
+        
+        return deleted_count
     
-    def get_log_summary(self) -> Dict[str, Any]:
-        """Retourne un résumé des logs"""
+    def rotate_logs(self):
+        """Force la rotation de tous les logs"""
+        with self._lock:
+            for logger in self._loggers_cache.values():
+                for handler in logger.handlers:
+                    if isinstance(handler, logging.handlers.RotatingFileHandler):
+                        handler.doRollover()
+    
+    def flush_all_logs(self):
+        """Force l'écriture de tous les logs en attente"""
+        with self._lock:
+            for logger in self._loggers_cache.values():
+                for handler in logger.handlers:
+                    handler.flush()
+    
+    def get_log_stats(self) -> Dict[str, Any]:
+        """Retourne les statistiques de logging"""
+        log_files = list(self.logs_dir.glob("*.log"))
+        
+        stats = self.stats.copy()
+        stats['sessions_logged'] = len(stats['sessions_logged'])
+        stats['active_loggers'] = len(self._loggers_cache)
+        stats['log_files_count'] = len(log_files)
+        stats['logs_directory'] = str(self.logs_dir)
+        
+        return stats
+    
+    def get_logs_summary(self) -> Dict[str, Any]:
+        """Retourne un résumé des logs disponibles"""
         log_files = list(self.logs_dir.glob("*.log"))
         
         summary = {
@@ -350,6 +385,59 @@ class MusicDataLogger:
         }
         
         return summary
+
+
+class JsonFormatter(logging.Formatter):
+    """Formatter JSON pour logs structurés"""
+    
+    def format(self, record):
+        log_entry = {
+            'timestamp': datetime.fromtimestamp(record.created).isoformat(),
+            'level': record.levelname,
+            'logger': record.name,
+            'message': record.getMessage(),
+            'module': record.module,
+            'function': record.funcName,
+            'line': record.lineno
+        }
+        
+        if record.exc_info:
+            log_entry['exception'] = self.formatException(record.exc_info)
+        
+        return json.dumps(log_entry, ensure_ascii=False)
+
+
+# ===== FONCTIONS DE CONFIGURATION GLOBALES =====
+
+def setup_logging(level: str = "INFO", debug_mode: bool = False) -> MusicDataLogger:
+    """
+    Configure le système de logging pour l'application.
+    
+    Args:
+        level: Niveau de logging ('DEBUG', 'INFO', 'WARNING', 'ERROR')
+        debug_mode: Activer le mode debug
+        
+    Returns:
+        Instance du gestionnaire de logging
+    """
+    # Création du gestionnaire global
+    logger_manager = MusicDataLogger()
+    
+    # Configuration du niveau
+    if debug_mode:
+        logger_manager.set_debug_mode(True)
+    else:
+        log_level = getattr(logging, level.upper(), logging.INFO)
+        logger_manager.log_level = log_level
+    
+    # Log de démarrage
+    main_logger = logger_manager.get_logger('music_data_extractor')
+    main_logger.info("🎵 Music Data Extractor - Logging initialisé")
+    main_logger.info(f"📁 Répertoire logs: {logger_manager.logs_dir}")
+    main_logger.info(f"📊 Niveau: {level}")
+    main_logger.info(f"🔧 Mode debug: {'Activé' if debug_mode else 'Désactivé'}")
+    
+    return logger_manager
 
 
 # Instance globale du gestionnaire de logging
@@ -370,10 +458,269 @@ def set_debug_mode(enabled: bool = True):
 
 def cleanup_logs(days_to_keep: int = 30):
     """Fonction de convenance pour nettoyer les logs"""
-    logger_manager.cleanup_old_logs(days_to_keep)
+    return logger_manager.cleanup_old_logs(days_to_keep)
 
+def get_logging_stats() -> Dict[str, Any]:
+    """Fonction de convenance pour obtenir les statistiques"""
+    return logger_manager.get_log_stats()
 
-# Exemples d'utilisation pour documentation
+def flush_logs():
+    """Fonction de convenance pour forcer l'écriture des logs"""
+    logger_manager.flush_all_logs()
+
+def rotate_logs():
+    """Fonction de convenance pour forcer la rotation"""
+    logger_manager.rotate_logs()
+
+# ===== FONCTIONS DE DIAGNOSTIC =====
+
+def validate_logging_setup() -> Tuple[bool, List[str]]:
+    """
+    Valide que le système de logging est correctement configuré.
+    
+    Returns:
+        Tuple (configuration_valide, liste_problèmes)
+    """
+    issues = []
+    
+    # Vérifier que le répertoire de logs existe
+    if not logger_manager.logs_dir.exists():
+        try:
+            logger_manager.logs_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            issues.append(f"Impossible de créer le répertoire de logs: {e}")
+    
+    # Vérifier les permissions d'écriture
+    if logger_manager.logs_dir.exists():
+        import os
+        if not os.access(logger_manager.logs_dir, os.W_OK):
+            issues.append("Pas de permission d'écriture dans le répertoire de logs")
+    
+    # Vérifier que le logger principal existe
+    try:
+        main_logger = logger_manager.get_logger('music_data_extractor')
+        if not main_logger:
+            issues.append("Logger principal non créé")
+    except Exception as e:
+        issues.append(f"Erreur création logger principal: {e}")
+    
+    # Vérifier l'espace disque (minimum 50MB)
+    try:
+        import shutil
+        total, used, free = shutil.disk_usage(logger_manager.logs_dir)
+        free_mb = free / (1024 * 1024)
+        if free_mb < 50:
+            issues.append(f"Espace disque insuffisant: {free_mb:.1f}MB disponibles")
+    except Exception:
+        issues.append("Impossible de vérifier l'espace disque")
+    
+    return len(issues) == 0, issues
+
+def run_logging_diagnostics() -> Dict[str, Any]:
+    """
+    Lance des diagnostics complets sur le système de logging.
+    
+    Returns:
+        Rapport de diagnostic détaillé
+    """
+    diagnostics = {
+        'setup_validation': {},
+        'statistics': logger_manager.get_log_stats(),
+        'logs_summary': logger_manager.get_logs_summary(),
+        'configuration': {
+            'log_level': logging.getLevelName(logger_manager.log_level),
+            'logs_directory': str(logger_manager.logs_dir),
+            'max_file_size_mb': logger_manager.max_file_size / (1024 * 1024),
+            'backup_count': logger_manager.backup_count,
+            'retention_days': logger_manager.retention_days
+        }
+    }
+    
+    # Validation de la configuration
+    is_valid, issues = validate_logging_setup()
+    diagnostics['setup_validation'] = {
+        'is_valid': is_valid,
+        'issues': issues
+    }
+    
+    # Test de création de logger
+    try:
+        test_logger = logger_manager.get_logger('diagnostic_test')
+        test_logger.info("Test de diagnostic logging")
+        diagnostics['logger_creation_test'] = {
+            'success': True,
+            'message': "Logger de test créé avec succès"
+        }
+    except Exception as e:
+        diagnostics['logger_creation_test'] = {
+            'success': False,
+            'error': str(e)
+        }
+    
+    # Test des différents niveaux de log
+    log_levels_test = {}
+    for level_name in ['DEBUG', 'INFO', 'WARNING', 'ERROR']:
+        try:
+            test_logger = logger_manager.get_logger('level_test')
+            level = getattr(logging, level_name)
+            test_logger.log(level, f"Test niveau {level_name}")
+            log_levels_test[level_name] = True
+        except Exception:
+            log_levels_test[level_name] = False
+    
+    diagnostics['log_levels_test'] = log_levels_test
+    
+    return diagnostics
+
+def create_session_logs_summary(session_id: str) -> Dict[str, Any]:
+    """
+    Crée un résumé des logs pour une session donnée.
+    
+    Args:
+        session_id: ID de la session
+        
+    Returns:
+        Résumé des logs de la session
+    """
+    session_logs = []
+    
+    # Recherche des fichiers de logs pour cette session
+    for log_file in logger_manager.logs_dir.glob(f"*{session_id}*.log"):
+        try:
+            with open(log_file, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+                session_logs.append({
+                    'file': log_file.name,
+                    'lines_count': len(lines),
+                    'file_size_kb': log_file.stat().st_size / 1024,
+                    'last_modified': datetime.fromtimestamp(log_file.stat().st_mtime).isoformat()
+                })
+        except Exception as e:
+            session_logs.append({
+                'file': log_file.name,
+                'error': f"Erreur lecture: {e}"
+            })
+    
+    return {
+        'session_id': session_id,
+        'total_log_files': len(session_logs),
+        'log_files': session_logs,
+        'generated_at': datetime.now().isoformat()
+    }
+
+# ===== CONTEXTE MANAGERS POUR LOGGING =====
+
+class LoggingContext:
+    """Context manager pour logging avec session"""
+    
+    def __init__(self, session_id: str, component: str, logger_manager: MusicDataLogger = None):
+        self.session_id = session_id
+        self.component = component
+        self.manager = logger_manager or globals()['logger_manager']
+        self.logger = None
+        self.start_time = None
+    
+    def __enter__(self):
+        self.start_time = datetime.now()
+        self.logger = self.manager.get_session_logger(self.session_id, self.component)
+        self.logger.info(f"🚀 Début {self.component} - Session {self.session_id}")
+        return self.logger
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        duration = datetime.now() - self.start_time
+        
+        if exc_type is None:
+            self.logger.info(f"✅ Fin {self.component} - Durée: {duration.total_seconds():.2f}s")
+        else:
+            self.logger.error(f"❌ Erreur {self.component} - {exc_type.__name__}: {exc_val}")
+            self.logger.error(f"⏱️ Durée avant erreur: {duration.total_seconds():.2f}s")
+        
+        return False  # Ne pas supprimer l'exception
+
+class TimedLogging:
+    """Context manager pour mesurer et logger des opérations"""
+    
+    def __init__(self, operation_name: str, logger: logging.Logger = None, threshold_seconds: float = 1.0):
+        self.operation_name = operation_name
+        self.logger = logger or logging.getLogger('music_data_extractor')
+        self.threshold_seconds = threshold_seconds
+        self.start_time = None
+    
+    def __enter__(self):
+        self.start_time = datetime.now()
+        self.logger.debug(f"⏱️ Début: {self.operation_name}")
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        duration = datetime.now() - self.start_time
+        duration_seconds = duration.total_seconds()
+        
+        if exc_type is None:
+            if duration_seconds > self.threshold_seconds:
+                self.logger.warning(f"🐌 {self.operation_name} lent: {duration_seconds:.2f}s")
+            else:
+                self.logger.debug(f"✅ {self.operation_name}: {duration_seconds:.2f}s")
+        else:
+            self.logger.error(f"❌ Erreur {self.operation_name}: {exc_val} (après {duration_seconds:.2f}s)")
+        
+        return False
+
+# ===== DÉCORATEURS DE LOGGING =====
+
+def log_function_calls(logger_name: str = None):
+    """
+    Décorateur pour logger automatiquement les appels de fonction.
+    
+    Args:
+        logger_name: Nom du logger à utiliser
+    """
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            logger = get_logger(logger_name or func.__module__)
+            
+            # Log de l'entrée
+            logger.debug(f"🔗 Appel {func.__name__} avec args={len(args)}, kwargs={len(kwargs)}")
+            
+            start_time = datetime.now()
+            try:
+                result = func(*args, **kwargs)
+                duration = datetime.now() - start_time
+                logger.debug(f"✅ {func.__name__} terminé en {duration.total_seconds():.3f}s")
+                return result
+            except Exception as e:
+                duration = datetime.now() - start_time
+                logger.error(f"❌ Erreur {func.__name__} après {duration.total_seconds():.3f}s: {e}")
+                raise
+        
+        return wrapper
+    return decorator
+
+def log_errors_only(logger_name: str = None):
+    """
+    Décorateur pour logger uniquement les erreurs d'une fonction.
+    
+    Args:
+        logger_name: Nom du logger à utiliser
+    """
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                logger = get_logger(logger_name or func.__module__)
+                logger.error(f"💥 Erreur dans {func.__name__}: {type(e).__name__}: {e}")
+                logger.debug(f"🔍 Stack trace complète:", exc_info=True)
+                raise
+        
+        return wrapper
+    return decorator
+
+# ===== LOGGING PRINCIPAL =====
+
+main_logger = logging.getLogger('music_data_extractor')
+main_logger.info("Module logging_config initialisé avec succès")
+
+# ===== EXEMPLES D'UTILISATION =====
 """
 Exemples d'utilisation:
 
@@ -390,9 +737,34 @@ logger_manager.log_extraction_start("session_123", "Nekfeu")
 logger_manager.log_api_call("session_123", "genius", "/songs/123", 200, 0.5)
 logger_manager.log_scraping_activity("session_123", "genius_scraper", "https://genius.com/song", True)
 
+# Context managers
+with LoggingContext("session_123", "extraction") as logger:
+    logger.info("Traitement en cours...")
+
+with TimedLogging("Opération longue", logger, threshold_seconds=2.0):
+    # Opération à mesurer
+    pass
+
+# Décorateurs
+@log_function_calls("my_module")
+def ma_fonction():
+    pass
+
+@log_errors_only("my_module")  
+def fonction_avec_erreurs():
+    pass
+
 # Mode debug
 set_debug_mode(True)
 
 # Nettoyage
 cleanup_logs(days_to_keep=7)
+
+# Diagnostics
+diagnostics = run_logging_diagnostics()
+print(f"Système de logging valide: {diagnostics['setup_validation']['is_valid']}")
+
+# Statistiques
+stats = get_logging_stats()
+print(f"Total logs créés: {stats['logs_created']}")
 """
