@@ -1,743 +1,784 @@
 # discovery/spotify_discovery.py
+"""
+Découverte de morceaux via l'API Spotify.
+Version optimisée avec cache intelligent, authentification automatique et enrichissement des métadonnées.
+"""
+
 import logging
-import re
-from typing import Dict, List, Optional, Any, Tuple
-from datetime import datetime, timedelta
+import time
 import base64
+from functools import lru_cache
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from ..core.exceptions import ExtractionError, RateLimitError, ValidationError
-from ..core.cache import CacheManager
-from ..core.rate_limiter import RateLimiter
-from ..config.settings import settings
-from ..models.entities import Artist, Album, Track
-from ..models.enums import AlbumType, DataSource, ExtractionStatus
-from ..utils.text_utils import clean_text, normalize_title, extract_featuring_artists
+# Imports absolus
+from config.settings import settings
+from models.entities import Track, Artist, Album
+from models.enums import DataSource, QualityLevel
+from core.exceptions import APIError, APIRateLimitError, DataValidationError
+
+# Imports conditionnels
+try:
+    from core.cache import CacheManager
+except ImportError:
+    CacheManager = None
+
+try:
+    from core.rate_limiter import RateLimiter
+except ImportError:
+    RateLimiter = None
+
+from utils.text_utils import clean_artist_name, normalize_text
+
+
+@dataclass
+class SpotifyDiscoveryResult:
+    """
+    Résultat optimisé d'une découverte Spotify avec métriques détaillées.
+    """
+    success: bool
+    tracks: List[Dict[str, Any]] = field(default_factory=list)
+    albums: List[Dict[str, Any]] = field(default_factory=list)
+    artist_info: Optional[Dict[str, Any]] = None
+    total_found: int = 0
+    error: Optional[str] = None
+    source: str = "spotify"
+    api_calls_made: int = 0
+    cache_hits: int = 0
+    discovery_time_seconds: float = 0.0
+    
+    def __post_init__(self):
+        self.total_found = len(self.tracks)
+    
+    @property
+    def cache_hit_rate(self) -> float:
+        """Calcule le taux de succès du cache"""
+        total_requests = self.cache_hits + self.api_calls_made
+        if total_requests == 0:
+            return 0.0
+        return (self.cache_hits / total_requests) * 100
 
 
 class SpotifyDiscovery:
     """
-    Module de découverte pour Spotify.
+    Découverte optimisée de morceaux via l'API Spotify.
     
-    Responsabilités :
-    - Découverte des albums d'un artiste
-    - Récupération de la discographie complète
-    - Organisation des tracks par albums/singles/compilations
-    - Extraction des métadonnées de base (durée, année, etc.)
+    Fonctionnalités:
+    - Authentification automatique avec Client Credentials Flow
+    - Cache intelligent des tokens et résultats
+    - Rate limiting respectueux des limites Spotify
+    - Enrichissement des métadonnées (popularity, preview_url, etc.)
+    - Gestion robuste des erreurs avec retry
     """
     
     def __init__(self):
+        self.logger = logging.getLogger(__name__)
+        
+        # Configuration API Spotify
         self.client_id = settings.spotify_client_id
         self.client_secret = settings.spotify_client_secret
         
         if not self.client_id or not self.client_secret:
-            raise ExtractionError("Identifiants Spotify manquants")
+            raise APIError("Identifiants Spotify manquants dans la configuration")
         
-        # Configuration
         self.base_url = "https://api.spotify.com/v1"
         self.auth_url = "https://accounts.spotify.com/api/token"
         
-        # Gestion des tokens
+        # Session HTTP optimisée
+        self.session = self._create_optimized_session()
+        
+        # Token management
         self.access_token = None
         self.token_expires_at = None
         
-        # Composants
-        self.logger = logging.getLogger(f"{__name__}.SpotifyDiscovery")
-        self.cache_manager = CacheManager()
-        self.rate_limiter = RateLimiter(
-            requests_per_period=settings.get('rate_limits.spotify.requests_per_minute', 100),
-            period_seconds=60
-        )
+        # Composants optionnels
+        self.cache_manager = CacheManager() if CacheManager else None
+        self.rate_limiter = RateLimiter(calls_per_minute=100) if RateLimiter else None  # Spotify: ~100 req/min
         
-        # Session HTTP
-        self.session = self._create_session()
-        
-        # Configuration spécifique
-        self.config = {
-            'include_singles': settings.get('albums.detect_singles', True),
-            'include_compilations': settings.get('spotify.include_compilations', False),
-            'include_appears_on': settings.get('spotify.include_appears_on', True),
-            'market': settings.get('spotify.market', 'US'),  # Marché pour la disponibilité
-            'limit_albums': settings.get('spotify.max_albums_per_artist', 50),
-            'prefer_original_releases': settings.get('albums.prefer_spotify', True)
+        # Métriques de performance
+        self.performance_metrics = {
+            'total_api_calls': 0,
+            'total_cache_hits': 0,
+            'total_tracks_found': 0,
+            'authentication_count': 0,
+            'average_response_time': 0.0,
+            'error_count': 0
         }
         
-        self.logger.info("SpotifyDiscovery initialisé")
+        self.logger.info("✅ SpotifyDiscovery optimisé initialisé")
     
-    def _create_session(self) -> requests.Session:
-        """Crée une session HTTP avec retry automatique"""
+    def _create_optimized_session(self) -> requests.Session:
+        """Crée une session HTTP optimisée pour Spotify"""
         session = requests.Session()
         
+        # Configuration du retry
         retry_strategy = Retry(
             total=3,
-            backoff_factor=1,
+            backoff_factor=2,
             status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"]
         )
         
         adapter = HTTPAdapter(max_retries=retry_strategy)
         session.mount("http://", adapter)
         session.mount("https://", adapter)
         
+        session.timeout = 30
         return session
     
-    def _get_access_token(self) -> str:
-        """Obtient ou renouvelle le token d'accès Spotify"""
-        # Vérifier si le token actuel est encore valide
-        if (self.access_token and self.token_expires_at and 
-            datetime.now() < self.token_expires_at - timedelta(minutes=5)):
-            return self.access_token
+    def _authenticate(self) -> bool:
+        """
+        Authentification via Client Credentials Flow avec cache du token.
         
-        # Demander un nouveau token
-        auth_header = base64.b64encode(
-            f"{self.client_id}:{self.client_secret}".encode()
-        ).decode()
-        
-        headers = {
-            "Authorization": f"Basic {auth_header}",
-            "Content-Type": "application/x-www-form-urlencoded"
-        }
-        
-        data = {"grant_type": "client_credentials"}
+        Returns:
+            True si l'authentification réussit
+        """
+        # Vérifier si le token est encore valide
+        if self.access_token and self.token_expires_at:
+            if datetime.now() < self.token_expires_at - timedelta(minutes=5):  # Marge de 5 minutes
+                return True
         
         try:
+            # Préparer les données d'authentification
+            auth_string = f"{self.client_id}:{self.client_secret}"
+            auth_bytes = auth_string.encode('ascii')
+            auth_b64 = base64.b64encode(auth_bytes).decode('ascii')
+            
+            headers = {
+                'Authorization': f'Basic {auth_b64}',
+                'Content-Type': 'application/x-www-form-urlencoded'
+            }
+            
+            data = {'grant_type': 'client_credentials'}
+            
             response = self.session.post(self.auth_url, headers=headers, data=data)
             response.raise_for_status()
             
-            token_data = response.json()
-            self.access_token = token_data["access_token"]
-            expires_in = token_data.get("expires_in", 3600)
+            auth_data = response.json()
+            
+            # Stocker le token
+            self.access_token = auth_data['access_token']
+            expires_in = auth_data.get('expires_in', 3600)  # Défaut: 1 heure
             self.token_expires_at = datetime.now() + timedelta(seconds=expires_in)
             
-            self.logger.debug("Token Spotify renouvelé")
-            return self.access_token
+            self.performance_metrics['authentication_count'] += 1
+            self.logger.debug("🔑 Authentification Spotify réussie")
             
-        except requests.exceptions.RequestException as e:
-            raise ExtractionError(f"Erreur lors de l'authentification Spotify: {e}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"❌ Erreur authentification Spotify: {e}")
+            return False
     
-    def _make_request(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Effectue une requête à l'API Spotify"""
-        self.rate_limiter.wait_if_needed()
+    def _get_headers(self) -> Dict[str, str]:
+        """Retourne les headers pour les requêtes API"""
+        if not self._authenticate():
+            raise APIError("Impossible de s'authentifier auprès de Spotify")
         
-        # S'assurer d'avoir un token valide
-        token = self._get_access_token()
-        
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
+        return {
+            'Authorization': f'Bearer {self.access_token}',
+            'Content-Type': 'application/json'
         }
-        
-        url = f"{self.base_url}/{endpoint.lstrip('/')}"
-        
-        try:
-            response = self.session.get(url, headers=headers, params=params)
-            
-            if response.status_code == 429:
-                # Rate limit atteint
-                retry_after = int(response.headers.get('Retry-After', 60))
-                raise RateLimitError(f"Rate limit Spotify, retry après {retry_after}s")
-            
-            response.raise_for_status()
-            return response.json()
-            
-        except requests.exceptions.RequestException as e:
-            raise ExtractionError(f"Erreur API Spotify: {e}")
     
-    def discover_artist_albums(self, artist_name: str) -> Dict[str, Any]:
+    @lru_cache(maxsize=128)
+    def discover_artist_tracks(self, artist_name: str, max_tracks: Optional[int] = None) -> SpotifyDiscoveryResult:
         """
-        Découvre tous les albums d'un artiste.
+        Découvre les morceaux d'un artiste sur Spotify avec cache LRU.
         
         Args:
-            artist_name: Nom de l'artiste
-        
+            artist_name: Nom de l'artiste à rechercher
+            max_tracks: Nombre maximum de morceaux à récupérer
+            
         Returns:
-            Dict contenant la discographie organisée
+            SpotifyDiscoveryResult avec les morceaux trouvés
         """
-        cache_key = f"spotify_discovery_albums_{artist_name}"
-        cached_result = self.cache_manager.get(cache_key)
-        
-        if cached_result:
-            self.logger.debug(f"Cache hit pour albums de {artist_name}")
-            return cached_result
+        start_time = time.time()
         
         try:
-            # 1. Rechercher l'artiste
-            artist_data = self._search_artist(artist_name)
+            normalized_artist = clean_artist_name(artist_name)
+            self.logger.info(f"🔍 Recherche Spotify pour: {normalized_artist}")
+            
+            # Vérification du cache
+            cache_key = f"spotify_discovery_{normalized_artist}_{max_tracks}"
+            
+            if self.cache_manager:
+                cached_result = self.cache_manager.get(cache_key)
+                if cached_result:
+                    self.performance_metrics['total_cache_hits'] += 1
+                    self.logger.info(f"💾 Cache hit Spotify pour {normalized_artist}")
+                    
+                    result = SpotifyDiscoveryResult(**cached_result)
+                    result.cache_hits = 1
+                    return result
+            
+            # Recherche de l'artiste
+            artist_data = self._search_artist(normalized_artist)
             if not artist_data:
-                raise ExtractionError(f"Artiste '{artist_name}' non trouvé sur Spotify")
+                return SpotifyDiscoveryResult(
+                    success=False,
+                    error=f"Artiste '{artist_name}' non trouvé sur Spotify",
+                    discovery_time_seconds=time.time() - start_time
+                )
             
-            artist_id = artist_data['id']
+            # Récupération des albums
+            albums = self._get_artist_albums(artist_data['id'])
             
-            # 2. Récupérer tous les albums
-            all_albums = self._get_artist_albums(artist_id)
+            # Récupération des top tracks
+            top_tracks = self._get_artist_top_tracks(artist_data['id'])
             
-            # 3. Organiser par type
-            organized_albums = self._organize_albums_by_type(all_albums)
+            # Récupération des tracks de tous les albums
+            all_tracks = []
+            for album in albums:
+                album_tracks = self._get_album_tracks(album['id'])
+                # Enrichir avec les infos de l'album
+                for track in album_tracks:
+                    track['album_info'] = album
+                all_tracks.extend(album_tracks)
             
-            # 4. Enrichir avec les détails et tracks
-            enriched_albums = self._enrich_albums_with_tracks(organized_albums)
+            # Ajouter les top tracks avec déduplication
+            existing_track_ids = {track.get('id') for track in all_tracks}
+            for track in top_tracks:
+                if track.get('id') not in existing_track_ids:
+                    all_tracks.append(track)
             
-            # 5. Construire le résultat final
-            result = {
-                'artist': artist_data,
-                'discovery_date': datetime.now().isoformat(),
-                'total_albums': len(all_albums),
-                'albums_by_type': {
-                    'studio_albums': enriched_albums.get('album', []),
-                    'singles': enriched_albums.get('single', []),
-                    'compilations': enriched_albums.get('compilation', []),
-                    'appears_on': enriched_albums.get('appears_on', [])
-                },
-                'statistics': self._calculate_discovery_stats(enriched_albums),
-                'metadata': {
-                    'include_singles': self.config['include_singles'],
-                    'include_compilations': self.config['include_compilations'],
-                    'include_appears_on': self.config['include_appears_on'],
-                    'market': self.config['market']
-                }
-            }
+            # Limiter si nécessaire
+            if max_tracks and len(all_tracks) > max_tracks:
+                # Trier par popularité décroissante
+                all_tracks.sort(key=lambda x: x.get('popularity', 0), reverse=True)
+                all_tracks = all_tracks[:max_tracks]
             
-            # Mettre en cache
-            self.cache_manager.set(cache_key, result, expire_days=1)  # Cache court pour la découverte
+            # Enrichissement final
+            enriched_tracks = self._enrich_tracks_metadata(all_tracks, artist_data)
             
-            self.logger.info(f"Découverte terminée pour {artist_name}: {result['total_albums']} albums trouvés")
+            # Création du résultat
+            discovery_time = time.time() - start_time
+            result = SpotifyDiscoveryResult(
+                success=True,
+                tracks=enriched_tracks,
+                albums=albums,
+                artist_info=artist_data,
+                api_calls_made=3 + len(albums),  # search + albums + top_tracks + album_tracks
+                discovery_time_seconds=discovery_time
+            )
+            
+            # Mise en cache
+            if self.cache_manager and result.success:
+                self.cache_manager.set(cache_key, result.__dict__, expire_hours=6)
+            
+            # Mise à jour des métriques
+            self._update_performance_metrics(result)
+            
+            self.logger.info(f"✅ Spotify: {result.total_found} morceaux trouvés "
+                           f"en {discovery_time:.2f}s")
             
             return result
             
+        except APIRateLimitError:
+            self.logger.warning("⚠️ Limite de taux API Spotify atteinte")
+            return SpotifyDiscoveryResult(
+                success=False,
+                error="Rate limit atteint",
+                discovery_time_seconds=time.time() - start_time
+            )
         except Exception as e:
-            self.logger.error(f"Erreur lors de la découverte pour {artist_name}: {e}")
-            raise
+            self.logger.error(f"❌ Erreur Spotify pour {artist_name}: {e}")
+            self.performance_metrics['error_count'] += 1
+            return SpotifyDiscoveryResult(
+                success=False,
+                error=str(e),
+                discovery_time_seconds=time.time() - start_time
+            )
     
     def _search_artist(self, artist_name: str) -> Optional[Dict[str, Any]]:
-        """Recherche un artiste sur Spotify"""
-        params = {
-            'q': f'artist:"{artist_name}"',
-            'type': 'artist',
-            'limit': 10
-        }
+        """
+        Recherche un artiste sur Spotify.
+        
+        Args:
+            artist_name: Nom de l'artiste
+            
+        Returns:
+            Données de l'artiste ou None
+        """
+        if self.rate_limiter:
+            self.rate_limiter.wait_if_needed()
         
         try:
-            response = self._make_request('search', params)
-            artists = response.get('artists', {}).get('items', [])
+            url = f"{self.base_url}/search"
+            params = {
+                'q': f'artist:"{artist_name}"',
+                'type': 'artist',
+                'limit': 1
+            }
             
-            if not artists:
-                # Tentative avec recherche moins restrictive
-                params['q'] = artist_name
-                response = self._make_request('search', params)
-                artists = response.get('artists', {}).get('items', [])
+            response = self.session.get(url, headers=self._get_headers(), params=params)
+            response.raise_for_status()
+            
+            self.performance_metrics['total_api_calls'] += 1
+            
+            data = response.json()
+            artists = data.get('artists', {}).get('items', [])
             
             if artists:
-                # Trouver la meilleure correspondance
-                best_match = self._find_best_artist_match(artists, artist_name)
-                return best_match
+                artist = artists[0]
+                # Vérification de similarité du nom
+                found_name = normalize_text(artist['name'])
+                search_name = normalize_text(artist_name)
+                
+                if found_name == search_name or search_name in found_name:
+                    self.logger.debug(f"✅ Artiste Spotify trouvé: {artist['name']}")
+                    return artist
             
+            self.logger.warning(f"⚠️ Artiste '{artist_name}' non trouvé sur Spotify")
             return None
             
-        except Exception as e:
-            self.logger.error(f"Erreur lors de la recherche d'artiste '{artist_name}': {e}")
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"❌ Erreur recherche artiste Spotify: {e}")
             return None
-    
-    def _find_best_artist_match(self, artists: List[Dict[str, Any]], target_name: str) -> Dict[str, Any]:
-        """Trouve la meilleure correspondance d'artiste"""
-        target_normalized = normalize_title(target_name)
-        
-        best_match = None
-        best_score = 0.0
-        
-        for artist in artists:
-            artist_name = artist.get('name', '')
-            artist_normalized = normalize_title(artist_name)
-            
-            # Score de similarité
-            score = self._calculate_name_similarity(artist_normalized, target_normalized)
-            
-            # Bonus pour la popularité (artistes plus connus = plus fiables)
-            popularity = artist.get('popularity', 0)
-            score += (popularity / 100) * 0.1  # Bonus max de 0.1
-            
-            # Bonus pour les genres rap/hip-hop
-            genres = artist.get('genres', [])
-            if any(genre in ['hip hop', 'rap', 'hip-hop'] for genre in genres):
-                score += 0.1
-            
-            if score > best_score:
-                best_score = score
-                best_match = artist
-        
-        return best_match
-    
-    def _calculate_name_similarity(self, name1: str, name2: str) -> float:
-        """Calcule la similarité entre deux noms d'artistes"""
-        if not name1 or not name2:
-            return 0.0
-        
-        # Correspondance exacte
-        if name1 == name2:
-            return 1.0
-        
-        # Correspondance par mots
-        words1 = set(name1.split())
-        words2 = set(name2.split())
-        
-        if not words1 or not words2:
-            return 0.0
-        
-        intersection = len(words1.intersection(words2))
-        union = len(words1.union(words2))
-        
-        return intersection / union if union > 0 else 0.0
     
     def _get_artist_albums(self, artist_id: str) -> List[Dict[str, Any]]:
-        """Récupère tous les albums d'un artiste"""
-        all_albums = []
+        """
+        Récupère tous les albums d'un artiste.
         
-        # Types d'albums à récupérer
-        album_types = ['album']
-        if self.config['include_singles']:
-            album_types.append('single')
-        if self.config['include_compilations']:
-            album_types.append('compilation')
-        if self.config['include_appears_on']:
-            album_types.append('appears_on')
+        Args:
+            artist_id: ID Spotify de l'artiste
+            
+        Returns:
+            Liste des albums
+        """
+        if self.rate_limiter:
+            self.rate_limiter.wait_if_needed()
         
-        for album_type in album_types:
-            albums = self._get_albums_by_type(artist_id, album_type)
-            all_albums.extend(albums)
-        
-        # Supprimer les doublons basés sur l'ID
-        seen_ids = set()
-        unique_albums = []
-        for album in all_albums:
-            if album['id'] not in seen_ids:
-                seen_ids.add(album['id'])
-                unique_albums.append(album)
-        
-        # Limiter le nombre d'albums
-        if len(unique_albums) > self.config['limit_albums']:
-            self.logger.warning(f"Limitation à {self.config['limit_albums']} albums (trouvés: {len(unique_albums)})")
-            unique_albums = unique_albums[:self.config['limit_albums']]
-        
-        return unique_albums
-    
-    def _get_albums_by_type(self, artist_id: str, album_type: str) -> List[Dict[str, Any]]:
-        """Récupère les albums d'un type spécifique"""
-        albums = []
-        offset = 0
-        limit = 50
-        
-        while True:
+        try:
+            url = f"{self.base_url}/artists/{artist_id}/albums"
             params = {
-                'include_groups': album_type,
-                'market': self.config['market'],
-                'limit': limit,
-                'offset': offset
+                'include_groups': 'album,single,compilation',
+                'market': 'FR',  # Marché français pour le rap français
+                'limit': 50
             }
             
-            try:
-                response = self._make_request(f'artists/{artist_id}/albums', params)
-                batch_albums = response.get('items', [])
-                
-                if not batch_albums:
-                    break
-                
-                albums.extend(batch_albums)
-                
-                # Vérifier s'il y a plus de résultats
-                if len(batch_albums) < limit:
-                    break
-                
-                offset += limit
-                
-                # Limite de sécurité
-                if offset >= 500:  # Max 500 albums par type
-                    self.logger.warning(f"Limite de sécurité atteinte pour {album_type}")
-                    break
-                
-            except Exception as e:
-                self.logger.error(f"Erreur lors de la récupération des albums {album_type}: {e}")
-                break
-        
-        return albums
-    
-    def _organize_albums_by_type(self, albums: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-        """Organise les albums par type"""
-        organized = {
-            'album': [],
-            'single': [],
-            'compilation': [],
-            'appears_on': []
-        }
-        
-        for album in albums:
-            album_type = album.get('album_type', 'album')
-            if album_type in organized:
-                organized[album_type].append(album)
-            else:
-                organized['album'].append(album)  # Par défaut dans albums
-        
-        # Trier chaque type par date de sortie (plus récent en premier)
-        for album_type in organized:
-            organized[album_type].sort(
-                key=lambda x: x.get('release_date', '0000-01-01'),
-                reverse=True
-            )
-        
-        return organized
-    
-    def _enrich_albums_with_tracks(self, organized_albums: Dict[str, List[Dict[str, Any]]]) -> Dict[str, List[Dict[str, Any]]]:
-        """Enrichit les albums avec leurs tracks"""
-        enriched = {}
-        
-        for album_type, albums in organized_albums.items():
-            enriched[album_type] = []
+            response = self.session.get(url, headers=self._get_headers(), params=params)
+            response.raise_for_status()
             
-            for album in albums:
-                try:
-                    # Récupérer les détails complets de l'album
-                    detailed_album = self._get_album_details(album['id'])
-                    
-                    if detailed_album:
-                        # Récupérer les tracks
-                        tracks = self._get_album_tracks(album['id'])
-                        detailed_album['tracks'] = tracks
-                        detailed_album['total_tracks'] = len(tracks)
-                        
-                        # Calculer la durée totale
-                        total_duration_ms = sum(track.get('duration_ms', 0) for track in tracks)
-                        detailed_album['total_duration_ms'] = total_duration_ms
-                        detailed_album['total_duration_formatted'] = self._format_duration(total_duration_ms)
-                        
-                        # Ajouter des métadonnées de découverte
-                        detailed_album['discovery_metadata'] = {
-                            'discovered_at': datetime.now().isoformat(),
-                            'source': 'spotify_discovery',
-                            'original_album_type': album.get('album_type'),
-                            'market': self.config['market']
-                        }
-                        
-                        enriched[album_type].append(detailed_album)
-                    
-                except Exception as e:
-                    self.logger.warning(f"Erreur lors de l'enrichissement de l'album {album.get('name', 'Unknown')}: {e}")
-                    # Ajouter l'album sans enrichissement
-                    enriched[album_type].append(album)
-        
-        return enriched
-    
-    def _get_album_details(self, album_id: str) -> Optional[Dict[str, Any]]:
-        """Récupère les détails complets d'un album"""
-        try:
-            params = {'market': self.config['market']}
-            response = self._make_request(f'albums/{album_id}', params)
-            return response
-        except Exception as e:
-            self.logger.error(f"Erreur lors de la récupération des détails de l'album {album_id}: {e}")
-            return None
-    
-    def _get_album_tracks(self, album_id: str) -> List[Dict[str, Any]]:
-        """Récupère toutes les tracks d'un album"""
-        tracks = []
-        offset = 0
-        limit = 50
-        
-        while True:
-            params = {
-                'market': self.config['market'],
-                'limit': limit,
-                'offset': offset
-            }
+            self.performance_metrics['total_api_calls'] += 1
             
-            try:
-                response = self._make_request(f'albums/{album_id}/tracks', params)
-                batch_tracks = response.get('items', [])
-                
-                if not batch_tracks:
-                    break
-                
-                # Enrichir chaque track avec des métadonnées
-                for track in batch_tracks:
-                    enriched_track = self._enrich_track_data(track)
-                    tracks.append(enriched_track)
-                
-                if len(batch_tracks) < limit:
-                    break
-                
-                offset += limit
-                
-            except Exception as e:
-                self.logger.error(f"Erreur lors de la récupération des tracks de l'album {album_id}: {e}")
-                break
-        
-        return tracks
-    
-    def _enrich_track_data(self, track: Dict[str, Any]) -> Dict[str, Any]:
-        """Enrichit les données d'un track"""
-        enriched = track.copy()
-        
-        # Artistes principaux et featuring
-        artists = track.get('artists', [])
-        if artists:
-            enriched['primary_artist'] = artists[0]['name']
-            enriched['all_artists'] = [artist['name'] for artist in artists]
+            data = response.json()
+            albums = data.get('items', [])
             
-            # Détecter les featuring
-            featuring_artists = extract_featuring_artists(track.get('name', ''))
-            if featuring_artists:
-                enriched['featuring_artists'] = featuring_artists
-        
-        # Durée formatée
-        duration_ms = track.get('duration_ms', 0)
-        enriched['duration_formatted'] = self._format_duration(duration_ms)
-        enriched['duration_seconds'] = duration_ms // 1000 if duration_ms else 0
-        
-        # Analyse du titre pour extraire des infos
-        title_analysis = self._analyze_track_title(track.get('name', ''))
-        enriched.update(title_analysis)
-        
-        # URLs et métadonnées
-        enriched['spotify_url'] = track.get('external_urls', {}).get('spotify', '')
-        enriched['preview_url'] = track.get('preview_url', '')
-        
-        # Numéro de track
-        enriched['track_number'] = track.get('track_number', 0)
-        enriched['disc_number'] = track.get('disc_number', 1)
-        
-        # Disponibilité
-        enriched['is_playable'] = track.get('is_playable', True)
-        enriched['explicit'] = track.get('explicit', False)
-        
-        return enriched
-    
-    def _analyze_track_title(self, title: str) -> Dict[str, Any]:
-        """Analyse le titre d'un track pour extraire des informations"""
-        analysis = {}
-        
-        # Détecter les remix, versions spéciales, etc.
-        title_lower = title.lower()
-        
-        # Types de versions
-        if any(word in title_lower for word in ['remix', 'rmx', 'rework']):
-            analysis['is_remix'] = True
-            analysis['version_type'] = 'remix'
-        elif any(word in title_lower for word in ['acoustic', 'unplugged']):
-            analysis['is_acoustic'] = True
-            analysis['version_type'] = 'acoustic'
-        elif any(word in title_lower for word in ['live', 'concert']):
-            analysis['is_live'] = True
-            analysis['version_type'] = 'live'
-        elif any(word in title_lower for word in ['instrumental', 'inst']):
-            analysis['is_instrumental'] = True
-            analysis['version_type'] = 'instrumental'
-        elif any(word in title_lower for word in ['extended', 'extended mix', 'ext']):
-            analysis['is_extended'] = True
-            analysis['version_type'] = 'extended'
-        else:
-            analysis['version_type'] = 'original'
-        
-        # Détecter les featuring dans le titre
-        featuring_match = re.search(r'\(feat\.?\s+([^)]+)\)', title, re.IGNORECASE)
-        if featuring_match:
-            analysis['featuring_in_title'] = featuring_match.group(1)
-        
-        # Nettoyer le titre de base
-        clean_title = re.sub(r'\s*\([^)]*\)\s*', '', title)  # Supprimer parenthèses
-        clean_title = re.sub(r'\s*\[[^\]]*\]\s*', '', clean_title)  # Supprimer crochets
-        analysis['clean_title'] = clean_title.strip()
-        
-        return analysis
-    
-    def _calculate_discovery_stats(self, enriched_albums: Dict[str, List[Dict[str, Any]]]) -> Dict[str, Any]:
-        """Calcule les statistiques de découverte"""
-        stats = {
-            'total_albums': 0,
-            'total_tracks': 0,
-            'total_duration_ms': 0,
-            'albums_by_type': {},
-            'years_span': {},
-            'earliest_release': None,
-            'latest_release': None,
-            'average_tracks_per_album': 0.0,
-            'average_album_duration_minutes': 0.0
-        }
-        
-        all_albums = []
-        for album_type, albums in enriched_albums.items():
-            stats['albums_by_type'][album_type] = len(albums)
-            stats['total_albums'] += len(albums)
-            all_albums.extend(albums)
-        
-        if not all_albums:
-            return stats
-        
-        # Calculs détaillés
-        total_tracks = 0
-        total_duration = 0
-        release_years = []
-        
-        for album in all_albums:
-            # Tracks
-            album_tracks = len(album.get('tracks', []))
-            total_tracks += album_tracks
+            self.logger.debug(f"📀 {len(albums)} albums trouvés sur Spotify")
+            return albums
             
-            # Durée
-            album_duration = album.get('total_duration_ms', 0)
-            total_duration += album_duration
-            
-            # Années
-            release_date = album.get('release_date', '')
-            if release_date and len(release_date) >= 4:
-                try:
-                    year = int(release_date[:4])
-                    release_years.append(year)
-                except ValueError:
-                    pass
-        
-        stats['total_tracks'] = total_tracks
-        stats['total_duration_ms'] = total_duration
-        
-        # Moyennes
-        if stats['total_albums'] > 0:
-            stats['average_tracks_per_album'] = total_tracks / stats['total_albums']
-            stats['average_album_duration_minutes'] = (total_duration / 1000 / 60) / stats['total_albums']
-        
-        # Années
-        if release_years:
-            stats['earliest_release'] = min(release_years)
-            stats['latest_release'] = max(release_years)
-            stats['career_span_years'] = max(release_years) - min(release_years)
-            
-            # Distribution par décennie
-            decade_counts = {}
-            for year in release_years:
-                decade = (year // 10) * 10
-                decade_counts[f"{decade}s"] = decade_counts.get(f"{decade}s", 0) + 1
-            stats['albums_by_decade'] = decade_counts
-        
-        # Durée totale formatée
-        stats['total_duration_formatted'] = self._format_duration(total_duration)
-        
-        return stats
-    
-    def _format_duration(self, duration_ms: int) -> str:
-        """Formate une durée en millisecondes vers HH:MM:SS ou MM:SS"""
-        if not duration_ms:
-            return "0:00"
-        
-        total_seconds = duration_ms // 1000
-        hours = total_seconds // 3600
-        minutes = (total_seconds % 3600) // 60
-        seconds = total_seconds % 60
-        
-        if hours > 0:
-            return f"{hours}:{minutes:02d}:{seconds:02d}"
-        else:
-            return f"{minutes}:{seconds:02d}"
-    
-    def get_artist_top_tracks(self, artist_id: str, market: str = 'US') -> List[Dict[str, Any]]:
-        """Récupère les top tracks d'un artiste"""
-        try:
-            params = {'market': market}
-            response = self._make_request(f'artists/{artist_id}/top-tracks', params)
-            
-            tracks = response.get('tracks', [])
-            
-            # Enrichir les tracks
-            enriched_tracks = []
-            for track in tracks:
-                enriched_track = self._enrich_track_data(track)
-                enriched_track['popularity'] = track.get('popularity', 0)
-                enriched_tracks.append(enriched_track)
-            
-            return enriched_tracks
-            
-        except Exception as e:
-            self.logger.error(f"Erreur lors de la récupération des top tracks pour {artist_id}: {e}")
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"❌ Erreur récupération albums Spotify: {e}")
             return []
     
-    def search_track_by_name(self, artist_name: str, track_name: str) -> Optional[Dict[str, Any]]:
-        """Recherche un track spécifique par nom d'artiste et titre"""
-        params = {
-            'q': f'artist:"{artist_name}" track:"{track_name}"',
-            'type': 'track',
-            'limit': 10,
-            'market': self.config['market']
-        }
+    def _get_artist_top_tracks(self, artist_id: str) -> List[Dict[str, Any]]:
+        """
+        Récupère les top tracks d'un artiste.
+        
+        Args:
+            artist_id: ID Spotify de l'artiste
+            
+        Returns:
+            Liste des top tracks
+        """
+        if self.rate_limiter:
+            self.rate_limiter.wait_if_needed()
         
         try:
-            response = self._make_request('search', params)
-            tracks = response.get('tracks', {}).get('items', [])
+            url = f"{self.base_url}/artists/{artist_id}/top-tracks"
+            params = {'market': 'FR'}
             
-            if not tracks:
-                # Recherche moins restrictive
-                params['q'] = f'"{artist_name}" "{track_name}"'
-                response = self._make_request('search', params)
-                tracks = response.get('tracks', {}).get('items', [])
+            response = self.session.get(url, headers=self._get_headers(), params=params)
+            response.raise_for_status()
             
-            if tracks:
-                # Trouver la meilleure correspondance
-                best_match = self._find_best_track_match(tracks, artist_name, track_name)
-                if best_match:
-                    return self._enrich_track_data(best_match)
+            self.performance_metrics['total_api_calls'] += 1
             
-            return None
+            data = response.json()
+            tracks = data.get('tracks', [])
             
-        except Exception as e:
-            self.logger.error(f"Erreur lors de la recherche du track '{track_name}' par {artist_name}: {e}")
-            return None
+            self.logger.debug(f"🔥 {len(tracks)} top tracks trouvés sur Spotify")
+            return tracks
+            
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"❌ Erreur récupération top tracks Spotify: {e}")
+            return []
     
-    def _find_best_track_match(self, tracks: List[Dict[str, Any]], target_artist: str, target_track: str) -> Optional[Dict[str, Any]]:
-        """Trouve la meilleure correspondance de track"""
-        target_artist_norm = normalize_title(target_artist)
-        target_track_norm = normalize_title(target_track)
+    def _get_album_tracks(self, album_id: str) -> List[Dict[str, Any]]:
+        """
+        Récupère toutes les tracks d'un album.
         
-        best_match = None
-        best_score = 0.0
+        Args:
+            album_id: ID Spotify de l'album
+            
+        Returns:
+            Liste des tracks de l'album
+        """
+        if self.rate_limiter:
+            self.rate_limiter.wait_if_needed()
+        
+        try:
+            url = f"{self.base_url}/albums/{album_id}/tracks"
+            params = {'market': 'FR', 'limit': 50}
+            
+            response = self.session.get(url, headers=self._get_headers(), params=params)
+            response.raise_for_status()
+            
+            self.performance_metrics['total_api_calls'] += 1
+            
+            data = response.json()
+            tracks = data.get('items', [])
+            
+            return tracks
+            
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"❌ Erreur récupération tracks album Spotify: {e}")
+            return []
+    
+    def _enrich_tracks_metadata(self, tracks: List[Dict[str, Any]], artist_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Enrichit les métadonnées des tracks avec les informations Spotify.
+        
+        Args:
+            tracks: Liste des tracks brutes
+            artist_data: Données de l'artiste principal
+            
+        Returns:
+            Tracks enrichies
+        """
+        enriched_tracks = []
         
         for track in tracks:
-            # Score basé sur l'artiste
-            artists = track.get('artists', [])
-            artist_score = 0.0
-            for artist in artists:
-                artist_name_norm = normalize_title(artist['name'])
-                similarity = self._calculate_name_similarity(artist_name_norm, target_artist_norm)
-                artist_score = max(artist_score, similarity)
-            
-            # Score basé sur le titre
-            track_name_norm = normalize_title(track.get('name', ''))
-            track_score = self._calculate_name_similarity(track_name_norm, target_track_norm)
-            
-            # Score total (artiste 40%, titre 60%)
-            total_score = (artist_score * 0.4) + (track_score * 0.6)
-            
-            # Bonus pour la popularité
-            popularity = track.get('popularity', 0)
-            total_score += (popularity / 100) * 0.1
-            
-            if total_score > best_score:
-                best_score = total_score
-                best_match = track
+            try:
+                enriched_track = {
+                    # Identifiants Spotify
+                    'spotify_id': track.get('id'),
+                    'spotify_uri': track.get('uri'),
+                    'spotify_url': track.get('external_urls', {}).get('spotify'),
+                    
+                    # Données de base
+                    'title': track.get('name', ''),
+                    'track_number': track.get('track_number'),
+                    'disc_number': track.get('disc_number', 1),
+                    'duration_ms': track.get('duration_ms'),
+                    'duration_seconds': track.get('duration_ms', 0) // 1000 if track.get('duration_ms') else None,
+                    'explicit': track.get('explicit', False),
+                    'popularity': track.get('popularity', 0),
+                    'preview_url': track.get('preview_url'),
+                    
+                    # Artiste principal
+                    'primary_artist': {
+                        'spotify_id': artist_data.get('id'),
+                        'name': artist_data.get('name', ''),
+                        'spotify_url': artist_data.get('external_urls', {}).get('spotify'),
+                        'followers': artist_data.get('followers', {}).get('total', 0),
+                        'popularity': artist_data.get('popularity', 0),
+                        'genres': artist_data.get('genres', [])
+                    },
+                    
+                    # Artistes supplémentaires (features)
+                    'featured_artists': [
+                        {
+                            'spotify_id': artist.get('id'),
+                            'name': artist.get('name', ''),
+                            'spotify_url': artist.get('external_urls', {}).get('spotify')
+                        }
+                        for artist in track.get('artists', [])[1:]  # Exclure l'artiste principal
+                    ],
+                    
+                    # Informations d'album
+                    'album': self._extract_album_info(track),
+                    
+                    # Métadonnées Spotify
+                    'is_local': track.get('is_local', False),
+                    'is_playable': track.get('is_playable', True),
+                    'markets': track.get('available_markets', []),
+                    
+                    # Source et qualité
+                    'data_source': DataSource.SPOTIFY.value,
+                    'quality_level': self._assess_spotify_track_quality(track),
+                    
+                    # Timestamp d'extraction
+                    'extracted_at': datetime.now().isoformat(),
+                    'extraction_source': 'spotify_api'
+                }
+                
+                enriched_tracks.append(enriched_track)
+                
+            except Exception as e:
+                self.logger.warning(f"⚠️ Erreur enrichissement track Spotify: {e}")
+                continue
         
-        # Retourner seulement si le score est suffisant
-        return best_match if best_score >= 0.6 else None
+        self.logger.debug(f"🔍 {len(enriched_tracks)}/{len(tracks)} tracks Spotify enrichies")
+        return enriched_tracks
     
-    def get_album_by_id(self, album_id: str) -> Optional[Dict[str, Any]]:
-        """Récupère un album par son ID Spotify"""
+    def _extract_album_info(self, track: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Extrait les informations d'album d'une track.
+        
+        Args:
+            track: Données de la track
+            
+        Returns:
+            Informations d'album ou None
+        """
+        album_data = track.get('album') or track.get('album_info')
+        
+        if not album_data:
+            return None
+        
+        return {
+            'spotify_id': album_data.get('id'),
+            'name': album_data.get('name', ''),
+            'spotify_url': album_data.get('external_urls', {}).get('spotify'),
+            'album_type': album_data.get('album_type', ''),
+            'release_date': album_data.get('release_date', ''),
+            'release_date_precision': album_data.get('release_date_precision', ''),
+            'total_tracks': album_data.get('total_tracks', 0),
+            'images': album_data.get('images', []),
+            'cover_art_url': album_data.get('images', [{}])[0].get('url', '') if album_data.get('images') else ''
+        }
+    
+    @lru_cache(maxsize=128)
+    def _assess_spotify_track_quality(self, track: Dict[str, Any]) -> str:
+        """
+        Évalue la qualité des données d'une track Spotify avec cache.
+        
+        Args:
+            track: Données de la track
+            
+        Returns:
+            Niveau de qualité
+        """
+        score = 0
+        
+        # Critères de qualité Spotify
+        if track.get('popularity', 0) > 50:
+            score += 3
+        elif track.get('popularity', 0) > 20:
+            score += 2
+        elif track.get('popularity', 0) > 0:
+            score += 1
+        
+        if track.get('preview_url'):
+            score += 2
+        
+        if track.get('duration_ms') and track.get('duration_ms') > 30000:  # Plus de 30 secondes
+            score += 1
+        
+        if track.get('album'):
+            score += 2
+        
+        if not track.get('explicit'):  # Préférence pour le contenu non explicite
+            score += 1
+        
+        if track.get('is_playable', True):
+            score += 1
+        
+        # Classification par score
+        if score >= 8:
+            return QualityLevel.HIGH.value
+        elif score >= 5:
+            return QualityLevel.MEDIUM.value
+        else:
+            return QualityLevel.LOW.value
+    
+    def _update_performance_metrics(self, result: SpotifyDiscoveryResult) -> None:
+        """Met à jour les métriques de performance globales"""
+        self.performance_metrics['total_api_calls'] += result.api_calls_made
+        self.performance_metrics['total_cache_hits'] += result.cache_hits
+        self.performance_metrics['total_tracks_found'] += result.total_found
+        
+        # Mise à jour de la moyenne du temps de réponse
+        current_avg = self.performance_metrics['average_response_time']
+        new_time = result.discovery_time_seconds
+        
+        if current_avg == 0:
+            self.performance_metrics['average_response_time'] = new_time
+        else:
+            self.performance_metrics['average_response_time'] = (current_avg + new_time) / 2
+    
+    # ===== MÉTHODES UTILITAIRES =====
+    
+    @lru_cache(maxsize=1)
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Retourne les statistiques de performance avec cache"""
+        total_requests = (self.performance_metrics['total_api_calls'] + 
+                         self.performance_metrics['total_cache_hits'])
+        
+        return {
+            'total_api_calls': self.performance_metrics['total_api_calls'],
+            'total_cache_hits': self.performance_metrics['total_cache_hits'],
+            'cache_hit_rate': (self.performance_metrics['total_cache_hits'] / max(total_requests, 1)) * 100,
+            'total_tracks_found': self.performance_metrics['total_tracks_found'],
+            'authentication_count': self.performance_metrics['authentication_count'],
+            'average_response_time': self.performance_metrics['average_response_time'],
+            'error_count': self.performance_metrics['error_count'],
+            'tracks_per_api_call': (self.performance_metrics['total_tracks_found'] / 
+                                  max(self.performance_metrics['total_api_calls'], 1)),
+            'token_valid': self.access_token is not None and 
+                          self.token_expires_at is not None and 
+                          datetime.now() < self.token_expires_at
+        }
+    
+    def reset_performance_stats(self) -> None:
+        """Remet à zéro les statistiques de performance"""
+        self.performance_metrics = {
+            'total_api_calls': 0,
+            'total_cache_hits': 0,
+            'total_tracks_found': 0,
+            'authentication_count': 0,
+            'average_response_time': 0.0,
+            'error_count': 0
+        }
+        
+        # Vider le cache LRU
+        self.discover_artist_tracks.cache_clear()
+        self._assess_spotify_track_quality.cache_clear()
+        self.get_performance_stats.cache_clear()
+        
+        self.logger.info("📊 Statistiques Spotify réinitialisées")
+    
+    def test_connection(self) -> Tuple[bool, str]:
+        """
+        Teste la connexion à l'API Spotify.
+        
+        Returns:
+            Tuple (succès, message)
+        """
         try:
-            album = self._get_album_details(album_id)
-            if album:
-                tracks = self._get_album_tracks(album_id)
-                album['tracks'] = tracks
-                album['total_tracks'] = len(tracks)
+            # Test d'authentification
+            auth_success = self._authenticate()
+            if not auth_success:
+                return False, "Échec de l'authentification Spotify"
+            
+            # Test de requête simple
+            url = f"{self.base_url}/search"
+            params = {'q': 'test', 'type': 'artist', 'limit': 1}
+            
+            response = self.session.get(url, headers=self._get_headers(), params=params, timeout=10)
+            response.raise_for_status()
+            
+            return True, "Connexion Spotify API réussie"
+            
+        except requests.exceptions.RequestException as e:
+            return False, f"Erreur connexion Spotify API: {e}"
+    
+    def get_audio_features(self, track_ids: List[str]) -> List[Dict[str, Any]]:
+        """
+        Récupère les caractéristiques audio des tracks (BPM, clé, etc.).
+        
+        Args:
+            track_ids: Liste des IDs Spotify des tracks
+            
+        Returns:
+            Liste des caractéristiques audio
+        """
+        if not track_ids:
+            return []
+        
+        try:
+            # Spotify permet jusqu'à 100 tracks par requête
+            batch_size = 100
+            all_features = []
+            
+            for i in range(0, len(track_ids), batch_size):
+                batch_ids = track_ids[i:i + batch_size]
                 
-                # Calculer la durée totale
-                total_duration_ms = sum(track.get('duration_ms', 0) for track in tracks)
-                album['total_duration_ms'] = total_duration_ms
-                album['total_duration_formatted'] = self._format_duration(total_duration_ms)
+                if self.rate_limiter:
+                    self.rate_limiter.wait_if_needed()
                 
-                return album
-            return None
+                url = f"{self.base_url}/audio-features"
+                params = {'ids': ','.join(batch_ids)}
+                
+                response = self.session.get(url, headers=self._get_headers(), params=params)
+                response.raise_for_status()
+                
+                data = response.json()
+                features = data.get('audio_features', [])
+                all_features.extend([f for f in features if f])  # Exclure les None
+                
+                self.performance_metrics['total_api_calls'] += 1
+            
+            self.logger.debug(f"🎵 Caractéristiques audio récupérées pour {len(all_features)} tracks")
+            return all_features
+            
         except Exception as e:
-            self.logger.error(f"Erreur lors de la récupération de l'album {album_id}: {e}")
-            return None
+            self.logger.error(f"❌ Erreur récupération audio features: {e}")
+            return []
+    
+    def __repr__(self) -> str:
+        """Représentation string de l'instance"""
+        stats = self.get_performance_stats()
+        return (f"SpotifyDiscovery(api_calls={stats['total_api_calls']}, "
+                f"tracks_found={stats['total_tracks_found']}, "
+                f"cache_hit_rate={stats['cache_hit_rate']:.1f}%, "
+                f"token_valid={stats['token_valid']})")
+
+
+# ===== FONCTIONS UTILITAIRES MODULE =====
+
+def create_spotify_discovery() -> Optional[SpotifyDiscovery]:
+    """
+    Factory function pour créer une instance SpotifyDiscovery.
+    
+    Returns:
+        Instance SpotifyDiscovery ou None si échec
+    """
+    try:
+        return SpotifyDiscovery()
+    except Exception as e:
+        logging.getLogger(__name__).error(f"❌ Impossible de créer SpotifyDiscovery: {e}")
+        return None
+
+
+def test_spotify_api() -> Dict[str, Any]:
+    """
+    Teste l'API Spotify et retourne un rapport de diagnostic.
+    
+    Returns:
+        Dictionnaire avec les résultats du test
+    """
+    logger = logging.getLogger(__name__)
+    
+    try:
+        discovery = create_spotify_discovery()
+        if not discovery:
+            return {
+                'success': False,
+                'error': 'Impossible de créer une instance SpotifyDiscovery',
+                'api_available': False
+            }
+        
+        # Test de connexion
+        connection_ok, connection_msg = discovery.test_connection()
+        
+        # Test de recherche simple
+        test_result = None
+        if connection_ok:
+            try:
+                test_result = discovery.discover_artist_tracks("Eminem", max_tracks=1)
+            except Exception as e:
+                test_result = SpotifyDiscoveryResult(success=False, error=str(e))
+        
+        return {
+            'success': connection_ok and (test_result.success if test_result else False),
+            'connection_status': connection_msg,
+            'api_available': connection_ok,
+            'test_search_success': test_result.success if test_result else False,
+            'test_tracks_found': test_result.total_found if test_result else 0,
+            'performance_stats': discovery.get_performance_stats(),
+            'credentials_configured': bool(settings.spotify_client_id and settings.spotify_client_secret)
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur test Spotify API: {e}")
+        return {
+            'success': False,
+            'error': str(e),
+            'api_available': False
+        }

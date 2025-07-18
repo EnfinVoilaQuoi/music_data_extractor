@@ -1,8 +1,14 @@
 # extractors/web_scrapers/rapedia_scraper.py
+"""
+Scraper optimisé pour Rapedia.fr - source très fiable pour le rap français.
+Version optimisée avec cache intelligent, parsing avancé et gestion d'erreurs robuste.
+"""
+
 import logging
 import time
 import re
-from typing import Dict, List, Optional, Any, Union
+from functools import lru_cache
+from typing import Dict, List, Optional, Any, Union, Tuple
 from urllib.parse import urljoin, quote
 from datetime import datetime
 
@@ -11,698 +17,1175 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from ...core.exceptions import ScrapingError, PageNotFoundError, ElementNotFoundError
-from ...core.rate_limiter import RateLimiter
-from ...core.cache import CacheManager
-from ...config.settings import settings
-from ...utils.text_utils import normalize_text, normalize_text, clean_artist_name
-from ...models.enums import DataSource, CreditType, CreditCategory
+# Imports absolus
+from core.exceptions import ScrapingError, PageNotFoundError, ElementNotFoundError
+from core.rate_limiter import RateLimiter
+from core.cache import CacheManager
+from config.settings import settings
+from utils.text_utils import normalize_text, clean_artist_name
+from models.enums import DataSource, CreditType, CreditCategory
+
 
 class RapediaScraper:
     """
-    Scraper spécialisé pour Rapedia.fr - source très fiable pour le rap français.
+    Scraper spécialisé optimisé pour Rapedia.fr - source très fiable pour le rap français.
     
     Rapedia.fr contient des informations détaillées et vérifiées sur le rap français,
     incluant des crédits précis, des dates de sortie, et des collaborations.
+    
+    Fonctionnalités optimisées :
+    - Cache intelligent pour éviter les requêtes répétées
+    - Parsing avancé avec patterns spécifiques au rap français
+    - Rate limiting respectueux du site
+    - Gestion robuste des erreurs avec retry
+    - Extraction complète des métadonnées
+    - Déduplication intelligente des résultats
     """
     
     def __init__(self):
         self.logger = logging.getLogger(__name__)
         
-        # Configuration
+        # Configuration optimisée
         self.base_url = "https://rapedia.fr"
         self.search_url = f"{self.base_url}/rechercher"
         
         # Headers pour éviter la détection de bot
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
             "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-            "Accept-Encoding": "gzip, deflate",
+            "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none"
         }
         
-        # Composants
-        self.rate_limiter = RateLimiter(requests_per_period=10, period_seconds=60)  # Respectueux
-        self.cache_manager = CacheManager()
+        # Composants optimisés
+        self.rate_limiter = RateLimiter(requests_per_period=15, period_seconds=60)  # Respectueux
+        self.cache_manager = CacheManager() if CacheManager else None
         
-        # Session HTTP avec retry
-        self.session = self._create_session()
+        # Session HTTP optimisée avec retry
+        self.session = self._create_optimized_session()
         
-        # Patterns de reconnaissance spécifiques à Rapedia
-        self.rapedia_patterns = {
-            'producer_patterns': [
-                r'(?:Produit par|Production[:\s]*|Prod[.\s]*:?\s*|Beat[:\s]*)(.*?)(?:\n|$|;)',
-                r'(?:Réalisé par|Réalisation[:\s]*)(.*?)(?:\n|$|;)',
-                r'(?:Instrumental[:\s]*)(.*?)(?:\n|$|;)'
-            ],
-            'featuring_patterns': [
-                r'(?:feat\.?\s*|featuring\s*|avec\s*)(.*?)(?:\n|$|;)',
-                r'(?:en duo avec|collaboration avec)(.*?)(?:\n|$|;)'
-            ],
-            'credit_patterns': [
-                r'(?:Mix[:\s]*|Mixage[:\s]*)(.*?)(?:\n|$|;)',
-                r'(?:Master[:\s]*|Mastering[:\s]*)(.*?)(?:\n|$|;)',
-                r'(?:Enregistrement[:\s]*|Recording[:\s]*)(.*?)(?:\n|$|;)',
-                r'(?:Paroles[:\s]*|Lyrics[:\s]*)(.*?)(?:\n|$|;)'
-            ]
-        }
+        # Patterns de reconnaissance spécifiques à Rapedia et au rap français
+        self.rapedia_patterns = self._compile_rapedia_patterns()
         
-        # Cache des pages visitées pour éviter les requêtes répétées
+        # Cache pour éviter les recalculs
         self._visited_pages = set()
+        self._artist_cache = {}
+        self._pattern_cache = {}
         
-        self.logger.info("RapediaScraper initialisé")
+        # Statistiques de performance
+        self.stats = {
+            'searches_performed': 0,
+            'pages_scraped': 0,
+            'tracks_found': 0,
+            'credits_extracted': 0,
+            'cache_hits': 0,
+            'failed_requests': 0,
+            'total_time_spent': 0.0
+        }
+        
+        self.logger.info("✅ RapediaScraper optimisé initialisé - spécialisé rap français")
     
-    def _create_session(self) -> requests.Session:
-        """Crée une session HTTP avec retry automatique"""
+    def _create_optimized_session(self) -> requests.Session:
+        """Crée une session HTTP optimisée avec retry et timeout"""
         session = requests.Session()
         
+        # Configuration du retry avec backoff exponentiel
         retry_strategy = Retry(
             total=3,
             backoff_factor=2,
             status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"]
         )
         
         adapter = HTTPAdapter(max_retries=retry_strategy)
         session.mount("http://", adapter)
         session.mount("https://", adapter)
+        
         session.headers.update(self.headers)
+        session.timeout = 30
         
         return session
     
-    def search_artist(self, artist_name: str) -> List[Dict[str, Any]]:
+    @lru_cache(maxsize=1)
+    def _compile_rapedia_patterns(self) -> Dict[str, List[re.Pattern]]:
         """
-        Recherche un artiste sur Rapedia.
+        Compile les patterns de reconnaissance spécifiques à Rapedia avec cache.
+        
+        Returns:
+            Dictionnaire des patterns compilés
+        """
+        patterns = {
+            'producer_patterns': [
+                r'(?:Produit par|Production[:\s]*|Prod[.\s]*:?\s*|Beat[:\s]*)(.*?)(?:\n|$|;)',
+                r'(?:Réalisé par|Réalisation[:\s]*)(.*?)(?:\n|$|;)',
+                r'(?:Instrumental[:\s]*)(.*?)(?:\n|$|;)',
+                r'(?:Beatmaker[:\s]*)(.*?)(?:\n|$|;)'
+            ],
+            'featuring_patterns': [
+                r'(?:feat\.?\s*|featuring\s*|avec\s*)(.*?)(?:\n|$|;)',
+                r'(?:en duo avec|collaboration avec)(.*?)(?:\n|$|;)',
+                r'(?:invité[:\s]*)(.*?)(?:\n|$|;)'
+            ],
+            'engineering_patterns': [
+                r'(?:Mix[:\s]*|Mixage[:\s]*)(.*?)(?:\n|$|;)',
+                r'(?:Master[:\s]*|Mastering[:\s]*)(.*?)(?:\n|$|;)',
+                r'(?:Enregistrement[:\s]*|Recording[:\s]*)(.*?)(?:\n|$|;)',
+                r'(?:Prise de son[:\s]*)(.*?)(?:\n|$|;)'
+            ],
+            'writing_patterns': [
+                r'(?:Paroles[:\s]*|Lyrics[:\s]*)(.*?)(?:\n|$|;)',
+                r'(?:Texte[:\s]*)(.*?)(?:\n|$|;)',
+                r'(?:Écrit par[:\s]*)(.*?)(?:\n|$|;)',
+                r'(?:Compositeur[:\s]*)(.*?)(?:\n|$|;)'
+            ],
+            'label_patterns': [
+                r'(?:Label[:\s]*|Maison de disque[:\s]*)(.*?)(?:\n|$|;)',
+                r'(?:Distribué par[:\s]*)(.*?)(?:\n|$|;)'
+            ],
+            'date_patterns': [
+                r'(?:Sortie[:\s]*|Date de sortie[:\s]*)(.*?)(?:\n|$|;)',
+                r'(?:Publié le[:\s]*)(.*?)(?:\n|$|;)',
+                r'(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4})',
+                r'(\d{4})'
+            ]
+        }
+        
+        # Compilation avec cache
+        compiled_patterns = {}
+        for category, pattern_list in patterns.items():
+            compiled_patterns[category] = [
+                re.compile(pattern, re.IGNORECASE | re.MULTILINE) for pattern in pattern_list
+            ]
+        
+        return compiled_patterns
+    
+    def search_artist_tracks(self, artist_name: str, max_tracks: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Recherche les morceaux d'un artiste sur Rapedia avec optimisations.
         
         Args:
             artist_name: Nom de l'artiste à rechercher
+            max_tracks: Nombre maximum de morceaux à récupérer
             
         Returns:
-            Liste des résultats de recherche avec URLs et métadonnées
+            Liste des morceaux trouvés avec métadonnées complètes
         """
-        cache_key = f"rapedia_search_{clean_artist_name(artist_name)}"
-        
-        # Vérification du cache
-        cached_result = self.cache_manager.get(cache_key)
-        if cached_result:
-            self.logger.debug(f"Résultats de recherche en cache pour {artist_name}")
-            return cached_result
+        start_time = time.time()
         
         try:
-            self.logger.info(f"Recherche de '{artist_name}' sur Rapedia")
+            normalized_artist = clean_artist_name(artist_name)
+            self.logger.info(f"🔍 Recherche Rapedia pour: {normalized_artist}")
             
-            # Respecter le rate limiting
-            self.rate_limiter.wait_if_needed('rapedia')
+            # Vérification du cache
+            cache_key = f"rapedia_search_{normalized_artist}_{max_tracks}"
             
-            # Effectuer la recherche
-            search_params = {
-                'q': artist_name,
-                'type': 'artiste'
-            }
+            if self.cache_manager:
+                cached_result = self.cache_manager.get(cache_key)
+                if cached_result:
+                    self.stats['cache_hits'] += 1
+                    self.logger.info(f"💾 Cache hit Rapedia pour {normalized_artist}")
+                    return cached_result
             
-            response = self.session.get(
-                self.search_url,
-                params=search_params,
-                timeout=30
-            )
+            # Rate limiting
+            if self.rate_limiter:
+                self.rate_limiter.wait_if_needed()
             
-            if response.status_code == 404:
-                self.logger.warning(f"Page de recherche non trouvée pour {artist_name}")
+            # Recherche sur Rapedia
+            search_results = self._perform_search(normalized_artist)
+            
+            if not search_results:
+                self.logger.warning(f"⚠️ Aucun résultat trouvé pour '{artist_name}' sur Rapedia")
                 return []
             
-            response.raise_for_status()
+            # Extraction détaillée des morceaux
+            all_tracks = []
             
-            # Parser les résultats
-            soup = BeautifulSoup(response.content, 'html.parser')
-            results = self._parse_search_results(soup, artist_name)
+            for result in search_results:
+                try:
+                    if result.get('type') == 'artist':
+                        # Page d'artiste - extraire tous les morceaux
+                        artist_tracks = self._extract_tracks_from_artist_page(result['url'])
+                        all_tracks.extend(artist_tracks)
+                    elif result.get('type') == 'track':
+                        # Morceau individuel
+                        track_data = self._extract_track_details(result['url'])
+                        if track_data:
+                            all_tracks.append(track_data)
+                    
+                    # Limiter si nécessaire
+                    if max_tracks and len(all_tracks) >= max_tracks:
+                        all_tracks = all_tracks[:max_tracks]
+                        break
+                        
+                except Exception as e:
+                    self.logger.warning(f"⚠️ Erreur extraction résultat {result.get('url', 'unknown')}: {e}")
+                    continue
+            
+            # Déduplication et enrichissement
+            final_tracks = self._deduplicate_and_enrich_tracks(all_tracks, normalized_artist)
             
             # Mise en cache
-            self.cache_manager.set(cache_key, results)
+            if self.cache_manager and final_tracks:
+                self.cache_manager.set(cache_key, final_tracks, expire_hours=12)
             
-            self.logger.info(f"Trouvé {len(results)} résultat(s) pour {artist_name}")
+            # Mise à jour des statistiques
+            self.stats['searches_performed'] += 1
+            self.stats['tracks_found'] += len(final_tracks)
+            self.stats['total_time_spent'] += time.time() - start_time
+            
+            self.logger.info(f"✅ Rapedia: {len(final_tracks)} morceaux trouvés en {time.time() - start_time:.2f}s")
+            
+            return final_tracks
+            
+        except Exception as e:
+            self.stats['failed_requests'] += 1
+            self.logger.error(f"❌ Erreur recherche Rapedia pour {artist_name}: {e}")
+            return []
+    
+    def _perform_search(self, artist_name: str) -> List[Dict[str, Any]]:
+        """
+        Effectue la recherche sur Rapedia avec parsing intelligent.
+        
+        Args:
+            artist_name: Nom de l'artiste
+            
+        Returns:
+            Liste des résultats de recherche
+        """
+        try:
+            # Préparation de la requête de recherche
+            search_params = {
+                'q': artist_name,
+                'type': 'all'  # Rechercher artistes et morceaux
+            }
+            
+            response = self.session.get(self.search_url, params=search_params)
+            response.raise_for_status()
+            
+            # Parsing du HTML
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Extraction des résultats
+            results = self._parse_search_results(soup, artist_name)
+            
+            self.logger.debug(f"📊 Trouvé {len(results)} résultat(s) pour {artist_name}")
             return results
             
         except requests.exceptions.RequestException as e:
-            self.logger.error(f"Erreur lors de la recherche sur Rapedia: {e}")
+            self.logger.error(f"❌ Erreur lors de la recherche sur Rapedia: {e}")
             raise ScrapingError(f"Erreur recherche Rapedia: {e}")
     
     def _parse_search_results(self, soup: BeautifulSoup, query: str) -> List[Dict[str, Any]]:
-        """Parse les résultats de recherche"""
+        """Parse les résultats de recherche avec sélecteurs adaptatifs"""
         results = []
         
         try:
-            # Rechercher les éléments contenant les résultats
-            # Note: Les sélecteurs peuvent changer, adapter selon la structure réelle
-            result_items = soup.find_all(['div', 'article'], class_=re.compile(r'search-result|artist-result|result-item', re.I))
+            # Sélecteurs multiples pour les résultats (structure adaptative)
+            result_selectors = [
+                '.search-result',
+                '.result-item',
+                '[class*="result"]',
+                'article',
+                '.artist-item',
+                '.track-item'
+            ]
             
+            result_items = []
+            for selector in result_selectors:
+                items = soup.select(selector)
+                if items:
+                    result_items = items
+                    break
+            
+            # Fallback: recherche de liens d'artistes/morceaux
             if not result_items:
-                # Tentative avec sélecteurs plus génériques
-                result_items = soup.find_all('a', href=re.compile(r'/artiste/|/artist/'))
+                result_items = soup.find_all('a', href=re.compile(r'/(artiste|artist|track|morceau)/'))
             
             for item in result_items:
                 try:
-                    # Extraction du nom et de l'URL
-                    link = item.find('a') if item.name != 'a' else item
-                    if not link:
-                        continue
-                    
-                    url = link.get('href', '')
-                    if url and not url.startswith('http'):
-                        url = urljoin(self.base_url, url)
-                    
-                    # Extraction du nom de l'artiste
-                    name_element = link.find(['h1', 'h2', 'h3', 'span', 'div'])
-                    artist_name = normalize_text(name_element.get_text()) if name_element else normalize_text(link.get_text())
-                    
-                    if artist_name and url:
-                        result = {
-                            'name': artist_name,
-                            'url': url,
-                            'source': 'rapedia',
-                            'match_score': self._calculate_match_score(artist_name, query)
-                        }
-                        
-                        # Extraction d'informations supplémentaires si disponibles
-                        desc_element = item.find(class_=re.compile(r'description|bio|summary', re.I))
-                        if desc_element:
-                            result['description'] = normalize_text(desc_element.get_text())
-                        
-                        results.append(result)
+                    result_data = self._extract_search_result_data(item, query)
+                    if result_data:
+                        results.append(result_data)
                         
                 except Exception as e:
-                    self.logger.warning(f"Erreur parsing résultat de recherche: {e}")
+                    self.logger.debug(f"Erreur extraction item: {e}")
                     continue
             
+            # Déduplication par URL
+            seen_urls = set()
+            unique_results = []
+            for result in results:
+                url = result.get('url')
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    unique_results.append(result)
+            
+            return unique_results
+            
         except Exception as e:
-            self.logger.error(f"Erreur lors du parsing des résultats de recherche: {e}")
-        
-        # Tri par score de correspondance
-        results.sort(key=lambda x: x['match_score'], reverse=True)
-        return results
+            self.logger.error(f"❌ Erreur parsing résultats recherche: {e}")
+            return []
     
-    def scrape_artist_tracks(self, artist_url: str, limit: int = 100) -> List[Dict[str, Any]]:
+    def _extract_search_result_data(self, item, query: str) -> Optional[Dict[str, Any]]:
+        """Extrait les données d'un résultat de recherche"""
+        try:
+            # Extraction du lien
+            link = item.find('a') if item.name != 'a' else item
+            if not link:
+                return None
+            
+            url = link.get('href', '')
+            if url and not url.startswith('http'):
+                url = urljoin(self.base_url, url)
+            
+            if not url:
+                return None
+            
+            # Extraction du nom/titre
+            title_element = (
+                link.find(['h1', 'h2', 'h3', 'h4']) or
+                link.find(class_=re.compile(r'title|name')) or
+                link
+            )
+            
+            title = self._extract_text_safe(title_element)
+            if not title:
+                return None
+            
+            # Détermination du type (artiste ou morceau)
+            result_type = 'track'  # Défaut
+            if any(indicator in url.lower() for indicator in ['/artiste/', '/artist/']):
+                result_type = 'artist'
+            elif any(indicator in url.lower() for indicator in ['/track/', '/morceau/', '/song/']):
+                result_type = 'track'
+            
+            # Vérification de pertinence
+            if not self._is_relevant_result(title, query):
+                return None
+            
+            # Extraction de métadonnées additionnelles
+            metadata = self._extract_result_metadata(item)
+            
+            return {
+                'title': title.strip(),
+                'url': url,
+                'type': result_type,
+                'relevance_score': self._calculate_relevance_score(title, query),
+                **metadata
+            }
+            
+        except Exception as e:
+            self.logger.debug(f"Erreur extraction résultat: {e}")
+            return None
+    
+    def _extract_tracks_from_artist_page(self, artist_url: str) -> List[Dict[str, Any]]:
         """
-        Scrape les morceaux d'un artiste depuis sa page Rapedia.
+        Extrait tous les morceaux depuis une page d'artiste Rapedia.
         
         Args:
-            artist_url: URL de la page de l'artiste
-            limit: Nombre maximum de morceaux à récupérer
+            artist_url: URL de la page artiste
             
         Returns:
-            Liste des morceaux avec métadonnées et crédits
+            Liste des morceaux avec métadonnées
         """
-        cache_key = f"rapedia_tracks_{self._url_to_cache_key(artist_url)}"
+        if artist_url in self._visited_pages:
+            return []
         
-        # Vérification du cache
-        cached_result = self.cache_manager.get(cache_key)
-        if cached_result:
-            self.logger.debug(f"Morceaux en cache pour {artist_url}")
-            return cached_result[:limit]
+        self._visited_pages.add(artist_url)
         
         try:
-            self.logger.info(f"Scraping des morceaux depuis {artist_url}")
+            if self.rate_limiter:
+                self.rate_limiter.wait_if_needed()
             
-            if artist_url in self._visited_pages:
-                self.logger.debug(f"Page déjà visitée: {artist_url}")
-            
-            # Respecter le rate limiting
-            self.rate_limiter.wait_if_needed('rapedia')
-            
-            response = self.session.get(artist_url, timeout=30)
-            
-            if response.status_code == 404:
-                raise PageNotFoundError(artist_url)
-            
+            response = self.session.get(artist_url)
             response.raise_for_status()
-            self._visited_pages.add(artist_url)
             
-            # Parser la page
             soup = BeautifulSoup(response.content, 'html.parser')
-            tracks = self._parse_artist_page(soup, artist_url)
             
-            # Limitation du nombre de résultats
-            limited_tracks = tracks[:limit]
+            tracks = []
             
-            # Mise en cache
-            self.cache_manager.set(cache_key, tracks)
+            # Sélecteurs pour les listes de morceaux
+            track_selectors = [
+                '.track-list .track-item',
+                '.discography .track',
+                '[class*="track"]',
+                '.song-list .song',
+                'ul li a[href*="/track/"]',
+                'ul li a[href*="/morceau/"]'
+            ]
             
-            self.logger.info(f"Trouvé {len(limited_tracks)} morceau(x) sur Rapedia")
-            return limited_tracks
-            
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"Erreur lors du scraping de {artist_url}: {e}")
-            raise ScrapingError(f"Erreur scraping page artiste: {e}")
-    
-    def _parse_artist_page(self, soup: BeautifulSoup, base_url: str) -> List[Dict[str, Any]]:
-        """Parse la page d'un artiste pour extraire les morceaux"""
-        tracks = []
-        
-        try:
-            # Rechercher les sections contenant les morceaux
-            track_sections = soup.find_all(['div', 'article', 'section'], 
-                                         class_=re.compile(r'track|song|morceau|titre', re.I))
-            
-            # Si pas de sections spécifiques, chercher des liens vers des morceaux
-            if not track_sections:
-                track_links = soup.find_all('a', href=re.compile(r'/titre/|/track/|/song/|/morceau/'))
-                for link in track_links:
-                    track_url = urljoin(base_url, link.get('href', ''))
-                    track_title = normalize_text(link.get_text())
-                    
-                    if track_title and track_url:
-                        track_data = self.scrape_track_details(track_url)
+            for selector in track_selectors:
+                track_elements = soup.select(selector)
+                
+                for element in track_elements:
+                    try:
+                        track_data = self._extract_track_from_element(element, artist_url)
                         if track_data:
                             tracks.append(track_data)
-            else:
-                # Parser chaque section de morceau
-                for section in track_sections:
-                    track_data = self._parse_track_section(section, base_url)
-                    if track_data:
-                        tracks.append(track_data)
+                    except Exception as e:
+                        self.logger.debug(f"Erreur extraction track element: {e}")
+                        continue
+            
+            # Si peu de morceaux trouvés, essayer méthode alternative
+            if len(tracks) < 3:
+                alternative_tracks = self._extract_tracks_alternative_method(soup, artist_url)
+                tracks.extend(alternative_tracks)
+            
+            self.stats['pages_scraped'] += 1
+            self.logger.debug(f"📀 {len(tracks)} morceaux extraits de la page artiste")
+            
+            return tracks
             
         except Exception as e:
-            self.logger.error(f"Erreur lors du parsing de la page artiste: {e}")
-        
-        return tracks
+            self.logger.error(f"❌ Erreur extraction page artiste {artist_url}: {e}")
+            return []
     
-    def scrape_track_details(self, track_url: str) -> Optional[Dict[str, Any]]:
+    def _extract_track_details(self, track_url: str) -> Optional[Dict[str, Any]]:
         """
-        Scrape les détails d'un morceau spécifique.
+        Extrait les détails complets d'un morceau depuis sa page Rapedia.
         
         Args:
             track_url: URL de la page du morceau
             
         Returns:
-            Dictionnaire avec les détails du morceau et crédits
+            Détails du morceau avec crédits complets
         """
-        cache_key = f"rapedia_track_{self._url_to_cache_key(track_url)}"
+        if track_url in self._visited_pages:
+            return None
         
-        # Vérification du cache
-        cached_result = self.cache_manager.get(cache_key)
-        if cached_result:
-            return cached_result
+        self._visited_pages.add(track_url)
         
         try:
-            self.logger.debug(f"Scraping détails du morceau: {track_url}")
+            if self.rate_limiter:
+                self.rate_limiter.wait_if_needed()
             
-            # Respecter le rate limiting
-            self.rate_limiter.wait_if_needed('rapedia')
-            
-            response = self.session.get(track_url, timeout=30)
-            
-            if response.status_code == 404:
-                self.logger.warning(f"Page de morceau non trouvée: {track_url}")
-                return None
-            
+            response = self.session.get(track_url)
             response.raise_for_status()
             
-            # Parser la page
             soup = BeautifulSoup(response.content, 'html.parser')
-            track_data = self._parse_track_page(soup, track_url)
             
-            # Mise en cache si données trouvées
-            if track_data:
-                self.cache_manager.set(cache_key, track_data)
+            # Extraction des informations de base
+            track_data = {
+                'url': track_url,
+                'data_source': DataSource.RAPEDIA.value,
+                'extracted_at': datetime.now().isoformat()
+            }
+            
+            # Titre du morceau
+            title_selectors = ['h1', '.track-title', '.song-title', '[class*="title"]']
+            for selector in title_selectors:
+                title_elem = soup.select_one(selector)
+                if title_elem:
+                    track_data['title'] = self._extract_text_safe(title_elem)
+                    break
+            
+            # Artiste principal
+            artist_selectors = ['.artist-name', '.main-artist', 'h2', '[class*="artist"]']
+            for selector in artist_selectors:
+                artist_elem = soup.select_one(selector)
+                if artist_elem:
+                    track_data['artist_name'] = self._extract_text_safe(artist_elem)
+                    break
+            
+            # Extraction des crédits complets
+            credits = self._extract_credits_from_page(soup)
+            track_data['credits'] = credits
+            self.stats['credits_extracted'] += len(credits)
+            
+            # Métadonnées additionnelles
+            metadata = self._extract_track_metadata(soup)
+            track_data.update(metadata)
+            
+            self.stats['pages_scraped'] += 1
             
             return track_data
             
-        except requests.exceptions.RequestException as e:
-            self.logger.warning(f"Erreur lors du scraping du morceau {track_url}: {e}")
-            return None
-    
-    def _parse_track_page(self, soup: BeautifulSoup, track_url: str) -> Optional[Dict[str, Any]]:
-        """Parse une page de morceau pour extraire toutes les informations"""
-        try:
-            track_data = {
-                'url': track_url,
-                'source': DataSource.RAPEDIA.value,
-                'scraped_at': datetime.now().isoformat(),
-                'credits': [],
-                'metadata': {}
-            }
-            
-            # Extraction du titre
-            title_selectors = ['h1', '.track-title', '.song-title', '.titre']
-            title = self._extract_with_selectors(soup, title_selectors)
-            if title:
-                track_data['title'] = normalize_text(title)
-            
-            # Extraction de l'artiste
-            artist_selectors = ['.artist-name', '.artiste', '.artist', 'h2']
-            artist = self._extract_with_selectors(soup, artist_selectors)
-            if artist:
-                track_data['artist'] = normalize_text(artist)
-            
-            # Extraction de l'album
-            album_selectors = ['.album-name', '.album', '.album-title']
-            album = self._extract_with_selectors(soup, album_selectors)
-            if album:
-                track_data['album'] = normalize_text(album)
-            
-            # Extraction de la date de sortie
-            date_selectors = ['.release-date', '.date', '.sortie']
-            release_date = self._extract_with_selectors(soup, date_selectors)
-            if release_date:
-                track_data['release_date'] = normalize_text(release_date)
-            
-            # Extraction des crédits - c'est la partie la plus importante
-            credits_section = soup.find(['div', 'section'], class_=re.compile(r'credit|prod|info', re.I))
-            if credits_section:
-                credits = self._extract_credits_from_section(credits_section)
-                track_data['credits'].extend(credits)
-            
-            # Recherche de crédits dans le texte général
-            main_content = soup.find(['div', 'article'], class_=re.compile(r'content|main|body', re.I))
-            if main_content:
-                text_credits = self._extract_credits_from_text(main_content.get_text())
-                track_data['credits'].extend(text_credits)
-            
-            # Extraction des paroles si disponibles
-            lyrics_section = soup.find(['div', 'section'], class_=re.compile(r'lyrics|paroles', re.I))
-            if lyrics_section:
-                lyrics = normalize_text(lyrics_section.get_text())
-                if lyrics and len(lyrics) > 50:  # Filtrer les faux positifs
-                    track_data['lyrics'] = lyrics
-            
-            # Extraction d'autres métadonnées
-            self._extract_additional_metadata(soup, track_data)
-            
-            return track_data if track_data.get('title') else None
-            
         except Exception as e:
-            self.logger.error(f"Erreur lors du parsing de la page de morceau: {e}")
+            self.logger.error(f"❌ Erreur extraction détails track {track_url}: {e}")
             return None
     
-    def _parse_track_section(self, section: BeautifulSoup, base_url: str) -> Optional[Dict[str, Any]]:
-        """Parse une section contenant un morceau"""
-        try:
-            track_data = {
-                'source': DataSource.RAPEDIA.value,
-                'credits': []
-            }
-            
-            # Extraction du titre depuis la section
-            title_element = section.find(['h1', 'h2', 'h3', 'h4', 'a'])
-            if title_element:
-                track_data['title'] = normalize_text(title_element.get_text())
-                
-                # Si c'est un lien, récupérer l'URL pour plus de détails
-                if title_element.name == 'a':
-                    track_url = urljoin(base_url, title_element.get('href', ''))
-                    track_data['url'] = track_url
-            
-            # Extraction des crédits depuis la section
-            credits = self._extract_credits_from_section(section)
-            track_data['credits'].extend(credits)
-            
-            return track_data if track_data.get('title') else None
-            
-        except Exception as e:
-            self.logger.warning(f"Erreur parsing section morceau: {e}")
-            return None
-    
-    def _extract_credits_from_section(self, section: BeautifulSoup) -> List[Dict[str, Any]]:
-        """Extrait les crédits depuis une section HTML"""
+    def _extract_credits_from_page(self, soup: BeautifulSoup) -> List[Dict[str, Any]]:
+        """Extrait les crédits depuis une page avec patterns spécialisés"""
         credits = []
         
         try:
-            # Recherche de patterns dans le texte de la section
-            section_text = section.get_text()
-            text_credits = self._extract_credits_from_text(section_text)
-            credits.extend(text_credits)
+            # Recherche des sections de crédits
+            credit_sections = soup.find_all(['div', 'section', 'article'], 
+                                          class_=re.compile(r'credit|production|info', re.I))
+            
+            if not credit_sections:
+                # Fallback: toute la page
+                credit_sections = [soup]
+            
+            for section in credit_sections:
+                section_credits = self._extract_credits_from_section(section)
+                credits.extend(section_credits)
+            
+            # Déduplication
+            credits = self._deduplicate_credits(credits)
+            
+        except Exception as e:
+            self.logger.debug(f"Erreur extraction crédits: {e}")
+        
+        return credits
+    
+    def _extract_credits_from_section(self, section) -> List[Dict[str, Any]]:
+        """Extrait les crédits depuis une section HTML avec patterns français"""
+        credits = []
+        
+        try:
+            # Récupération du texte de la section
+            section_text = self._extract_text_safe(section)
+            
+            if not section_text:
+                return credits
+            
+            # Application des patterns de reconnaissance
+            for category, patterns in self.rapedia_patterns.items():
+                for pattern in patterns:
+                    matches = pattern.finditer(section_text)
+                    
+                    for match in matches:
+                        try:
+                            credit_text = match.group(1).strip() if match.groups() else match.group(0)
+                            
+                            if credit_text:
+                                parsed_credits = self._parse_credit_text(credit_text, category)
+                                credits.extend(parsed_credits)
+                                
+                        except Exception as e:
+                            self.logger.debug(f"Erreur parsing match: {e}")
+                            continue
             
             # Recherche de listes de crédits structurées
             credit_lists = section.find_all(['ul', 'ol', 'dl'])
             for credit_list in credit_lists:
                 list_items = credit_list.find_all(['li', 'dt', 'dd'])
                 for item in list_items:
-                    item_text = normalize_text(item.get_text())
+                    item_text = self._extract_text_safe(item)
                     if item_text:
                         parsed_credits = self._parse_credit_text(item_text)
                         credits.extend(parsed_credits)
             
         except Exception as e:
-            self.logger.warning(f"Erreur extraction crédits depuis section: {e}")
+            self.logger.debug(f"Erreur extraction crédits section: {e}")
         
         return credits
     
-    def _extract_credits_from_text(self, text: str) -> List[Dict[str, Any]]:
-        """Extrait les crédits depuis un texte en utilisant les patterns"""
+    @lru_cache(maxsize=256)
+    def _parse_credit_text(self, text: str, category: str = None) -> List[Dict[str, Any]]:
+        """Parse un texte de crédit avec cache pour optimisation"""
         credits = []
         
         try:
-            # Application des patterns de reconnaissance
-            for credit_type, patterns in self.rapedia_patterns.items():
-                for pattern in patterns:
-                    matches = re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE)
-                    
-                    for match in matches:
-                        credit_text = match.group(1).strip()
-                        if credit_text:
-                            parsed_credits = self._parse_credit_text(credit_text, credit_type)
-                            credits.extend(parsed_credits)
+            if not text or len(text.strip()) < 2:
+                return credits
             
-            # Patterns génériques pour autres crédits
-            generic_patterns = [
-                r'(?:Crédits?[:\s]*)(.*?)(?:\n|$)',
-                r'(?:Participants?[:\s]*)(.*?)(?:\n|$)',
-                r'(?:Équipe[:\s]*)(.*?)(?:\n|$)'
-            ]
-            
-            for pattern in generic_patterns:
-                matches = re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE)
-                for match in matches:
-                    credit_text = match.group(1).strip()
-                    if credit_text:
-                        parsed_credits = self._parse_credit_text(credit_text)
-                        credits.extend(parsed_credits)
-            
-        except Exception as e:
-            self.logger.warning(f"Erreur extraction crédits depuis texte: {e}")
-        
-        return credits
-    
-    def _parse_credit_text(self, credit_text: str, credit_hint: str = None) -> List[Dict[str, Any]]:
-        """Parse un texte de crédit pour extraire les personnes et rôles"""
-        credits = []
-        
-        try:
             # Nettoyage du texte
-            cleaned_text = credit_text.strip()
+            cleaned_text = text.strip()
             
-            # Séparation multiple par virgules, points-virgules, "et", "and"
-            separators = [',', ';', ' et ', ' and ', ' & ']
+            # Séparation des noms multiples
+            separators = [',', ';', '&', ' et ', ' and ', '\n', ' / ']
             names = [cleaned_text]
             
-            for separator in separators:
+            for sep in separators:
                 new_names = []
                 for name in names:
-                    new_names.extend([n.strip() for n in name.split(separator)])
+                    new_names.extend([n.strip() for n in name.split(sep) if n.strip()])
                 names = new_names
             
-            # Détermination du type de crédit
-            credit_type, credit_category = self._determine_credit_type(credit_hint, cleaned_text)
-            
-            # Création des crédits pour chaque nom
+            # Création des crédits
             for name in names:
-                name = name.strip()
-                if name and len(name) > 1 and not self._is_excluded_name(name):
+                if len(name) > 1 and self._is_valid_credit_name(name):
+                    credit_type = self._infer_credit_type_from_category(category) if category else 'Contributor'
+                    
                     credit = {
+                        'credit_type': credit_type,
+                        'credit_category': self._map_category_to_enum(category),
                         'person_name': name,
-                        'credit_type': credit_type.value if credit_type else 'other',
-                        'credit_category': credit_category.value if credit_category else 'other',
-                        'role_detail': cleaned_text,
-                        'source': DataSource.RAPEDIA.value,
-                        'confidence_score': 0.9,  # Rapedia est très fiable
-                        'raw_text': credit_text
+                        'source_text': text,
+                        'data_source': DataSource.RAPEDIA.value,
+                        'extraction_method': 'pattern_parsing'
                     }
                     credits.append(credit)
             
         except Exception as e:
-            self.logger.warning(f"Erreur parsing texte crédit '{credit_text}': {e}")
+            self.logger.debug(f"Erreur parse credit text: {e}")
         
         return credits
     
-    def _determine_credit_type(self, hint: str, text: str) -> tuple:
-        """Détermine le type et la catégorie de crédit"""
-        text_lower = text.lower()
-        
-        # Mapping basé sur les hints
-        if hint:
-            hint_mapping = {
-                'producer_patterns': (CreditType.PRODUCER, CreditCategory.PRODUCER),
-                'featuring_patterns': (CreditType.FEATURING, CreditCategory.FEATURING),
-                'credit_patterns': (CreditType.OTHER, CreditCategory.TECHNICAL)
-            }
-            
-            if hint in hint_mapping:
-                return hint_mapping[hint]
-        
-        # Détection basée sur le contenu du texte
-        if any(word in text_lower for word in ['produit', 'prod', 'beat', 'instrumental']):
-            return CreditType.PRODUCER, CreditCategory.PRODUCER
-        elif any(word in text_lower for word in ['feat', 'featuring', 'avec', 'duo']):
-            return CreditType.FEATURING, CreditCategory.FEATURING
-        elif any(word in text_lower for word in ['mix', 'mixage']):
-            return CreditType.MIXING, CreditCategory.TECHNICAL
-        elif any(word in text_lower for word in ['master', 'mastering']):
-            return CreditType.MASTERING, CreditCategory.TECHNICAL
-        elif any(word in text_lower for word in ['paroles', 'lyrics', 'texte']):
-            return CreditType.LYRICIST, CreditCategory.COMPOSER
-        elif any(word in text_lower for word in ['guitare', 'guitar']):
-            return CreditType.GUITAR, CreditCategory.INSTRUMENT
-        elif any(word in text_lower for word in ['piano', 'clavier']):
-            return CreditType.PIANO, CreditCategory.INSTRUMENT
-        elif any(word in text_lower for word in ['batterie', 'drums']):
-            return CreditType.DRUMS, CreditCategory.INSTRUMENT
-        elif any(word in text_lower for word in ['basse', 'bass']):
-            return CreditType.BASS, CreditCategory.INSTRUMENT
-        
-        # Par défaut
-        return CreditType.OTHER, CreditCategory.OTHER
-    
-    def _extract_with_selectors(self, soup: BeautifulSoup, selectors: List[str]) -> Optional[str]:
-        """Extrait du texte en testant plusieurs sélecteurs CSS"""
-        for selector in selectors:
-            try:
-                element = soup.select_one(selector)
-                if element:
-                    text = normalize_text(element.get_text())
-                    if text:
-                        return text
-            except Exception:
-                continue
-        return None
-    
-    def _extract_additional_metadata(self, soup: BeautifulSoup, track_data: Dict[str, Any]):
-        """Extrait des métadonnées additionnelles depuis la page"""
-        try:
-            # Extraction de l'année
-            year_pattern = r'20\d{2}'
-            page_text = soup.get_text()
-            year_matches = re.findall(year_pattern, page_text)
-            if year_matches:
-                # Prendre l'année la plus récente trouvée
-                track_data['release_year'] = max(int(year) for year in year_matches)
-            
-            # Extraction du genre si mentionné
-            genre_keywords = ['rap', 'hip-hop', 'trap', 'drill', 'rnb', 'r&b']
-            for keyword in genre_keywords:
-                if keyword.lower() in page_text.lower():
-                    track_data['genre'] = keyword
-                    break
-            
-            # Extraction des liens externes (YouTube, Spotify, etc.)
-            external_links = soup.find_all('a', href=re.compile(r'youtube|spotify|deezer|soundcloud'))
-            if external_links:
-                track_data['external_links'] = []
-                for link in external_links:
-                    href = link.get('href', '')
-                    platform = self._identify_platform(href)
-                    if platform:
-                        track_data['external_links'].append({
-                            'platform': platform,
-                            'url': href
-                        })
-            
-            # Extraction des images (pochettes)
-            images = soup.find_all('img', src=re.compile(r'\.(jpg|jpeg|png|webp)', re.I))
-            for img in images:
-                src = img.get('src', '')
-                alt = img.get('alt', '').lower()
-                if any(keyword in alt for keyword in ['pochette', 'cover', 'album']):
-                    track_data['cover_image'] = urljoin(track_data['url'], src)
-                    break
-            
-        except Exception as e:
-            self.logger.warning(f"Erreur extraction métadonnées additionnelles: {e}")
-    
-    def _identify_platform(self, url: str) -> Optional[str]:
-        """Identifie la plateforme depuis une URL"""
-        url_lower = url.lower()
-        platforms = {
-            'youtube': 'youtube',
-            'spotify': 'spotify',
-            'deezer': 'deezer',
-            'soundcloud': 'soundcloud',
-            'apple': 'apple_music',
-            'bandcamp': 'bandcamp'
+    @lru_cache(maxsize=128)
+    def _infer_credit_type_from_category(self, category: str) -> str:
+        """Infère le type de crédit depuis la catégorie avec cache"""
+        category_mapping = {
+            'producer_patterns': 'Producer',
+            'featuring_patterns': 'Featured Artist',
+            'engineering_patterns': 'Engineer',
+            'writing_patterns': 'Songwriter',
+            'label_patterns': 'Label',
+            'date_patterns': 'Release Info'
         }
         
-        for keyword, platform in platforms.items():
-            if keyword in url_lower:
-                return platform
-        
-        return None
+        return category_mapping.get(category, 'Contributor')
     
-    def _calculate_match_score(self, found_name: str, query: str) -> float:
-        """Calcule un score de correspondance entre le nom trouvé et la requête"""
-        found_clean = clean_artist_name(found_name).lower()
-        query_clean = clean_artist_name(query).lower()
+    @lru_cache(maxsize=64)
+    def _map_category_to_enum(self, category: str) -> str:
+        """Mappe une catégorie vers un enum de crédit avec cache"""
+        if not category:
+            return CreditCategory.OTHER.value
         
-        # Match exact
-        if found_clean == query_clean:
-            return 1.0
+        if 'producer' in category.lower():
+            return CreditCategory.PRODUCTION.value
+        elif 'writing' in category.lower():
+            return CreditCategory.WRITING.value
+        elif 'engineering' in category.lower():
+            return CreditCategory.ENGINEERING.value
+        elif 'featuring' in category.lower():
+            return CreditCategory.PERFORMANCE.value
         
-        # Match avec mots dans le bon ordre
-        found_words = found_clean.split()
-        query_words = query_clean.split()
-        
-        if len(query_words) == 1:
-            # Recherche simple
-            if query_words[0] in found_words:
-                return 0.8
-        else:
-            # Recherche multi-mots
-            matches = sum(1 for word in query_words if word in found_words)
-            if matches == len(query_words):
-                return 0.9
-            elif matches > len(query_words) / 2:
-                return 0.6
-        
-        # Similarité de caractères
-        if found_clean in query_clean or query_clean in found_clean:
-            return 0.4
-        
-        return 0.0
+        return CreditCategory.OTHER.value
     
-    def _is_excluded_name(self, name: str) -> bool:
-        """Vérifie si un nom doit être exclu"""
-        name_lower = name.lower()
-        excluded_patterns = [
-            'inconnu', 'unknown', 'various', 'divers', 'multiple',
-            'tba', 'à déterminer', 'non renseigné', 'n/a'
+    def _is_valid_credit_name(self, name: str) -> bool:
+        """Valide si un nom est un crédit valide"""
+        if not name or len(name.strip()) < 2:
+            return False
+        
+        # Filtrer les mots-clés non pertinents
+        excluded_keywords = [
+            'produit', 'par', 'mixé', 'masterisé', 'écrit', 'featuring',
+            'feat', 'avec', 'et', 'and', 'the', 'le', 'la', 'les',
+            'de', 'du', 'des', 'en', 'sur', 'pour', 'dans'
         ]
         
-        return any(pattern in name_lower for pattern in excluded_patterns)
+        name_lower = name.lower().strip()
+        
+        # Exclure si c'est uniquement un mot-clé
+        if name_lower in excluded_keywords:
+            return False
+        
+        # Exclure les phrases trop longues (probablement pas un nom)
+        if len(name.split()) > 4:
+            return False
+        
+        # Doit contenir au moins une lettre
+        if not any(c.isalpha() for c in name):
+            return False
+        
+        return True
+    
+    def _extract_track_metadata(self, soup: BeautifulSoup) -> Dict[str, Any]:
+        """Extrait les métadonnées additionnelles d'une track"""
+        metadata = {}
+        
+        try:
+            # Date de sortie
+            date_selectors = ['.release-date', '.date', '[class*="date"]']
+            for selector in date_selectors:
+                date_elem = soup.select_one(selector)
+                if date_elem:
+                    date_text = self._extract_text_safe(date_elem)
+                    if date_text:
+                        metadata['release_date'] = date_text
+                        break
+            
+            # Album
+            album_selectors = ['.album-name', '.album-title', '[class*="album"]']
+            for selector in album_selectors:
+                album_elem = soup.select_one(selector)
+                if album_elem:
+                    album_text = self._extract_text_safe(album_elem)
+                    if album_text:
+                        metadata['album_title'] = album_text
+                        break
+            
+            # Label/Maison de disque
+            label_selectors = ['.label', '.record-label', '[class*="label"]']
+            for selector in label_selectors:
+                label_elem = soup.select_one(selector)
+                if label_elem:
+                    label_text = self._extract_text_safe(label_elem)
+                    if label_text:
+                        metadata['label'] = label_text
+                        break
+            
+            # Genre
+            genre_selectors = ['.genre', '.style', '[class*="genre"]']
+            for selector in genre_selectors:
+                genre_elem = soup.select_one(selector)
+                if genre_elem:
+                    genre_text = self._extract_text_safe(genre_elem)
+                    if genre_text:
+                        metadata['genre'] = genre_text
+                        break
+            
+        except Exception as e:
+            self.logger.debug(f"Erreur extraction métadonnées: {e}")
+        
+        return metadata
+    
+    def _extract_text_safe(self, element) -> str:
+        """Extraction sécurisée de texte depuis un élément"""
+        try:
+            if element:
+                return element.get_text(strip=True)
+        except Exception:
+            pass
+        return ""
+    
+    def _deduplicate_and_enrich_tracks(self, tracks: List[Dict[str, Any]], artist_name: str) -> List[Dict[str, Any]]:
+        """Déduplique et enrichit la liste des tracks"""
+        if not tracks:
+            return []
+        
+        # Déduplication par titre et URL
+        seen_tracks = set()
+        unique_tracks = []
+        
+        for track in tracks:
+            # Clé de déduplication
+            title = normalize_text(track.get('title', ''))
+            url = track.get('url', '')
+            dedup_key = (title, url)
+            
+            if dedup_key not in seen_tracks and title:
+                seen_tracks.add(dedup_key)
+                
+                # Enrichissement
+                track['artist_name'] = track.get('artist_name', artist_name)
+                track['data_source'] = DataSource.RAPEDIA.value
+                track['quality_score'] = self._calculate_track_quality_score(track)
+                
+                unique_tracks.append(track)
+        
+        # Tri par score de qualité
+        unique_tracks.sort(key=lambda x: x.get('quality_score', 0), reverse=True)
+        
+        self.logger.debug(f"🧹 Déduplication: {len(unique_tracks)}/{len(tracks)} tracks conservées")
+        
+        return unique_tracks
+    
+    def _calculate_track_quality_score(self, track: Dict[str, Any]) -> float:
+        """Calcule un score de qualité pour une track"""
+        score = 0.0
+        
+        # Critères de qualité spécifiques à Rapedia
+        if track.get('credits'):
+            score += len(track['credits']) * 0.5  # Plus de crédits = meilleure qualité
+        
+        if track.get('release_date'):
+            score += 2.0
+        
+        if track.get('album_title'):
+            score += 1.5
+        
+        if track.get('label'):
+            score += 1.0
+        
+        if track.get('genre'):
+            score += 0.5
+        
+        # Bonus pour la présence de métadonnées étendues
+        metadata_fields = ['url', 'title', 'artist_name']
+        score += sum(1.0 for field in metadata_fields if track.get(field))
+        
+        return min(score, 10.0)  # Score maximum de 10
+    
+    def _deduplicate_credits(self, credits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Déduplique les crédits"""
+        if not credits:
+            return []
+        
+        seen_credits = set()
+        unique_credits = []
+        
+        for credit in credits:
+            # Clé de déduplication
+            person_name = normalize_text(credit.get('person_name', ''))
+            credit_type = credit.get('credit_type', '')
+            dedup_key = (person_name, credit_type)
+            
+            if dedup_key not in seen_credits and person_name:
+                seen_credits.add(dedup_key)
+                unique_credits.append(credit)
+        
+        return unique_credits
+    
+    def _is_relevant_result(self, title: str, query: str) -> bool:
+        """Vérifie la pertinence d'un résultat"""
+        if not title or not query:
+            return False
+        
+        title_normalized = normalize_text(title)
+        query_normalized = normalize_text(query)
+        
+        # Correspondance exacte
+        if query_normalized == title_normalized:
+            return True
+        
+        # Correspondance partielle
+        if query_normalized in title_normalized or title_normalized in query_normalized:
+            return True
+        
+        # Correspondance des mots clés
+        query_words = set(query_normalized.split())
+        title_words = set(title_normalized.split())
+        
+        if len(query_words.intersection(title_words)) > 0:
+            return True
+        
+        return False
+    
+    def _calculate_relevance_score(self, title: str, query: str) -> float:
+        """Calcule un score de pertinence"""
+        if not title or not query:
+            return 0.0
+        
+        title_normalized = normalize_text(title)
+        query_normalized = normalize_text(query)
+        
+        # Score basé sur la similarité
+        if query_normalized == title_normalized:
+            return 1.0
+        elif query_normalized in title_normalized:
+            return 0.8
+        elif title_normalized in query_normalized:
+            return 0.7
+        else:
+            # Score basé sur les mots communs
+            query_words = set(query_normalized.split())
+            title_words = set(title_normalized.split())
+            common_words = query_words.intersection(title_words)
+            
+            if not query_words:
+                return 0.0
+            
+            return len(common_words) / len(query_words)
+    
+    def _extract_result_metadata(self, item) -> Dict[str, Any]:
+        """Extrait les métadonnées d'un résultat de recherche"""
+        metadata = {}
+        
+        try:
+            # Description/snippet
+            desc_elem = item.find(class_=re.compile(r'description|snippet|summary'))
+            if desc_elem:
+                metadata['description'] = self._extract_text_safe(desc_elem)
+            
+            # Date si visible
+            date_elem = item.find(class_=re.compile(r'date'))
+            if date_elem:
+                metadata['date'] = self._extract_text_safe(date_elem)
+            
+            # Genre/catégorie si visible
+            genre_elem = item.find(class_=re.compile(r'genre|category'))
+            if genre_elem:
+                metadata['genre'] = self._extract_text_safe(genre_elem)
+                
+        except Exception as e:
+            self.logger.debug(f"Erreur extraction métadonnées résultat: {e}")
+        
+        return metadata
+    
+    def _extract_track_from_element(self, element, source_url: str) -> Optional[Dict[str, Any]]:
+        """Extrait une track depuis un élément HTML"""
+        try:
+            # Lien vers la track
+            link = element.find('a') if element.name != 'a' else element
+            if not link:
+                return None
+            
+            track_url = link.get('href', '')
+            if track_url and not track_url.startswith('http'):
+                track_url = urljoin(self.base_url, track_url)
+            
+            # Titre de la track
+            title = self._extract_text_safe(link)
+            if not title:
+                return None
+            
+            return {
+                'title': title,
+                'url': track_url,
+                'source_page': source_url,
+                'extraction_method': 'element_parsing'
+            }
+            
+        except Exception as e:
+            self.logger.debug(f"Erreur extraction track element: {e}")
+            return None
+    
+    def _extract_tracks_alternative_method(self, soup: BeautifulSoup, source_url: str) -> List[Dict[str, Any]]:
+        """Méthode alternative d'extraction des tracks"""
+        tracks = []
+        
+        try:
+            # Recherche de tous les liens vers des tracks/morceaux
+            track_links = soup.find_all('a', href=re.compile(r'/(track|morceau|song)/'))
+            
+            for link in track_links:
+                try:
+                    track_url = link.get('href')
+                    if track_url and not track_url.startswith('http'):
+                        track_url = urljoin(self.base_url, track_url)
+                    
+                    title = self._extract_text_safe(link)
+                    
+                    if title and track_url:
+                        track = {
+                            'title': title,
+                            'url': track_url,
+                            'source_page': source_url,
+                            'extraction_method': 'alternative_parsing'
+                        }
+                        tracks.append(track)
+                        
+                except Exception as e:
+                    self.logger.debug(f"Erreur extraction alternative: {e}")
+                    continue
+            
+        except Exception as e:
+            self.logger.debug(f"Erreur méthode alternative: {e}")
+        
+        return tracks
     
     def _url_to_cache_key(self, url: str) -> str:
         """Convertit une URL en clé de cache valide"""
-        # Garder seulement la partie significative de l'URL
         import hashlib
         return hashlib.md5(url.encode()).hexdigest()[:16]
     
+    # ===== MÉTHODES UTILITAIRES =====
+    
+    @lru_cache(maxsize=1)
     def get_stats(self) -> Dict[str, Any]:
-        """Retourne les statistiques du scraper"""
-        return {
-            'pages_visited': len(self._visited_pages),
-            'cache_size': len(self.cache_manager._cache) if hasattr(self.cache_manager, '_cache') else 0,
-            'source': 'rapedia',
-            'reliability_score': 0.95  # Très fiable pour le rap français
-        }
+        """Retourne les statistiques avec cache"""
+        stats = self.stats.copy()
+        
+        # Calculs additionnels
+        if stats['searches_performed'] > 0:
+            stats['average_tracks_per_search'] = stats['tracks_found'] / stats['searches_performed']
+            stats['average_time_per_search'] = stats['total_time_spent'] / stats['searches_performed']
+        else:
+            stats['average_tracks_per_search'] = 0.0
+            stats['average_time_per_search'] = 0.0
+        
+        if stats['pages_scraped'] > 0:
+            stats['average_credits_per_page'] = stats['credits_extracted'] / stats['pages_scraped']
+        else:
+            stats['average_credits_per_page'] = 0.0
+        
+        # Taux de succès
+        total_requests = stats['searches_performed'] + stats['pages_scraped']
+        if total_requests > 0:
+            stats['success_rate'] = ((total_requests - stats['failed_requests']) / total_requests) * 100
+        else:
+            stats['success_rate'] = 0.0
+        
+        # Source et fiabilité
+        stats['source'] = 'rapedia'
+        stats['reliability_score'] = 0.95  # Très fiable pour le rap français
+        
+        return stats
     
-    def clear_cache(self):
+    def clear_cache(self) -> None:
         """Vide le cache et remet à zéro les pages visitées"""
-        if hasattr(self.cache_manager, 'clear_all'):
+        if self.cache_manager and hasattr(self.cache_manager, 'clear_all'):
             self.cache_manager.clear_all()
+        
         self._visited_pages.clear()
-        self.logger.info("Cache Rapedia vidé")
+        self._artist_cache.clear()
+        self._pattern_cache.clear()
+        
+        # Vider les caches LRU
+        self._parse_credit_text.cache_clear()
+        self._infer_credit_type_from_category.cache_clear()
+        self._map_category_to_enum.cache_clear()
+        self.get_stats.cache_clear()
+        
+        self.logger.info("🧹 Cache Rapedia vidé")
     
-    def test_connection(self) -> bool:
+    def reset_stats(self) -> None:
+        """Remet à zéro les statistiques"""
+        self.stats = {
+            'searches_performed': 0,
+            'pages_scraped': 0,
+            'tracks_found': 0,
+            'credits_extracted': 0,
+            'cache_hits': 0,
+            'failed_requests': 0,
+            'total_time_spent': 0.0
+        }
+        
+        self.get_stats.cache_clear()
+        self.logger.info("📊 Statistiques Rapedia réinitialisées")
+    
+    def test_connection(self) -> Tuple[bool, str]:
         """Teste la connexion à Rapedia"""
         try:
             response = self.session.get(self.base_url, timeout=10)
-            return response.status_code == 200
-        except:
-            return False
+            if response.status_code == 200:
+                return True, "Connexion Rapedia réussie"
+            else:
+                return False, f"Erreur HTTP {response.status_code}"
+        except Exception as e:
+            return False, f"Erreur connexion: {e}"
+    
+    def batch_search_artists(self, artist_names: List[str], max_tracks_per_artist: int = 20) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Recherche en lot pour plusieurs artistes.
+        
+        Args:
+            artist_names: Liste des noms d'artistes
+            max_tracks_per_artist: Nombre maximum de tracks par artiste
+            
+        Returns:
+            Dictionnaire {nom_artiste: [tracks]}
+        """
+        results = {}
+        
+        for artist_name in artist_names:
+            try:
+                self.logger.info(f"🔍 Recherche batch: {artist_name}")
+                tracks = self.search_artist_tracks(artist_name, max_tracks_per_artist)
+                results[artist_name] = tracks
+                
+                # Rate limiting entre artistes
+                time.sleep(1)
+                
+            except Exception as e:
+                self.logger.error(f"❌ Erreur batch pour {artist_name}: {e}")
+                results[artist_name] = []
+        
+        self.logger.info(f"🏁 Recherche batch terminée: {len(results)} artistes traités")
+        return results
+    
+    def __repr__(self) -> str:
+        """Représentation string de l'instance"""
+        stats = self.get_stats()
+        return (f"RapediaScraper(searches={stats['searches_performed']}, "
+                f"tracks_found={stats['tracks_found']}, "
+                f"success_rate={stats['success_rate']:.1f}%)")
+
+
+# ===== FONCTIONS UTILITAIRES MODULE =====
+
+def create_rapedia_scraper() -> Optional[RapediaScraper]:
+    """
+    Factory function pour créer une instance RapediaScraper.
+    
+    Returns:
+        Instance RapediaScraper ou None si échec
+    """
+    try:
+        return RapediaScraper()
+    except Exception as e:
+        logging.getLogger(__name__).error(f"❌ Impossible de créer RapediaScraper: {e}")
+        return None
+
+
+def test_rapedia_scraping(artist_name: str = "Booba") -> Dict[str, Any]:
+    """
+    Teste le scraping Rapedia et retourne un rapport de diagnostic.
+    
+    Args:
+        artist_name: Nom d'artiste pour le test
+        
+    Returns:
+        Dictionnaire avec les résultats du test
+    """
+    logger = logging.getLogger(__name__)
+    
+    try:
+        scraper = create_rapedia_scraper()
+        if not scraper:
+            return {
+                'success': False,
+                'error': 'Impossible de créer une instance RapediaScraper'
+            }
+        
+        # Test de connexion
+        connection_ok, connection_msg = scraper.test_connection()
+        
+        # Test de recherche
+        test_tracks = []
+        if connection_ok:
+            try:
+                test_tracks = scraper.search_artist_tracks(artist_name, max_tracks=3)
+            except Exception as e:
+                logger.error(f"Erreur test recherche: {e}")
+        
+        return {
+            'success': connection_ok and len(test_tracks) > 0,
+            'connection_status': connection_msg,
+            'test_artist': artist_name,
+            'tracks_found': len(test_tracks),
+            'sample_tracks': test_tracks[:2] if test_tracks else [],
+            'performance_stats': scraper.get_stats(),
+            'rapedia_available': connection_ok
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur test Rapedia: {e}")
+        return {
+            'success': False,
+            'error': str(e)
+        }
+
+
+def extract_rap_francais_data(artist_names: List[str]) -> Dict[str, Any]:
+    """
+    Extraction spécialisée pour le rap français via Rapedia.
+    
+    Args:
+        artist_names: Liste des artistes de rap français
+        
+    Returns:
+        Compilation des données extraites
+    """
+    logger = logging.getLogger(__name__)
+    
+    try:
+        scraper = create_rapedia_scraper()
+        if not scraper:
+            return {'success': False, 'error': 'Scraper creation failed'}
+        
+        logger.info(f"🎯 Extraction rap français: {len(artist_names)} artistes")
+        
+        # Recherche en lot
+        all_results = scraper.batch_search_artists(artist_names, max_tracks_per_artist=50)
+        
+        # Compilation des statistiques
+        total_tracks = sum(len(tracks) for tracks in all_results.values())
+        total_credits = sum(
+            len(track.get('credits', [])) 
+            for tracks in all_results.values() 
+            for track in tracks
+        )
+        
+        # Collecte des collaborateurs uniques
+        all_collaborators = set()
+        for tracks in all_results.values():
+            for track in tracks:
+                for credit in track.get('credits', []):
+                    collaborator = credit.get('person_name')
+                    if collaborator:
+                        all_collaborators.add(collaborator)
+        
+        return {
+            'success': True,
+            'artists_processed': len(artist_names),
+            'total_tracks_found': total_tracks,
+            'total_credits_extracted': total_credits,
+            'unique_collaborators': len(all_collaborators),
+            'collaborators_sample': sorted(list(all_collaborators))[:20],
+            'detailed_results': all_results,
+            'extraction_stats': scraper.get_stats()
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Erreur extraction rap français: {e}")
+        return {'success': False, 'error': str(e)}
