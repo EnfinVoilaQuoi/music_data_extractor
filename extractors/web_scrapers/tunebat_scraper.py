@@ -238,4 +238,4 @@ class TuneBatScraper:
             # Chercher des infos BPM dans le texte
             bpm_match = re.search(r'(\d+)\s*BPM', text, re.IGNORECASE)
             if bpm_match:
-                result_data['bpm'] = int(bpm_match.group(1
+                result_data['bpm'] = int(bpm_match.group(1))

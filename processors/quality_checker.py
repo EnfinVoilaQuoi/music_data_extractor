@@ -1,260 +1,3 @@
-    def check_track_quality(self, track: Track) -> QualityAnalysis:
-        """
-        Vérifie la qualité d'un track.
-        
-        Args:
-            track: Track à analyser
-            
-        Returns:
-            QualityAnalysis: Analyse complète de la qualité
-        """
-        issues = []
-        metrics = {}
-        
-        try:
-            # Vérifications de complétude
-            completeness_issues, completeness_score = self._check_track_completeness(track)
-            issues.extend(completeness_issues)
-            metrics[QualityMetric.COMPLETENESS] = completeness_score
-            
-            # Vérifications de validité
-            validity_issues, validity_score = self._check_track_validity(track)
-            issues.extend(validity_issues)
-            metrics[QualityMetric.VALIDITY] = validity_score
-            
-            # Vérifications de cohérence
-            consistency_issues, consistency_score = self._check_track_consistency(track)
-            issues.extend(consistency_issues)
-            metrics[QualityMetric.CONSISTENCY] = consistency_score
-            
-            # Vérifications de précision
-            accuracy_issues, accuracy_score = self._check_track_accuracy(track)
-            issues.extend(accuracy_issues)
-            metrics[QualityMetric.ACCURACY] = accuracy_score
-            
-            # Vérifications de fraîcheur
-            freshness_issues, freshness_score = self._check_track_freshness(track)
-            issues.extend(freshness_issues)
-            metrics[QualityMetric.FRESHNESS] = freshness_score
-            
-            # Vérifications d'unicité
-            uniqueness_issues, uniqueness_score = self._check_track_uniqueness(track)
-            issues.extend(uniqueness_issues)
-            metrics[QualityMetric.UNIQUENESS] = uniqueness_score
-            
-            # Calcul du score global
-            overall_score = self._calculate_overall_quality_score(metrics, issues)
-            quality_level = self._determine_quality_level(overall_score)
-            
-            # Génération des recommandations
-            recommendations = self._generate_track_recommendations(issues)
-            
-            return QualityAnalysis(
-                entity_id=track.id,
-                entity_type="track",
-                quality_level=quality_level,
-                quality_score=overall_score,
-                metrics=metrics,
-                issues=issues,
-                recommendations=recommendations,
-                last_checked=datetime.now()
-            )
-            
-        except Exception as e:
-            self.logger.error(f"Erreur vérification qualité track '{track.title}': {e}")
-            return QualityAnalysis(
-                entity_id=track.id,
-                entity_type="track",
-                quality_level=QualityLevel.VERY_POOR,
-                quality_score=0.0,
-                metrics={},
-                issues=[QualityIssue(
-                    check_type=QualityCheck.EMPTY_CREDITS,  # Placeholder
-                    metric=QualityMetric.VALIDITY,
-                    severity="critical",
-                    message=f"Erreur lors de la vérification: {e}"
-                )],
-                recommendations=[],
-                last_checked=datetime.now()
-            )
-    
-    def _check_track_completeness(self, track: Track) -> Tuple[List[QualityIssue], float]:
-        """Vérifie la complétude des données d'un track"""
-        issues = []
-        score = 0.0
-        max_score = 100.0
-        
-        # Vérification des champs essentiels
-        if not track.title or not track.title.strip():
-            issues.append(QualityIssue(
-                check_type=QualityCheck.MISSING_PRODUCER,  # Placeholder car pas de MISSING_TITLE
-                metric=QualityMetric.COMPLETENESS,
-                severity="critical",
-                message="Titre manquant",
-                field="title",
-                suggestion="Ajouter un titre valide"
-            ))
-        else:
-            score += 20
-        
-        if not track.artist_name:
-            issues.append(QualityIssue(
-                check_type=QualityCheck.INVALID_ARTIST_NAME,
-                metric=QualityMetric.COMPLETENESS,
-                severity="critical",
-                message="Nom d'artiste manquant",
-                field="artist_name",
-                suggestion="Ajouter le nom de l'artiste"
-            ))
-        else:
-            score += 20
-        
-        # Vérification producteur
-        has_producer = any(c.credit_category == CreditCategory.PRODUCER for c in track.credits)
-        if not has_producer and self.config['require_producer']:
-            issues.append(QualityIssue(
-                check_type=QualityCheck.MISSING_PRODUCER,
-                metric=QualityMetric.COMPLETENESS,
-                severity="major",
-                message="Aucun producteur identifié",
-                field="credits",
-                suggestion="Ajouter les crédits de production"
-            ))
-        else:
-            score += 15
-        
-        # Vérification durée
-        if not track.duration_seconds:
-            if self.config['require_bpm']:  # Utiliser la config existante
-                issues.append(QualityIssue(
-                    check_type=QualityCheck.MISSING_DURATION,
-                    metric=QualityMetric.COMPLETENESS,
-                    severity="major",
-                    message="Durée manquante",
-                    field="duration_seconds",
-                    suggestion="Ajouter la durée du morceau"
-                ))
-        else:
-            score += 10
-        
-        # Vérification BPM
-        if not track.bpm and self.config['require_bpm']:
-            issues.append(QualityIssue(
-                check_type=QualityCheck.MISSING_BPM,
-                metric=QualityMetric.COMPLETENESS,
-                severity="minor",
-                message="BPM manquant",
-                field="bpm",
-                suggestion="Ajouter le BPM du morceau"
-            ))
-        else:
-            score += 10
-        
-        # Vérification album
-        if not track.album_title:
-            issues.append(QualityIssue(
-                check_type=QualityCheck.MISSING_ALBUM,
-                metric=QualityMetric.COMPLETENESS,
-                severity="minor",
-                message="Informations d'album manquantes",
-                field="album_title",
-                suggestion="Associer le track à un album"
-            ))
-        else:
-            score += 10
-        
-        # Vérification crédits
-        if not track.credits:
-            issues.append(QualityIssue(
-                check_type=QualityCheck.EMPTY_CREDITS,
-                metric=QualityMetric.COMPLETENESS,
-                severity="major",
-                message="Aucun crédit trouvé",
-                field="credits",
-                suggestion="Ajouter les crédits du morceau"
-            ))
-        else:
-            score += 10
-        
-        # Bonus pour données additionnelles
-        if track.lyrics:
-            score += 3
-        if track.key:
-            score += 2
-        
-        return issues, min(score, max_score)
-    
-    def _check_track_validity(self, track: Track) -> Tuple[List[QualityIssue], float]:
-        """Vérifie la validité des données d'un track"""
-        issues = []
-        score = 100.0
-        
-        # Validation nom d'artiste
-        if track.artist_name and not validate_artist_name(track.artist_name):
-            issues.append(QualityIssue(
-                check_type=QualityCheck.INVALID_ARTIST_NAME,
-                metric=QualityMetric.VALIDITY,
-                severity="major",
-                message=f"Nom d'artiste invalide: '{track.artist_name}'",
-                field="artist_name",
-                value=track.artist_name,
-                suggestion="Corriger le nom de l'artiste"
-            ))
-            score -= 20
-        
-        # Validation durée
-        if track.duration_seconds:
-            if track.duration_seconds < self.config['min_duration']:
-                issues.append(QualityIssue(
-                    check_type=QualityCheck.SUSPICIOUS_DURATION,
-                    metric=QualityMetric.VALIDITY,
-                    severity="major",
-                    message=f"Durée très courte: {track.duration_seconds}s",
-                    field="duration_seconds",
-                    value=track.duration_seconds,
-                    suggestion="Vérifier la durée du morceau"
-                ))
-                score -= 15
-            elif track.duration_seconds > self.config['max_duration']:
-                issues.append(QualityIssue(
-                    check_type=QualityCheck.SUSPICIOUS_DURATION,
-                    metric=QualityMetric.VALIDITY,
-                    severity="minor",
-                    message=f"Durée très longue: {track.duration_seconds}s",
-                    field="duration_seconds",
-                    value=track.duration_seconds,
-                    suggestion="Vérifier la durée du morceau"
-                ))
-                score -= 10
-        
-        # Validation BPM
-        if track.bpm:
-            if track.bpm < self.config['min_bpm'] or track.bpm > self.config['max_bpm']:
-                issues.append(QualityIssue(
-                    check_type=QualityCheck.SUSPICIOUS_BPM,
-                    metric=QualityMetric.VALIDITY,
-                    severity="minor",
-                    message=f"BPM suspect: {track.bpm}",
-                    field="bpm",
-                    value=track.bpm,
-                    suggestion="Vérifier le BPM du morceau"
-                ))
-                score -= 10
-        
-        # Validation IDs externes
-        if track.genius_id and not str(track.genius_id).isdigit():
-            issues.append(QualityIssue(
-                check_type=QualityCheck.INVALID_EXTERNAL_IDS,
-                metric=QualityMetric.VALIDITY,
-                severity="minor",
-                message="ID Genius invalide",
-                field="genius_id",
-                value=track.genius_id,
-                suggestion="Corriger l'ID Genius"
-            ))
-            score -= 5
-        
-        if track.spotify_id and not re.match(r'^[a-zA-Z0-9]{22}# processors/quality_checker.py
 import logging
 import re
 from typing import Dict, List, Optional, Any, Set, Tuple
@@ -1411,3 +1154,260 @@ class QualityChecker:
         
         Args:
             track: Track à
+                def check_track_quality(self, track: Track) -> QualityAnalysis:
+        """
+        Vérifie la qualité d'un track.
+        
+        Args:
+            track: Track à analyser
+            
+        Returns:
+            QualityAnalysis: Analyse complète de la qualité
+        """
+        issues = []
+        metrics = {}
+        
+        try:
+            # Vérifications de complétude
+            completeness_issues, completeness_score = self._check_track_completeness(track)
+            issues.extend(completeness_issues)
+            metrics[QualityMetric.COMPLETENESS] = completeness_score
+            
+            # Vérifications de validité
+            validity_issues, validity_score = self._check_track_validity(track)
+            issues.extend(validity_issues)
+            metrics[QualityMetric.VALIDITY] = validity_score
+            
+            # Vérifications de cohérence
+            consistency_issues, consistency_score = self._check_track_consistency(track)
+            issues.extend(consistency_issues)
+            metrics[QualityMetric.CONSISTENCY] = consistency_score
+            
+            # Vérifications de précision
+            accuracy_issues, accuracy_score = self._check_track_accuracy(track)
+            issues.extend(accuracy_issues)
+            metrics[QualityMetric.ACCURACY] = accuracy_score
+            
+            # Vérifications de fraîcheur
+            freshness_issues, freshness_score = self._check_track_freshness(track)
+            issues.extend(freshness_issues)
+            metrics[QualityMetric.FRESHNESS] = freshness_score
+            
+            # Vérifications d'unicité
+            uniqueness_issues, uniqueness_score = self._check_track_uniqueness(track)
+            issues.extend(uniqueness_issues)
+            metrics[QualityMetric.UNIQUENESS] = uniqueness_score
+            
+            # Calcul du score global
+            overall_score = self._calculate_overall_quality_score(metrics, issues)
+            quality_level = self._determine_quality_level(overall_score)
+            
+            # Génération des recommandations
+            recommendations = self._generate_track_recommendations(issues)
+            
+            return QualityAnalysis(
+                entity_id=track.id,
+                entity_type="track",
+                quality_level=quality_level,
+                quality_score=overall_score,
+                metrics=metrics,
+                issues=issues,
+                recommendations=recommendations,
+                last_checked=datetime.now()
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Erreur vérification qualité track '{track.title}': {e}")
+            return QualityAnalysis(
+                entity_id=track.id,
+                entity_type="track",
+                quality_level=QualityLevel.VERY_POOR,
+                quality_score=0.0,
+                metrics={},
+                issues=[QualityIssue(
+                    check_type=QualityCheck.EMPTY_CREDITS,  # Placeholder
+                    metric=QualityMetric.VALIDITY,
+                    severity="critical",
+                    message=f"Erreur lors de la vérification: {e}"
+                )],
+                recommendations=[],
+                last_checked=datetime.now()
+            )
+    
+    def _check_track_completeness(self, track: Track) -> Tuple[List[QualityIssue], float]:
+        """Vérifie la complétude des données d'un track"""
+        issues = []
+        score = 0.0
+        max_score = 100.0
+        
+        # Vérification des champs essentiels
+        if not track.title or not track.title.strip():
+            issues.append(QualityIssue(
+                check_type=QualityCheck.MISSING_PRODUCER,  # Placeholder car pas de MISSING_TITLE
+                metric=QualityMetric.COMPLETENESS,
+                severity="critical",
+                message="Titre manquant",
+                field="title",
+                suggestion="Ajouter un titre valide"
+            ))
+        else:
+            score += 20
+        
+        if not track.artist_name:
+            issues.append(QualityIssue(
+                check_type=QualityCheck.INVALID_ARTIST_NAME,
+                metric=QualityMetric.COMPLETENESS,
+                severity="critical",
+                message="Nom d'artiste manquant",
+                field="artist_name",
+                suggestion="Ajouter le nom de l'artiste"
+            ))
+        else:
+            score += 20
+        
+        # Vérification producteur
+        has_producer = any(c.credit_category == CreditCategory.PRODUCER for c in track.credits)
+        if not has_producer and self.config['require_producer']:
+            issues.append(QualityIssue(
+                check_type=QualityCheck.MISSING_PRODUCER,
+                metric=QualityMetric.COMPLETENESS,
+                severity="major",
+                message="Aucun producteur identifié",
+                field="credits",
+                suggestion="Ajouter les crédits de production"
+            ))
+        else:
+            score += 15
+        
+        # Vérification durée
+        if not track.duration_seconds:
+            if self.config['require_bpm']:  # Utiliser la config existante
+                issues.append(QualityIssue(
+                    check_type=QualityCheck.MISSING_DURATION,
+                    metric=QualityMetric.COMPLETENESS,
+                    severity="major",
+                    message="Durée manquante",
+                    field="duration_seconds",
+                    suggestion="Ajouter la durée du morceau"
+                ))
+        else:
+            score += 10
+        
+        # Vérification BPM
+        if not track.bpm and self.config['require_bpm']:
+            issues.append(QualityIssue(
+                check_type=QualityCheck.MISSING_BPM,
+                metric=QualityMetric.COMPLETENESS,
+                severity="minor",
+                message="BPM manquant",
+                field="bpm",
+                suggestion="Ajouter le BPM du morceau"
+            ))
+        else:
+            score += 10
+        
+        # Vérification album
+        if not track.album_title:
+            issues.append(QualityIssue(
+                check_type=QualityCheck.MISSING_ALBUM,
+                metric=QualityMetric.COMPLETENESS,
+                severity="minor",
+                message="Informations d'album manquantes",
+                field="album_title",
+                suggestion="Associer le track à un album"
+            ))
+        else:
+            score += 10
+        
+        # Vérification crédits
+        if not track.credits:
+            issues.append(QualityIssue(
+                check_type=QualityCheck.EMPTY_CREDITS,
+                metric=QualityMetric.COMPLETENESS,
+                severity="major",
+                message="Aucun crédit trouvé",
+                field="credits",
+                suggestion="Ajouter les crédits du morceau"
+            ))
+        else:
+            score += 10
+        
+        # Bonus pour données additionnelles
+        if track.lyrics:
+            score += 3
+        if track.key:
+            score += 2
+        
+        return issues, min(score, max_score)
+    
+    def _check_track_validity(self, track: Track) -> Tuple[List[QualityIssue], float]:
+        """Vérifie la validité des données d'un track"""
+        issues = []
+        score = 100.0
+        
+        # Validation nom d'artiste
+        if track.artist_name and not validate_artist_name(track.artist_name):
+            issues.append(QualityIssue(
+                check_type=QualityCheck.INVALID_ARTIST_NAME,
+                metric=QualityMetric.VALIDITY,
+                severity="major",
+                message=f"Nom d'artiste invalide: '{track.artist_name}'",
+                field="artist_name",
+                value=track.artist_name,
+                suggestion="Corriger le nom de l'artiste"
+            ))
+            score -= 20
+        
+        # Validation durée
+        if track.duration_seconds:
+            if track.duration_seconds < self.config['min_duration']:
+                issues.append(QualityIssue(
+                    check_type=QualityCheck.SUSPICIOUS_DURATION,
+                    metric=QualityMetric.VALIDITY,
+                    severity="major",
+                    message=f"Durée très courte: {track.duration_seconds}s",
+                    field="duration_seconds",
+                    value=track.duration_seconds,
+                    suggestion="Vérifier la durée du morceau"
+                ))
+                score -= 15
+            elif track.duration_seconds > self.config['max_duration']:
+                issues.append(QualityIssue(
+                    check_type=QualityCheck.SUSPICIOUS_DURATION,
+                    metric=QualityMetric.VALIDITY,
+                    severity="minor",
+                    message=f"Durée très longue: {track.duration_seconds}s",
+                    field="duration_seconds",
+                    value=track.duration_seconds,
+                    suggestion="Vérifier la durée du morceau"
+                ))
+                score -= 10
+        
+        # Validation BPM
+        if track.bpm:
+            if track.bpm < self.config['min_bpm'] or track.bpm > self.config['max_bpm']:
+                issues.append(QualityIssue(
+                    check_type=QualityCheck.SUSPICIOUS_BPM,
+                    metric=QualityMetric.VALIDITY,
+                    severity="minor",
+                    message=f"BPM suspect: {track.bpm}",
+                    field="bpm",
+                    value=track.bpm,
+                    suggestion="Vérifier le BPM du morceau"
+                ))
+                score -= 10
+        
+        # Validation IDs externes
+        if track.genius_id and not str(track.genius_id).isdigit():
+            issues.append(QualityIssue(
+                check_type=QualityCheck.INVALID_EXTERNAL_IDS,
+                metric=QualityMetric.VALIDITY,
+                severity="minor",
+                message="ID Genius invalide",
+                field="genius_id",
+                value=track.genius_id,
+                suggestion="Corriger l'ID Genius"
+            ))
+            score -= 5
+        
+        if track.spotify_id and not re.match(r'^[a-zA-Z0-9]{22}# processors/quality_checker.py

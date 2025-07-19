@@ -384,4 +384,6 @@ class MetadataEnricher:
                         'action': 'added',
                         'value': language,
                         'confidence': 0.6,
-                        'reason':
+                        'reason': 'Inferred from language list or context',
+                        'source': 'inference'
+                    })

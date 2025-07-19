@@ -1,3 +1,285 @@
+import logging
+import re
+from typing import Dict, List, Optional, Any, Set, Tuple, Union
+from datetime import datetime
+from dataclasses import dataclass
+from enum import Enum
+
+from ..models.entities import Track, Credit, Artist, Album
+from ..models.enums import CreditType, CreditCategory, DataSource, AlbumType
+from ..core.database import Database
+from ..config.settings import settings
+from ..utils.text_utils import similarity_ratio, extract_year_from_date
+
+class EnrichmentSource(Enum):
+    """Sources d'enrichissement"""
+    GENIUS_API = "genius_api"
+    SPOTIFY_API = "spotify_api"
+    DISCOGS_API = "discogs_api"
+    LASTFM_API = "lastfm_api"
+    WEB_SCRAPING = "web_scraping"
+    CROSS_REFERENCE = "cross_reference"  # Enrichissement croisé entre entités
+    INFERENCE = "inference"              # Inférence basée sur les données existantes
+    EXTERNAL_DB = "external_db"          # Bases de données externes
+
+class EnrichmentType(Enum):
+    """Types d'enrichissement"""
+    MISSING_DATA = "missing_data"        # Compléter données manquantes
+    METADATA = "metadata"                # Ajouter métadonnées
+    RELATIONSHIPS = "relationships"      # Établir relations
+    VALIDATION = "validation"           # Valider données existantes
+    ENHANCEMENT = "enhancement"         # Améliorer qualité données
+    CROSS_LINK = "cross_link"          # Lier données entre sources
+
+@dataclass
+class EnrichmentResult:
+    """Résultat d'enrichissement"""
+    entity_id: int
+    entity_type: str
+    enrichment_type: EnrichmentType
+    source: EnrichmentSource
+    field: str
+    old_value: Optional[Any]
+    new_value: Any
+    confidence: float  # 0-1
+    success: bool
+    message: str
+
+@dataclass
+class EnrichmentStats:
+    """Statistiques d'enrichissement"""
+    total_processed: int = 0
+    successful_enrichments: int = 0
+    failed_enrichments: int = 0
+    fields_enriched: Dict[str, int] = None
+    sources_used: Dict[str, int] = None
+    
+    def __post_init__(self):
+        if self.fields_enriched is None:
+            self.fields_enriched = {}
+        if self.sources_used is None:
+            self.sources_used = {}
+
+class DataEnricher:
+    """
+    Enrichisseur de données musicales.
+    
+    Responsabilités :
+    - Compléter les données manquantes
+    - Améliorer la qualité des métadonnées
+    - Établir des relations entre entités
+    - Valider et corriger les données existantes
+    - Inférer des informations à partir du contexte
+    """
+    
+    def __init__(self, database: Optional[Database] = None):
+        self.logger = logging.getLogger(__name__)
+        self.database = database or Database()
+        
+        # Configuration d'enrichissement
+        self.config = {
+            'auto_enrich_missing': settings.get('enrichment.auto_enrich_missing', True),
+            'min_confidence_threshold': settings.get('enrichment.min_confidence', 0.7),
+            'max_external_requests': settings.get('enrichment.max_requests_per_session', 100),
+            'enable_inference': settings.get('enrichment.enable_inference', True),
+            'prefer_official_sources': settings.get('enrichment.prefer_official_sources', True),
+            'cross_reference_validation': settings.get('enrichment.cross_reference', True)
+        }
+        
+        # Règles d'inférence
+        self.inference_rules = self._load_inference_rules()
+        
+        # Cache pour éviter les requêtes répétées
+        self._enrichment_cache = {}
+        
+        self.logger.info("DataEnricher initialisé")
+    
+    def _load_inference_rules(self) -> Dict[str, Any]:
+        """Charge les règles d'inférence"""
+        return {
+            'album_type_rules': {
+                'single': {'max_tracks': 3, 'keywords': ['single', 'feat']},
+                'ep': {'max_tracks': 8, 'min_tracks': 4},
+                'album': {'min_tracks': 8},
+                'mixtape': {'keywords': ['mixtape', 'mix tape', 'street']},
+                'live': {'keywords': ['live', 'concert', 'tour']}
+            },
+            'genre_inference': {
+                'rap_keywords': ['rap', 'hip hop', 'hip-hop', 'trap', 'drill'],
+                'producer_patterns': {
+                    'trap': ['808', 'mafia', 'south', 'atlanta'],
+                    'boom_bap': ['boom', 'bap', 'classic', 'east'],
+                    'drill': ['drill', 'uk', 'chicago']
+                }
+            },
+            'collaboration_rules': {
+                'featuring_threshold': 0.3,  # Si >30% des tracks ont des featuring
+                'crew_detection': 0.5       # Si >50% des collaborateurs récurrents
+            },
+            'temporal_rules': {
+                'era_inference': {
+                    '1980-1995': 'old_school',
+                    '1995-2005': 'golden_age',
+                    '2005-2015': 'modern',
+                    '2015-': 'contemporary'
+                }
+            }
+        }
+    
+    def enrich_track(self, track: Track, enrich_types: Optional[List[EnrichmentType]] = None) -> List[EnrichmentResult]:
+        """
+        Enrichit les données d'un track.
+        
+        Args:
+            track: Track à enrichir
+            enrich_types: Types d'enrichissement à effectuer
+            
+        Returns:
+            Liste des résultats d'enrichissement
+        """
+        if enrich_types is None:
+            enrich_types = [EnrichmentType.MISSING_DATA, EnrichmentType.METADATA, EnrichmentType.RELATIONSHIPS]
+        
+        results = []
+        
+        try:
+            self.logger.info(f"Enrichissement du track '{track.title}'")
+            
+            for enrich_type in enrich_types:
+                if enrich_type == EnrichmentType.MISSING_DATA:
+                    results.extend(self._enrich_missing_track_data(track))
+                elif enrich_type == EnrichmentType.METADATA:
+                    results.extend(self._enrich_track_metadata(track))
+                elif enrich_type == EnrichmentType.RELATIONSHIPS:
+                    results.extend(self._enrich_track_relationships(track))
+                elif enrich_type == EnrichmentType.VALIDATION:
+                    results.extend(self._validate_and_correct_track_data(track))
+                elif enrich_type == EnrichmentType.ENHANCEMENT:
+                    results.extend(self._enhance_track_data(track))
+            
+            # Mettre à jour le track en base si des enrichissements ont réussi
+            successful_enrichments = [r for r in results if r.success]
+            if successful_enrichments:
+                track.updated_at = datetime.now()
+                self.database.update_track(track)
+                self.logger.info(f"Track '{track.title}' enrichi avec {len(successful_enrichments)} améliorations")
+            
+            return results
+            
+        except Exception as e:
+            self.logger.error(f"Erreur enrichissement track '{track.title}': {e}")
+            return [EnrichmentResult(
+                entity_id=track.id,
+                entity_type="track",
+                enrichment_type=EnrichmentType.MISSING_DATA,
+                source=EnrichmentSource.INFERENCE,
+                field="error",
+                old_value=None,
+                new_value=None,
+                confidence=0.0,
+                success=False,
+                message=f"Erreur lors de l'enrichissement: {e}"
+            )]
+    
+    def _enrich_missing_track_data(self, track: Track) -> List[EnrichmentResult]:
+        """Enrichit les données manquantes d'un track"""
+        results = []
+        
+        # Enrichir la durée manquante
+        if not track.duration_seconds:
+            duration_result = self._infer_track_duration(track)
+            if duration_result:
+                results.append(duration_result)
+        
+        # Enrichir le BPM manquant
+        if not track.bpm:
+            bpm_result = self._infer_track_bpm(track)
+            if bpm_result:
+                results.append(bpm_result)
+        
+        # Enrichir l'album manquant
+        if not track.album_title:
+            album_result = self._infer_track_album(track)
+            if album_result:
+                results.append(album_result)
+        
+        # Enrichir l'année de sortie
+        if not track.release_year:
+            year_result = self._infer_release_year(track)
+            if year_result:
+                results.append(year_result)
+        
+        # Enrichir les crédits manquants
+        if not track.credits or len(track.credits) < self.config.get('min_credits_expected', 1):
+            credit_results = self._infer_missing_credits(track)
+            results.extend(credit_results)
+        
+        return results
+    
+    def _infer_track_duration(self, track: Track) -> Optional[EnrichmentResult]:
+        """Infère la durée d'un track"""
+        try:
+            # Rechercher des tracks similaires du même artiste
+            similar_tracks = self._find_similar_tracks(track)
+            
+            if similar_tracks:
+                durations = [t.duration_seconds for t in similar_tracks if t.duration_seconds]
+                if durations:
+                    # Utiliser la médiane pour éviter les outliers
+                    from statistics import median
+                    inferred_duration = int(median(durations))
+                    
+                    # Validation de cohérence
+                    if 30 <= inferred_duration <= 600:  # Entre 30s et 10min
+                        track.duration_seconds = inferred_duration
+                        
+                        return EnrichmentResult(
+                            entity_id=track.id,
+                            entity_type="track",
+                            enrichment_type=EnrichmentType.MISSING_DATA,
+                            source=EnrichmentSource.INFERENCE,
+                            field="duration_seconds",
+                            old_value=None,
+                            new_value=inferred_duration,
+                            confidence=0.7,
+                            success=True,
+                            message=f"Durée inférée à partir de {len(durations)} tracks similaires"
+                        )
+        
+        except Exception as e:
+            self.logger.warning(f"Erreur inférence durée pour '{track.title}': {e}")
+        
+        return None
+    
+    def _infer_track_bpm(self, track: Track) -> Optional[EnrichmentResult]:
+        """Infère le BPM d'un track"""
+        try:
+            # Rechercher des tracks du même album
+            if track.album_title:
+                album_tracks = self._get_tracks_from_album(track.album_title, track.artist_id)
+                bpms = [t.bpm for t in album_tracks if t.bpm and t.id != track.id]
+                
+                if bpms:
+                    # Utiliser la moyenne pour les BPM
+                    from statistics import mean
+                    inferred_bpm = int(mean(bpms))
+                    
+                    if 60 <= inferred_bpm <= 200:  # BPM raisonnable pour le rap
+                        track.bpm = inferred_bpm
+                        
+                        return EnrichmentResult(
+                            entity_id=track.id,
+                            entity_type="track",
+                            enrichment_type=EnrichmentType.MISSING_DATA,
+                            source=EnrichmentSource.INFERENCE,
+                            field="bpm",
+                            old_value=None,
+                            new_value=inferred_bpm,
+                            confidence=0.6,
+                            success=True,
+                            message=f"BPM inféré à partir de l'album ({len(bpms)} tracks)"
+                        )
+        
         except Exception as e:
             self.logger.warning(f"Erreur inférence BPM pour '{track.title}': {e}")
         
@@ -1186,287 +1468,3 @@
                 total_calls += task['tracks_to_enrich']
         
         return total_calls# processors/data_enricher.py
-import logging
-import re
-from typing import Dict, List, Optional, Any, Set, Tuple, Union
-from datetime import datetime
-from dataclasses import dataclass
-from enum import Enum
-
-from ..models.entities import Track, Credit, Artist, Album
-from ..models.enums import CreditType, CreditCategory, DataSource, AlbumType
-from ..core.database import Database
-from ..config.settings import settings
-from ..utils.text_utils import similarity_ratio, extract_year_from_date
-
-class EnrichmentSource(Enum):
-    """Sources d'enrichissement"""
-    GENIUS_API = "genius_api"
-    SPOTIFY_API = "spotify_api"
-    DISCOGS_API = "discogs_api"
-    LASTFM_API = "lastfm_api"
-    WEB_SCRAPING = "web_scraping"
-    CROSS_REFERENCE = "cross_reference"  # Enrichissement croisé entre entités
-    INFERENCE = "inference"              # Inférence basée sur les données existantes
-    EXTERNAL_DB = "external_db"          # Bases de données externes
-
-class EnrichmentType(Enum):
-    """Types d'enrichissement"""
-    MISSING_DATA = "missing_data"        # Compléter données manquantes
-    METADATA = "metadata"                # Ajouter métadonnées
-    RELATIONSHIPS = "relationships"      # Établir relations
-    VALIDATION = "validation"           # Valider données existantes
-    ENHANCEMENT = "enhancement"         # Améliorer qualité données
-    CROSS_LINK = "cross_link"          # Lier données entre sources
-
-@dataclass
-class EnrichmentResult:
-    """Résultat d'enrichissement"""
-    entity_id: int
-    entity_type: str
-    enrichment_type: EnrichmentType
-    source: EnrichmentSource
-    field: str
-    old_value: Optional[Any]
-    new_value: Any
-    confidence: float  # 0-1
-    success: bool
-    message: str
-
-@dataclass
-class EnrichmentStats:
-    """Statistiques d'enrichissement"""
-    total_processed: int = 0
-    successful_enrichments: int = 0
-    failed_enrichments: int = 0
-    fields_enriched: Dict[str, int] = None
-    sources_used: Dict[str, int] = None
-    
-    def __post_init__(self):
-        if self.fields_enriched is None:
-            self.fields_enriched = {}
-        if self.sources_used is None:
-            self.sources_used = {}
-
-class DataEnricher:
-    """
-    Enrichisseur de données musicales.
-    
-    Responsabilités :
-    - Compléter les données manquantes
-    - Améliorer la qualité des métadonnées
-    - Établir des relations entre entités
-    - Valider et corriger les données existantes
-    - Inférer des informations à partir du contexte
-    """
-    
-    def __init__(self, database: Optional[Database] = None):
-        self.logger = logging.getLogger(__name__)
-        self.database = database or Database()
-        
-        # Configuration d'enrichissement
-        self.config = {
-            'auto_enrich_missing': settings.get('enrichment.auto_enrich_missing', True),
-            'min_confidence_threshold': settings.get('enrichment.min_confidence', 0.7),
-            'max_external_requests': settings.get('enrichment.max_requests_per_session', 100),
-            'enable_inference': settings.get('enrichment.enable_inference', True),
-            'prefer_official_sources': settings.get('enrichment.prefer_official_sources', True),
-            'cross_reference_validation': settings.get('enrichment.cross_reference', True)
-        }
-        
-        # Règles d'inférence
-        self.inference_rules = self._load_inference_rules()
-        
-        # Cache pour éviter les requêtes répétées
-        self._enrichment_cache = {}
-        
-        self.logger.info("DataEnricher initialisé")
-    
-    def _load_inference_rules(self) -> Dict[str, Any]:
-        """Charge les règles d'inférence"""
-        return {
-            'album_type_rules': {
-                'single': {'max_tracks': 3, 'keywords': ['single', 'feat']},
-                'ep': {'max_tracks': 8, 'min_tracks': 4},
-                'album': {'min_tracks': 8},
-                'mixtape': {'keywords': ['mixtape', 'mix tape', 'street']},
-                'live': {'keywords': ['live', 'concert', 'tour']}
-            },
-            'genre_inference': {
-                'rap_keywords': ['rap', 'hip hop', 'hip-hop', 'trap', 'drill'],
-                'producer_patterns': {
-                    'trap': ['808', 'mafia', 'south', 'atlanta'],
-                    'boom_bap': ['boom', 'bap', 'classic', 'east'],
-                    'drill': ['drill', 'uk', 'chicago']
-                }
-            },
-            'collaboration_rules': {
-                'featuring_threshold': 0.3,  # Si >30% des tracks ont des featuring
-                'crew_detection': 0.5       # Si >50% des collaborateurs récurrents
-            },
-            'temporal_rules': {
-                'era_inference': {
-                    '1980-1995': 'old_school',
-                    '1995-2005': 'golden_age',
-                    '2005-2015': 'modern',
-                    '2015-': 'contemporary'
-                }
-            }
-        }
-    
-    def enrich_track(self, track: Track, enrich_types: Optional[List[EnrichmentType]] = None) -> List[EnrichmentResult]:
-        """
-        Enrichit les données d'un track.
-        
-        Args:
-            track: Track à enrichir
-            enrich_types: Types d'enrichissement à effectuer
-            
-        Returns:
-            Liste des résultats d'enrichissement
-        """
-        if enrich_types is None:
-            enrich_types = [EnrichmentType.MISSING_DATA, EnrichmentType.METADATA, EnrichmentType.RELATIONSHIPS]
-        
-        results = []
-        
-        try:
-            self.logger.info(f"Enrichissement du track '{track.title}'")
-            
-            for enrich_type in enrich_types:
-                if enrich_type == EnrichmentType.MISSING_DATA:
-                    results.extend(self._enrich_missing_track_data(track))
-                elif enrich_type == EnrichmentType.METADATA:
-                    results.extend(self._enrich_track_metadata(track))
-                elif enrich_type == EnrichmentType.RELATIONSHIPS:
-                    results.extend(self._enrich_track_relationships(track))
-                elif enrich_type == EnrichmentType.VALIDATION:
-                    results.extend(self._validate_and_correct_track_data(track))
-                elif enrich_type == EnrichmentType.ENHANCEMENT:
-                    results.extend(self._enhance_track_data(track))
-            
-            # Mettre à jour le track en base si des enrichissements ont réussi
-            successful_enrichments = [r for r in results if r.success]
-            if successful_enrichments:
-                track.updated_at = datetime.now()
-                self.database.update_track(track)
-                self.logger.info(f"Track '{track.title}' enrichi avec {len(successful_enrichments)} améliorations")
-            
-            return results
-            
-        except Exception as e:
-            self.logger.error(f"Erreur enrichissement track '{track.title}': {e}")
-            return [EnrichmentResult(
-                entity_id=track.id,
-                entity_type="track",
-                enrichment_type=EnrichmentType.MISSING_DATA,
-                source=EnrichmentSource.INFERENCE,
-                field="error",
-                old_value=None,
-                new_value=None,
-                confidence=0.0,
-                success=False,
-                message=f"Erreur lors de l'enrichissement: {e}"
-            )]
-    
-    def _enrich_missing_track_data(self, track: Track) -> List[EnrichmentResult]:
-        """Enrichit les données manquantes d'un track"""
-        results = []
-        
-        # Enrichir la durée manquante
-        if not track.duration_seconds:
-            duration_result = self._infer_track_duration(track)
-            if duration_result:
-                results.append(duration_result)
-        
-        # Enrichir le BPM manquant
-        if not track.bpm:
-            bpm_result = self._infer_track_bpm(track)
-            if bpm_result:
-                results.append(bpm_result)
-        
-        # Enrichir l'album manquant
-        if not track.album_title:
-            album_result = self._infer_track_album(track)
-            if album_result:
-                results.append(album_result)
-        
-        # Enrichir l'année de sortie
-        if not track.release_year:
-            year_result = self._infer_release_year(track)
-            if year_result:
-                results.append(year_result)
-        
-        # Enrichir les crédits manquants
-        if not track.credits or len(track.credits) < self.config.get('min_credits_expected', 1):
-            credit_results = self._infer_missing_credits(track)
-            results.extend(credit_results)
-        
-        return results
-    
-    def _infer_track_duration(self, track: Track) -> Optional[EnrichmentResult]:
-        """Infère la durée d'un track"""
-        try:
-            # Rechercher des tracks similaires du même artiste
-            similar_tracks = self._find_similar_tracks(track)
-            
-            if similar_tracks:
-                durations = [t.duration_seconds for t in similar_tracks if t.duration_seconds]
-                if durations:
-                    # Utiliser la médiane pour éviter les outliers
-                    from statistics import median
-                    inferred_duration = int(median(durations))
-                    
-                    # Validation de cohérence
-                    if 30 <= inferred_duration <= 600:  # Entre 30s et 10min
-                        track.duration_seconds = inferred_duration
-                        
-                        return EnrichmentResult(
-                            entity_id=track.id,
-                            entity_type="track",
-                            enrichment_type=EnrichmentType.MISSING_DATA,
-                            source=EnrichmentSource.INFERENCE,
-                            field="duration_seconds",
-                            old_value=None,
-                            new_value=inferred_duration,
-                            confidence=0.7,
-                            success=True,
-                            message=f"Durée inférée à partir de {len(durations)} tracks similaires"
-                        )
-        
-        except Exception as e:
-            self.logger.warning(f"Erreur inférence durée pour '{track.title}': {e}")
-        
-        return None
-    
-    def _infer_track_bpm(self, track: Track) -> Optional[EnrichmentResult]:
-        """Infère le BPM d'un track"""
-        try:
-            # Rechercher des tracks du même album
-            if track.album_title:
-                album_tracks = self._get_tracks_from_album(track.album_title, track.artist_id)
-                bpms = [t.bpm for t in album_tracks if t.bpm and t.id != track.id]
-                
-                if bpms:
-                    # Utiliser la moyenne pour les BPM
-                    from statistics import mean
-                    inferred_bpm = int(mean(bpms))
-                    
-                    if 60 <= inferred_bpm <= 200:  # BPM raisonnable pour le rap
-                        track.bpm = inferred_bpm
-                        
-                        return EnrichmentResult(
-                            entity_id=track.id,
-                            entity_type="track",
-                            enrichment_type=EnrichmentType.MISSING_DATA,
-                            source=EnrichmentSource.INFERENCE,
-                            field="bpm",
-                            old_value=None,
-                            new_value=inferred_bpm,
-                            confidence=0.6,
-                            success=True,
-                            message=f"BPM inféré à partir de l'album ({len(bpms)} tracks)"
-                        )
-        
-        except Exception as e:
-            
