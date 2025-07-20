@@ -17,11 +17,10 @@ from config.settings import settings
 from utils.text_utils import normalize_text, clean_artist_name, calculate_similarity
 from models.enums import DataSource, Genre, CreditCategory, DataQuality
 
-
 class MetadataEnricher:
     """
     Enrichisseur spécialisé pour les métadonnées musicales.
-    
+
     Fonctionnalités optimisées :
     - Complément des données manquantes par inférence
     - Validation et correction des métadonnées existantes
@@ -31,10 +30,10 @@ class MetadataEnricher:
     - Cache intelligent pour éviter les retraitements
     - Scoring de qualité et confiance des données
     """
-    
+
     def __init__(self):
         self.logger = logging.getLogger(__name__)
-        
+
         # Configuration optimisée
         self.config = {
             'enable_inference': settings.get('enrichment.enable_inference', True),
@@ -45,15 +44,15 @@ class MetadataEnricher:
             'max_inference_depth': settings.get('enrichment.max_inference_depth', 3),
             'genre_normalization': settings.get('enrichment.genre_normalization', True)
         }
-        
+
         # Cache manager
         self.cache_manager = CacheManager(namespace='metadata_enrichment') if CacheManager else None
-        
+
         # Règles d'enrichissement et patterns
         self.enrichment_rules = self._load_enrichment_rules()
         self.genre_mappings = self._load_genre_mappings()
         self.validation_patterns = self._compile_validation_patterns()
-        
+
         # Statistiques d'enrichissement
         self.stats = {
             'items_enriched': 0,
@@ -64,9 +63,9 @@ class MetadataEnricher:
             'cache_hits': 0,
             'total_processing_time': 0.0
         }
-        
+
         self.logger.info("✅ MetadataEnricher optimisé initialisé")
-    
+
     @lru_cache(maxsize=1)
     def _load_enrichment_rules(self) -> Dict[str, Any]:
         """Charge les règles d'enrichissement avec cache"""
@@ -104,7 +103,7 @@ class MetadataEnricher:
                 }
             }
         }
-    
+
     @lru_cache(maxsize=1)
     def _load_genre_mappings(self) -> Dict[str, str]:
         """Charge les mappings de genres avec cache"""
@@ -121,14 +120,14 @@ class MetadataEnricher:
             'old school hip hop': 'Old School Hip-Hop',
             'gangsta rap': 'Gangsta Rap',
             'conscious rap': 'Conscious Hip-Hop',
-            
+
             # Genres français
             'rap français': 'Rap Français',
             'rap francais': 'Rap Français',
             'french rap': 'Rap Français',
             'rap fr': 'Rap Français',
             'chanson française': 'Chanson Française',
-            
+
             # Électronique
             'electronic': 'Electronic',
             'techno': 'Techno',
@@ -136,14 +135,14 @@ class MetadataEnricher:
             'dubstep': 'Dubstep',
             'drum and bass': 'Drum & Bass',
             'dnb': 'Drum & Bass',
-            
+
             # Rock et variantes
             'rock': 'Rock',
             'hard rock': 'Hard Rock',
             'punk': 'Punk',
             'metal': 'Metal',
             'heavy metal': 'Heavy Metal',
-            
+
             # Autres
             'pop': 'Pop',
             'r&b': 'R&B',
@@ -155,7 +154,7 @@ class MetadataEnricher:
             'reggae': 'Reggae',
             'country': 'Country'
         }
-    
+
     @lru_cache(maxsize=1)
     def _compile_validation_patterns(self) -> Dict[str, re.Pattern]:
         """Compile les patterns de validation avec cache"""
@@ -167,76 +166,64 @@ class MetadataEnricher:
             'version_pattern': re.compile(r'\b(acoustic|live|instrumental|acapella|demo)\b', re.IGNORECASE),
             'language_indicators': re.compile(r'\b(french|français|english|spanish|german)\b', re.IGNORECASE)
         }
-    
+
     # ===== MÉTHODES PRINCIPALES =====
-    
+
     def enrich_metadata(self, data_item: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Enrichit les métadonnées d'un élément de données.
-        
-        Args:
-            data_item: Élément à enrichir
-            context: Contexte additionnel pour l'enrichissement
-            
-        Returns:
-            Élément enrichi avec métadonnées améliorées
         """
         import time
         start_time = time.time()
-        
+
         if not data_item:
             return self._empty_result("Élément de données vide")
-        
-        # Génération de la clé de cache
+
         cache_key = self._generate_cache_key(data_item, context)
-        
-        # Vérifier le cache
         if self.cache_manager:
             cached_result = self.cache_manager.get(cache_key)
             if cached_result:
                 self.stats['cache_hits'] += 1
                 return cached_result
-        
+
         try:
-            # Copie de travail en préservant l'original
             enriched_item = data_item.copy() if self.config['preserve_original'] else data_item
             original_item = data_item.copy()
-            
+
             enrichment_log = []
-            
+
             # 1. Validation et nettoyage initial
             if self.config['auto_correction']:
                 corrected_fields = self._validate_and_correct_data(enriched_item)
                 if corrected_fields:
                     enrichment_log.extend(corrected_fields)
                     self.stats['corrections_made'] += len(corrected_fields)
-            
+
             # 2. Enrichissement par inférence
             if self.config['enable_inference']:
                 inferred_fields = self._apply_inference_rules(enriched_item, context)
                 if inferred_fields:
                     enrichment_log.extend(inferred_fields)
                     self.stats['inferences_applied'] += len(inferred_fields)
-            
+
             # 3. Normalisation des genres
             if self.config['genre_normalization']:
                 genre_changes = self._normalize_genres(enriched_item)
                 if genre_changes:
                     enrichment_log.extend(genre_changes)
-            
+
             # 4. Enrichissement croisé (si contexte fourni)
             if context and self.config['cross_validation']:
                 cross_enrichments = self._apply_cross_validation(enriched_item, context)
                 if cross_enrichments:
                     enrichment_log.extend(cross_enrichments)
-            
+
             # 5. Calcul de la qualité des données
             quality_score = self._calculate_data_quality(enriched_item)
-            
+
             # 6. Détection des champs manquants recommandés
             missing_fields = self._identify_missing_fields(enriched_item)
-            
-            # Compilation du résultat
+
             result = {
                 'success': True,
                 'enriched_data': enriched_item,
@@ -256,25 +243,23 @@ class MetadataEnricher:
                     'processing_time': time.time() - start_time
                 }
             }
-            
-            # Mise en cache
+
             if self.cache_manager:
                 self.cache_manager.set(cache_key, result, ttl=3600)
-            
+
             self.stats['items_enriched'] += 1
             self.stats['fields_added'] += result['enrichment_stats']['fields_added']
             self.stats['total_processing_time'] += time.time() - start_time
-            
+
             return result
-            
+
         except Exception as e:
             self.logger.error(f"❌ Erreur enrichissement métadonnées: {e}")
             return self._empty_result(f"Erreur d'enrichissement: {str(e)}")
-    
+
     def _validate_and_correct_data(self, data_item: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Valide et corrige les données existantes"""
         corrections = []
-        
         try:
             # Validation des durées
             duration = data_item.get('duration_ms') or data_item.get('duration')
@@ -290,7 +275,7 @@ class MetadataEnricher:
                         'confidence': 0.9,
                         'reason': 'Duration validation and normalization'
                     })
-            
+
             # Validation des dates
             release_date = data_item.get('release_date') or data_item.get('year')
             if release_date:
@@ -305,7 +290,7 @@ class MetadataEnricher:
                         'confidence': 0.8,
                         'reason': 'Date format standardization'
                     })
-            
+
             # Nettoyage des titres et noms d'artistes
             title = data_item.get('title') or data_item.get('name')
             if title:
@@ -320,7 +305,7 @@ class MetadataEnricher:
                         'confidence': 0.95,
                         'reason': 'Title cleaning and normalization'
                     })
-            
+
             # Nettoyage des noms d'artistes
             artist = data_item.get('artist') or data_item.get('artist_name')
             if artist:
@@ -335,16 +320,15 @@ class MetadataEnricher:
                         'confidence': 0.95,
                         'reason': 'Artist name cleaning'
                     })
-            
+
         except Exception as e:
             self.logger.debug(f"Erreur validation données: {e}")
-        
+
         return corrections
-    
+
     def _apply_inference_rules(self, data_item: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
         """Applique les règles d'inférence pour compléter les données manquantes"""
         inferences = []
-        
         try:
             # Inférence de l'année depuis la date de sortie
             if not data_item.get('year') and data_item.get('release_date'):
@@ -359,7 +343,7 @@ class MetadataEnricher:
                         'reason': 'Inferred from release_date',
                         'source': 'inference'
                     })
-            
+
             # Inférence du genre principal
             if not data_item.get('primary_genre'):
                 primary_genre = self._infer_primary_genre(data_item)
@@ -373,7 +357,7 @@ class MetadataEnricher:
                         'reason': 'Inferred from genre list or context',
                         'source': 'inference'
                     })
-            
+
             # Inférence de la langue
             if not data_item.get('language'):
                 language = self._infer_language(data_item, context)
@@ -387,3 +371,28 @@ class MetadataEnricher:
                         'reason': 'Inferred from language list or context',
                         'source': 'inference'
                     })
+
+        except Exception as e:
+            self.logger.debug(f"Erreur inférence: {e}")
+
+        return inferences
+
+    # ... (autres méthodes à compléter si besoin -- ce bloc est syntaxiquement sûr)
+
+    # Ajoute ici les autres méthodes (_normalize_genres, _apply_cross_validation, _calculate_data_quality,
+    # _identify_missing_fields, _validate_duration, _validate_date, _clean_title, _extract_year_from_date, etc.)
+    # en t'assurant qu'elles sont correctement indentées et terminées.
+
+    def _empty_result(self, message: str):
+        return {
+            'success': False,
+            'error': message,
+            'enriched_data': None
+        }
+
+    def _generate_cache_key(self, data_item: Dict[str, Any], context: Optional[Dict[str, Any]] = None) -> str:
+        # Simple cache key for demonstration (à personnaliser si besoin)
+        base = str(sorted(data_item.items()))
+        if context:
+            base += str(sorted(context.items()))
+        return base

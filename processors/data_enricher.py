@@ -1,1112 +1,420 @@
+# processors/data_enricher.py
+"""
+Module d'enrichissement des données pour Music Data Extractor.
+Améliore la qualité et la complétude des données extraites.
+"""
+
 import logging
-import re
-from typing import Dict, List, Optional, Any, Set, Tuple, Union
-from datetime import datetime
+from typing import Dict, List, Optional, Any, Tuple, Set
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 from enum import Enum
+from collections import defaultdict
 
-from ..models.entities import Track, Credit, Artist, Album
-from ..models.enums import CreditType, CreditCategory, DataSource, AlbumType
-from ..core.database import Database
-from ..config.settings import settings
-from ..utils.text_utils import similarity_ratio, extract_year_from_date
+from models.entities import Track, Credit, Artist, Album
+from models.enums import CreditType, CreditCategory, DataSource, QualityLevel
+from core.database import Database
+from config.settings import settings
+from utils.text_utils import normalize_text, calculate_similarity
+
+
+class EnrichmentType(Enum):
+    """Types d'enrichissement disponibles"""
+    METADATA = "metadata"           # Métadonnées générales
+    CREDITS = "credits"             # Crédits détaillés
+    TECHNICAL = "technical"         # Données techniques (BPM, key, etc.)
+    LYRICS = "lyrics"              # Paroles
+    FEATURES = "features"          # Caractéristiques audio
+    RELATIONSHIPS = "relationships" # Relations entre entités
+    INFERENCE = "inference"        # Données inférées
+
 
 class EnrichmentSource(Enum):
     """Sources d'enrichissement"""
-    GENIUS_API = "genius_api"
-    SPOTIFY_API = "spotify_api"
-    DISCOGS_API = "discogs_api"
-    LASTFM_API = "lastfm_api"
-    WEB_SCRAPING = "web_scraping"
-    CROSS_REFERENCE = "cross_reference"  # Enrichissement croisé entre entités
-    INFERENCE = "inference"              # Inférence basée sur les données existantes
-    EXTERNAL_DB = "external_db"          # Bases de données externes
+    EXTERNAL_API = "external_api"
+    DATABASE = "database"
+    INFERENCE = "inference"
+    USER_INPUT = "user_input"
+    CROSS_REFERENCE = "cross_reference"
 
-class EnrichmentType(Enum):
-    """Types d'enrichissement"""
-    MISSING_DATA = "missing_data"        # Compléter données manquantes
-    METADATA = "metadata"                # Ajouter métadonnées
-    RELATIONSHIPS = "relationships"      # Établir relations
-    VALIDATION = "validation"           # Valider données existantes
-    ENHANCEMENT = "enhancement"         # Améliorer qualité données
-    CROSS_LINK = "cross_link"          # Lier données entre sources
 
 @dataclass
 class EnrichmentResult:
-    """Résultat d'enrichissement"""
+    """Résultat d'un enrichissement"""
     entity_id: int
     entity_type: str
+    field: str
+    original_value: Any
+    enriched_value: Any
     enrichment_type: EnrichmentType
     source: EnrichmentSource
-    field: str
-    old_value: Optional[Any]
-    new_value: Any
-    confidence: float  # 0-1
+    confidence: float
     success: bool
     message: str
-
-@dataclass
-class EnrichmentStats:
-    """Statistiques d'enrichissement"""
-    total_processed: int = 0
-    successful_enrichments: int = 0
-    failed_enrichments: int = 0
-    fields_enriched: Dict[str, int] = None
-    sources_used: Dict[str, int] = None
+    timestamp: datetime = None
     
     def __post_init__(self):
-        if self.fields_enriched is None:
-            self.fields_enriched = {}
-        if self.sources_used is None:
-            self.sources_used = {}
+        if self.timestamp is None:
+            self.timestamp = datetime.now()
+
 
 class DataEnricher:
     """
-    Enrichisseur de données musicales.
+    Enrichisseur de données pour améliorer la qualité et complétude.
     
-    Responsabilités :
-    - Compléter les données manquantes
-    - Améliorer la qualité des métadonnées
-    - Établir des relations entre entités
-    - Valider et corriger les données existantes
-    - Inférer des informations à partir du contexte
+    Fonctionnalités:
+    - Enrichissement des métadonnées manquantes
+    - Inférence de données à partir du contexte
+    - Cross-référencement entre sources
+    - Validation et amélioration de la qualité
     """
     
-    def __init__(self, database: Optional[Database] = None):
+    def __init__(self):
         self.logger = logging.getLogger(__name__)
-        self.database = database or Database()
+        self.database = Database()
         
-        # Configuration d'enrichissement
+        # Configuration
         self.config = {
-            'auto_enrich_missing': settings.get('enrichment.auto_enrich_missing', True),
-            'min_confidence_threshold': settings.get('enrichment.min_confidence', 0.7),
-            'max_external_requests': settings.get('enrichment.max_requests_per_session', 100),
+            'min_confidence': settings.get('enrichment.min_confidence', 0.7),
             'enable_inference': settings.get('enrichment.enable_inference', True),
-            'prefer_official_sources': settings.get('enrichment.prefer_official_sources', True),
-            'cross_reference_validation': settings.get('enrichment.cross_reference', True)
+            'batch_size': settings.get('enrichment.batch_size', 50),
+            'cache_results': settings.get('enrichment.cache_results', True)
         }
         
-        # Règles d'inférence
-        self.inference_rules = self._load_inference_rules()
-        
-        # Cache pour éviter les requêtes répétées
-        self._enrichment_cache = {}
-        
-        self.logger.info("DataEnricher initialisé")
-    
-    def _load_inference_rules(self) -> Dict[str, Any]:
-        """Charge les règles d'inférence"""
-        return {
-            'album_type_rules': {
-                'single': {'max_tracks': 3, 'keywords': ['single', 'feat']},
-                'ep': {'max_tracks': 8, 'min_tracks': 4},
-                'album': {'min_tracks': 8},
-                'mixtape': {'keywords': ['mixtape', 'mix tape', 'street']},
-                'live': {'keywords': ['live', 'concert', 'tour']}
-            },
-            'genre_inference': {
-                'rap_keywords': ['rap', 'hip hop', 'hip-hop', 'trap', 'drill'],
-                'producer_patterns': {
-                    'trap': ['808', 'mafia', 'south', 'atlanta'],
-                    'boom_bap': ['boom', 'bap', 'classic', 'east'],
-                    'drill': ['drill', 'uk', 'chicago']
-                }
-            },
-            'collaboration_rules': {
-                'featuring_threshold': 0.3,  # Si >30% des tracks ont des featuring
-                'crew_detection': 0.5       # Si >50% des collaborateurs récurrents
-            },
-            'temporal_rules': {
-                'era_inference': {
-                    '1980-1995': 'old_school',
-                    '1995-2005': 'golden_age',
-                    '2005-2015': 'modern',
-                    '2015-': 'contemporary'
-                }
-            }
+        # Statistiques
+        self.stats = {
+            'total_enrichments': 0,
+            'successful_enrichments': 0,
+            'failed_enrichments': 0,
+            'fields_enriched': defaultdict(int),
+            'sources_used': defaultdict(int)
         }
     
-    def enrich_track(self, track: Track, enrich_types: Optional[List[EnrichmentType]] = None) -> List[EnrichmentResult]:
+    def enrich_track(self, track: Track, enrichment_types: Optional[List[EnrichmentType]] = None) -> List[EnrichmentResult]:
         """
         Enrichit les données d'un track.
         
         Args:
             track: Track à enrichir
-            enrich_types: Types d'enrichissement à effectuer
+            enrichment_types: Types d'enrichissement à appliquer
             
         Returns:
             Liste des résultats d'enrichissement
         """
-        if enrich_types is None:
-            enrich_types = [EnrichmentType.MISSING_DATA, EnrichmentType.METADATA, EnrichmentType.RELATIONSHIPS]
+        if enrichment_types is None:
+            enrichment_types = list(EnrichmentType)
         
         results = []
         
-        try:
-            self.logger.info(f"Enrichissement du track '{track.title}'")
-            
-            for enrich_type in enrich_types:
-                if enrich_type == EnrichmentType.MISSING_DATA:
-                    results.extend(self._enrich_missing_track_data(track))
-                elif enrich_type == EnrichmentType.METADATA:
-                    results.extend(self._enrich_track_metadata(track))
-                elif enrich_type == EnrichmentType.RELATIONSHIPS:
-                    results.extend(self._enrich_track_relationships(track))
-                elif enrich_type == EnrichmentType.VALIDATION:
-                    results.extend(self._validate_and_correct_track_data(track))
-                elif enrich_type == EnrichmentType.ENHANCEMENT:
-                    results.extend(self._enhance_track_data(track))
-            
-            # Mettre à jour le track en base si des enrichissements ont réussi
-            successful_enrichments = [r for r in results if r.success]
-            if successful_enrichments:
-                track.updated_at = datetime.now()
+        for enrichment_type in enrichment_types:
+            try:
+                if enrichment_type == EnrichmentType.METADATA:
+                    results.extend(self._enrich_metadata(track))
+                elif enrichment_type == EnrichmentType.CREDITS:
+                    results.extend(self._enrich_credits(track))
+                elif enrichment_type == EnrichmentType.TECHNICAL:
+                    results.extend(self._enrich_technical_data(track))
+                elif enrichment_type == EnrichmentType.INFERENCE:
+                    results.extend(self._enrich_by_inference(track))
+                    
+            except Exception as e:
+                self.logger.error(f"Erreur enrichissement {enrichment_type} pour track {track.id}: {e}")
+                results.append(EnrichmentResult(
+                    entity_id=track.id,
+                    entity_type="track",
+                    field=enrichment_type.value,
+                    original_value=None,
+                    enriched_value=None,
+                    enrichment_type=enrichment_type,
+                    source=EnrichmentSource.EXTERNAL_API,
+                    confidence=0.0,
+                    success=False,
+                    message=str(e)
+                ))
+        
+        # Mettre à jour les stats
+        self._update_stats(results)
+        
+        return results
+    
+    def _enrich_metadata(self, track: Track) -> List[EnrichmentResult]:
+        """Enrichit les métadonnées du track"""
+        results = []
+        
+        # Enrichir l'album si manquant
+        if not track.album_title and track.album_id:
+            album = self.database.get_album_by_id(track.album_id)
+            if album:
+                results.append(EnrichmentResult(
+                    entity_id=track.id,
+                    entity_type="track",
+                    field="album_title",
+                    original_value=None,
+                    enriched_value=album.title,
+                    enrichment_type=EnrichmentType.METADATA,
+                    source=EnrichmentSource.DATABASE,
+                    confidence=1.0,
+                    success=True,
+                    message="Album trouvé dans la base de données"
+                ))
+                
+                # Mettre à jour le track
+                track.album_title = album.title
                 self.database.update_track(track)
-                self.logger.info(f"Track '{track.title}' enrichi avec {len(successful_enrichments)} améliorations")
-            
-            return results
-            
-        except Exception as e:
-            self.logger.error(f"Erreur enrichissement track '{track.title}': {e}")
-            return [EnrichmentResult(
-                entity_id=track.id,
-                entity_type="track",
-                enrichment_type=EnrichmentType.MISSING_DATA,
-                source=EnrichmentSource.INFERENCE,
-                field="error",
-                old_value=None,
-                new_value=None,
-                confidence=0.0,
-                success=False,
-                message=f"Erreur lors de l'enrichissement: {e}"
-            )]
-    
-    def _enrich_missing_track_data(self, track: Track) -> List[EnrichmentResult]:
-        """Enrichit les données manquantes d'un track"""
-        results = []
         
-        # Enrichir la durée manquante
-        if not track.duration_seconds:
-            duration_result = self._infer_track_duration(track)
-            if duration_result:
-                results.append(duration_result)
-        
-        # Enrichir le BPM manquant
-        if not track.bpm:
-            bpm_result = self._infer_track_bpm(track)
-            if bpm_result:
-                results.append(bpm_result)
-        
-        # Enrichir l'album manquant
-        if not track.album_title:
-            album_result = self._infer_track_album(track)
-            if album_result:
-                results.append(album_result)
-        
-        # Enrichir l'année de sortie
-        if not track.release_year:
-            year_result = self._infer_release_year(track)
-            if year_result:
-                results.append(year_result)
-        
-        # Enrichir les crédits manquants
-        if not track.credits or len(track.credits) < self.config.get('min_credits_expected', 1):
-            credit_results = self._infer_missing_credits(track)
-            results.extend(credit_results)
+        # Enrichir la date de sortie
+        if not track.release_date and track.album_id:
+            album = self.database.get_album_by_id(track.album_id)
+            if album and album.release_date:
+                results.append(EnrichmentResult(
+                    entity_id=track.id,
+                    entity_type="track",
+                    field="release_date",
+                    original_value=None,
+                    enriched_value=album.release_date,
+                    enrichment_type=EnrichmentType.METADATA,
+                    source=EnrichmentSource.DATABASE,
+                    confidence=0.9,
+                    success=True,
+                    message="Date inférée depuis l'album"
+                ))
         
         return results
     
-    def _infer_track_duration(self, track: Track) -> Optional[EnrichmentResult]:
-        """Infère la durée d'un track"""
-        try:
-            # Rechercher des tracks similaires du même artiste
-            similar_tracks = self._find_similar_tracks(track)
-            
-            if similar_tracks:
-                durations = [t.duration_seconds for t in similar_tracks if t.duration_seconds]
-                if durations:
-                    # Utiliser la médiane pour éviter les outliers
-                    from statistics import median
-                    inferred_duration = int(median(durations))
-                    
-                    # Validation de cohérence
-                    if 30 <= inferred_duration <= 600:  # Entre 30s et 10min
-                        track.duration_seconds = inferred_duration
-                        
-                        return EnrichmentResult(
-                            entity_id=track.id,
-                            entity_type="track",
-                            enrichment_type=EnrichmentType.MISSING_DATA,
-                            source=EnrichmentSource.INFERENCE,
-                            field="duration_seconds",
-                            old_value=None,
-                            new_value=inferred_duration,
-                            confidence=0.7,
-                            success=True,
-                            message=f"Durée inférée à partir de {len(durations)} tracks similaires"
-                        )
-        
-        except Exception as e:
-            self.logger.warning(f"Erreur inférence durée pour '{track.title}': {e}")
-        
-        return None
-    
-    def _infer_track_bpm(self, track: Track) -> Optional[EnrichmentResult]:
-        """Infère le BPM d'un track"""
-        try:
-            # Rechercher des tracks du même album
-            if track.album_title:
-                album_tracks = self._get_tracks_from_album(track.album_title, track.artist_id)
-                bpms = [t.bpm for t in album_tracks if t.bpm and t.id != track.id]
-                
-                if bpms:
-                    # Utiliser la moyenne pour les BPM
-                    from statistics import mean
-                    inferred_bpm = int(mean(bpms))
-                    
-                    if 60 <= inferred_bpm <= 200:  # BPM raisonnable pour le rap
-                        track.bpm = inferred_bpm
-                        
-                        return EnrichmentResult(
-                            entity_id=track.id,
-                            entity_type="track",
-                            enrichment_type=EnrichmentType.MISSING_DATA,
-                            source=EnrichmentSource.INFERENCE,
-                            field="bpm",
-                            old_value=None,
-                            new_value=inferred_bpm,
-                            confidence=0.6,
-                            success=True,
-                            message=f"BPM inféré à partir de l'album ({len(bpms)} tracks)"
-                        )
-        
-        except Exception as e:
-            self.logger.warning(f"Erreur inférence BPM pour '{track.title}': {e}")
-        
-        return None
-    
-    def _infer_track_album(self, track: Track) -> Optional[EnrichmentResult]:
-        """Infère l'album d'un track"""
-        try:
-            # Rechercher des tracks du même artiste avec des albums
-            artist_tracks = self.database.get_tracks_by_artist_id(track.artist_id)
-            
-            # Grouper par album et compter
-            album_counts = {}
-            for t in artist_tracks:
-                if t.album_title and t.id != track.id:
-                    album_counts[t.album_title] = album_counts.get(t.album_title, 0) + 1
-            
-            if album_counts:
-                # Prendre l'album le plus fréquent
-                most_common_album = max(album_counts.items(), key=lambda x: x[1])
-                album_title, count = most_common_album
-                
-                # Vérifier la cohérence temporelle si possible
-                if track.release_year:
-                    album_tracks = [t for t in artist_tracks if t.album_title == album_title]
-                    album_years = [t.release_year for t in album_tracks if t.release_year]
-                    
-                    if album_years and abs(track.release_year - max(album_years)) <= 2:
-                        track.album_title = album_title
-                        
-                        return EnrichmentResult(
-                            entity_id=track.id,
-                            entity_type="track",
-                            enrichment_type=EnrichmentType.MISSING_DATA,
-                            source=EnrichmentSource.INFERENCE,
-                            field="album_title",
-                            old_value=None,
-                            new_value=album_title,
-                            confidence=0.8,
-                            success=True,
-                            message=f"Album inféré à partir des tracks de l'artiste ({count} tracks)"
-                        )
-        
-        except Exception as e:
-            self.logger.warning(f"Erreur inférence album pour '{track.title}': {e}")
-        
-        return None
-    
-    def _infer_release_year(self, track: Track) -> Optional[EnrichmentResult]:
-        """Infère l'année de sortie d'un track"""
-        try:
-            # Essayer d'extraire l'année de la date de sortie
-            if track.release_date:
-                year = extract_year_from_date(track.release_date)
-                if year:
-                    track.release_year = year
-                    
-                    return EnrichmentResult(
-                        entity_id=track.id,
-                        entity_type="track",
-                        enrichment_type=EnrichmentType.MISSING_DATA,
-                        source=EnrichmentSource.INFERENCE,
-                        field="release_year",
-                        old_value=None,
-                        new_value=year,
-                        confidence=0.9,
-                        success=True,
-                        message="Année extraite de la date de sortie"
-                    )
-            
-            # Sinon, inférer à partir de l'album
-            if track.album_title:
-                album_tracks = self._get_tracks_from_album(track.album_title, track.artist_id)
-                years = [t.release_year for t in album_tracks if t.release_year and t.id != track.id]
-                
-                if years:
-                    # Prendre l'année la plus fréquente
-                    from collections import Counter
-                    year_counts = Counter(years)
-                    most_common_year = year_counts.most_common(1)[0][0]
-                    
-                    track.release_year = most_common_year
-                    
-                    return EnrichmentResult(
-                        entity_id=track.id,
-                        entity_type="track",
-                        enrichment_type=EnrichmentType.MISSING_DATA,
-                        source=EnrichmentSource.INFERENCE,
-                        field="release_year",
-                        old_value=None,
-                        new_value=most_common_year,
-                        confidence=0.7,
-                        success=True,
-                        message=f"Année inférée à partir de l'album ({len(years)} tracks)"
-                    )
-        
-        except Exception as e:
-            self.logger.warning(f"Erreur inférence année pour '{track.title}': {e}")
-        
-        return None
-    
-    def _infer_missing_credits(self, track: Track) -> List[EnrichmentResult]:
-        """Infère les crédits manquants d'un track"""
+    def _enrich_credits(self, track: Track) -> List[EnrichmentResult]:
+        """Enrichit les crédits du track"""
         results = []
         
-        try:
-            # Rechercher des producteurs récurrents pour l'artiste
-            if not any(c.credit_category == CreditCategory.PRODUCER for c in track.credits):
-                producer_result = self._infer_producer_credit(track)
-                if producer_result:
-                    results.append(producer_result)
-            
-            # Inférer des crédits basés sur l'album
-            if track.album_title:
-                album_credit_results = self._infer_album_based_credits(track)
-                results.extend(album_credit_results)
+        # Vérifier si le track a un producteur
+        has_producer = any(
+            credit.credit_type == CreditType.PRODUCER 
+            for credit in track.credits
+        )
         
-        except Exception as e:
-            self.logger.warning(f"Erreur inférence crédits pour '{track.title}': {e}")
-        
-        return results
-    
-    def _infer_producer_credit(self, track: Track) -> Optional[EnrichmentResult]:
-        """Infère le producteur principal d'un track"""
-        try:
-            # Analyser les producteurs récurrents de l'artiste
-            artist_tracks = self.database.get_tracks_by_artist_id(track.artist_id)
-            
-            producer_counts = {}
-            for t in artist_tracks:
-                if t.id != track.id:
-                    producers = [c.person_name for c in t.credits if c.credit_category == CreditCategory.PRODUCER]
-                    for producer in producers:
-                        producer_counts[producer] = producer_counts.get(producer, 0) + 1
-            
-            if producer_counts:
-                # Prendre le producteur le plus fréquent
-                most_common_producer = max(producer_counts.items(), key=lambda x: x[1])
-                producer_name, count = most_common_producer
+        if not has_producer:
+            # Essayer d'inférer le producteur depuis d'autres tracks du même album
+            if track.album_id:
+                similar_tracks = self.database.get_tracks_by_album_id(track.album_id)
                 
-                # Seuil de confiance basé sur la fréquence
-                confidence = min(0.9, count / len(artist_tracks))
+                # Chercher des patterns de producteurs
+                producer_counts = defaultdict(int)
+                for similar_track in similar_tracks:
+                    if similar_track.id != track.id:
+                        for credit in similar_track.credits:
+                            if credit.credit_type == CreditType.PRODUCER:
+                                producer_counts[credit.person_name] += 1
                 
-                if confidence >= self.config['min_confidence_threshold']:
-                    # Créer le crédit
-                    new_credit = Credit(
-                        track_id=track.id,
-                        credit_category=CreditCategory.PRODUCER,
-                        credit_type=CreditType.PRODUCER,
-                        person_name=producer_name,
-                        data_source=DataSource.WEB_SCRAPING,  # Utiliser une source existante
-                        extraction_date=datetime.now()
-                    )
+                # Si un producteur revient souvent, l'inférer
+                if producer_counts:
+                    most_common_producer = max(producer_counts, key=producer_counts.get)
+                    confidence = producer_counts[most_common_producer] / len(similar_tracks)
                     
-                    track.credits.append(new_credit)
-                    
-                    return EnrichmentResult(
-                        entity_id=track.id,
-                        entity_type="track",
-                        enrichment_type=EnrichmentType.MISSING_DATA,
-                        source=EnrichmentSource.INFERENCE,
-                        field="credits",
-                        old_value=len(track.credits) - 1,
-                        new_value=len(track.credits),
-                        confidence=confidence,
-                        success=True,
-                        message=f"Producteur inféré: {producer_name} ({count} collaborations)"
-                    )
-        
-        except Exception as e:
-            self.logger.warning(f"Erreur inférence producteur pour '{track.title}': {e}")
-        
-        return None
-    
-    def _infer_album_based_credits(self, track: Track) -> List[EnrichmentResult]:
-        """Infère des crédits basés sur l'album"""
-        results = []
-        
-        try:
-            album_tracks = self._get_tracks_from_album(track.album_title, track.artist_id)
-            
-            # Analyser les crédits récurrents dans l'album
-            credit_frequency = {}
-            
-            for t in album_tracks:
-                if t.id != track.id:
-                    for credit in t.credits:
-                        key = (credit.person_name, credit.credit_type)
-                        credit_frequency[key] = credit_frequency.get(key, 0) + 1
-            
-            # Inférer les crédits très fréquents (ex: mixing/mastering)
-            album_track_count = len(album_tracks)
-            
-            for (person_name, credit_type), count in credit_frequency.items():
-                frequency = count / album_track_count
-                
-                # Si le crédit apparaît dans >70% des tracks de l'album
-                if frequency > 0.7:
-                    # Vérifier que ce crédit n'existe pas déjà
-                    existing = any(
-                        c.person_name == person_name and c.credit_type == credit_type 
-                        for c in track.credits
-                    )
-                    
-                    if not existing:
-                        # Déterminer la catégorie
-                        category = self._get_category_for_type(credit_type)
-                        
-                        new_credit = Credit(
-                            track_id=track.id,
-                            credit_category=category,
-                            credit_type=credit_type,
-                            person_name=person_name,
-                            data_source=DataSource.WEB_SCRAPING,
-                            extraction_date=datetime.now()
-                        )
-                        
-                        track.credits.append(new_credit)
-                        
+                    if confidence >= self.config['min_confidence']:
                         results.append(EnrichmentResult(
                             entity_id=track.id,
                             entity_type="track",
-                            enrichment_type=EnrichmentType.MISSING_DATA,
-                            source=EnrichmentSource.CROSS_REFERENCE,
-                            field="credits",
-                            old_value=len(track.credits) - 1,
-                            new_value=len(track.credits),
-                            confidence=frequency,
+                            field="producer",
+                            original_value=None,
+                            enriched_value=most_common_producer,
+                            enrichment_type=EnrichmentType.CREDITS,
+                            source=EnrichmentSource.INFERENCE,
+                            confidence=confidence,
                             success=True,
-                            message=f"Crédit inféré de l'album: {person_name} ({credit_type.value})"
+                            message=f"Producteur inféré depuis l'album (confiance: {confidence:.2f})"
                         ))
         
-        except Exception as e:
-            self.logger.warning(f"Erreur inférence crédits album pour '{track.title}': {e}")
-        
         return results
     
-    def _enrich_track_metadata(self, track: Track) -> List[EnrichmentResult]:
-        """Enrichit les métadonnées d'un track"""
+    def _enrich_technical_data(self, track: Track) -> List[EnrichmentResult]:
+        """Enrichit les données techniques du track"""
         results = []
         
-        # Enrichir le genre si manquant
-        if not hasattr(track, 'genre') or not track.genre:
-            genre_result = self._infer_track_genre(track)
-            if genre_result:
-                results.append(genre_result)
-        
-        # Enrichir la clé musicale si manquante
-        if not track.key:
-            key_result = self._infer_musical_key(track)
-            if key_result:
-                results.append(key_result)
-        
-        # Enrichir les featuring à partir du titre
-        featuring_result = self._extract_featuring_from_title(track)
-        if featuring_result:
-            results.append(featuring_result)
-        
-        return results
-    
-    def _infer_track_genre(self, track: Track) -> Optional[EnrichmentResult]:
-        """Infère le genre d'un track"""
-        try:
-            # Analyser les crédits pour des indices de genre
-            rap_indicators = 0
-            
-            for credit in track.credits:
-                person_name = credit.person_name.lower()
-                
-                # Indices dans les noms de producteurs
-                for genre, patterns in self.inference_rules['genre_inference']['producer_patterns'].items():
-                    if any(pattern in person_name for pattern in patterns):
-                        rap_indicators += 1
-                        break
-            
-            # Analyser le titre pour des indices
-            title_lower = track.title.lower()
-            for keyword in self.inference_rules['genre_inference']['rap_keywords']:
-                if keyword in title_lower:
-                    rap_indicators += 1
-            
-            if rap_indicators > 0:
-                confidence = min(0.8, rap_indicators * 0.3)
-                
-                # Pour l'instant, on infère seulement "rap" comme genre principal
-                inferred_genre = "rap"
-                
-                return EnrichmentResult(
-                    entity_id=track.id,
-                    entity_type="track",
-                    enrichment_type=EnrichmentType.METADATA,
-                    source=EnrichmentSource.INFERENCE,
-                    field="genre",
-                    old_value=None,
-                    new_value=inferred_genre,
-                    confidence=confidence,
-                    success=True,
-                    message=f"Genre inféré à partir de {rap_indicators} indices"
-                )
-        
-        except Exception as e:
-            self.logger.warning(f"Erreur inférence genre pour '{track.title}': {e}")
-        
-        return None
-    
-    def _infer_musical_key(self, track: Track) -> Optional[EnrichmentResult]:
-        """Infère la clé musicale d'un track"""
-        try:
-            # Pour l'instant, inférence basique basée sur les tracks de l'album
-            if track.album_title:
-                album_tracks = self._get_tracks_from_album(track.album_title, track.artist_id)
-                keys = [t.key for t in album_tracks if t.key and t.id != track.id]
-                
-                if keys:
-                    # Prendre la clé la plus fréquente
-                    from collections import Counter
-                    key_counts = Counter(keys)
-                    most_common_key = key_counts.most_common(1)[0][0]
-                    
-                    track.key = most_common_key
-                    
-                    return EnrichmentResult(
-                        entity_id=track.id,
-                        entity_type="track",
-                        enrichment_type=EnrichmentType.METADATA,
-                        source=EnrichmentSource.INFERENCE,
-                        field="key",
-                        old_value=None,
-                        new_value=most_common_key,
-                        confidence=0.5,
-                        success=True,
-                        message=f"Clé musicale inférée de l'album ({len(keys)} tracks)"
-                    )
-        
-        except Exception as e:
-            self.logger.warning(f"Erreur inférence clé musicale pour '{track.title}': {e}")
-        
-        return None
-    
-    def _extract_featuring_from_title(self, track: Track) -> Optional[EnrichmentResult]:
-        """Extrait les featuring du titre du track"""
-        try:
-            from ..utils.text_utils import extract_featured_artists_from_title
-            
-            clean_title, featuring_artists = extract_featured_artists_from_title(track.title)
-            
-            if featuring_artists and not track.featuring_artists:
-                track.featuring_artists = featuring_artists
-                
-                return EnrichmentResult(
-                    entity_id=track.id,
-                    entity_type="track",
-                    enrichment_type=EnrichmentType.METADATA,
-                    source=EnrichmentSource.INFERENCE,
-                    field="featuring_artists",
-                    old_value=[],
-                    new_value=featuring_artists,
-                    confidence=0.9,
-                    success=True,
-                    message=f"Featuring extraits du titre: {', '.join(featuring_artists)}"
-                )
-        
-        except Exception as e:
-            self.logger.warning(f"Erreur extraction featuring pour '{track.title}': {e}")
-        
-        return None
-    
-    def _enrich_track_relationships(self, track: Track) -> List[EnrichmentResult]:
-        """Enrichit les relations d'un track"""
-        results = []
-        
-        # Lier à un album existant
-        if not track.album_id and track.album_title:
-            album_link_result = self._link_to_existing_album(track)
-            if album_link_result:
-                results.append(album_link_result)
-        
-        # Établir des relations avec d'autres tracks
-        similarity_results = self._establish_track_similarities(track)
-        results.extend(similarity_results)
-        
-        return results
-    
-    def _link_to_existing_album(self, track: Track) -> Optional[EnrichmentResult]:
-        """Lie un track à un album existant"""
-        try:
-            # Rechercher un album avec le même titre et artiste
-            with self.database.get_connection() as conn:
-                cursor = conn.execute("""
-                    SELECT id FROM albums 
-                    WHERE title = ? AND artist_id = ?
-                """, (track.album_title, track.artist_id))
-                
-                row = cursor.fetchone()
-                if row:
-                    track.album_id = row['id']
-                    
-                    return EnrichmentResult(
-                        entity_id=track.id,
-                        entity_type="track",
-                        enrichment_type=EnrichmentType.RELATIONSHIPS,
-                        source=EnrichmentSource.CROSS_REFERENCE,
-                        field="album_id",
-                        old_value=None,
-                        new_value=row['id'],
-                        confidence=1.0,
-                        success=True,
-                        message=f"Track lié à l'album existant (ID: {row['id']})"
-                    )
-        
-        except Exception as e:
-            self.logger.warning(f"Erreur liaison album pour '{track.title}': {e}")
-        
-        return None
-    
-    def _establish_track_similarities(self, track: Track) -> List[EnrichmentResult]:
-        """Établit des similarités entre tracks"""
-        results = []
-        
-        try:
-            similar_tracks = self._find_similar_tracks(track, limit=3)
-            
-            if similar_tracks:
-                similarity_data = []
-                for similar_track in similar_tracks:
-                    similarity_score = similarity_ratio(track.title, similar_track.title)
-                    similarity_data.append({
-                        'track_id': similar_track.id,
-                        'title': similar_track.title,
-                        'similarity': similarity_score
-                    })
-                
-                # Stocker les similarités comme métadonnée (nécessiterait un champ dédié)
+        # BPM manquant
+        if not track.bpm:
+            # Inférer depuis le genre ou des tracks similaires
+            inferred_bpm = self._infer_bpm_from_context(track)
+            if inferred_bpm:
                 results.append(EnrichmentResult(
                     entity_id=track.id,
                     entity_type="track",
-                    enrichment_type=EnrichmentType.RELATIONSHIPS,
-                    source=EnrichmentSource.INFERENCE,
-                    field="similar_tracks",
-                    old_value=None,
-                    new_value=similarity_data,
-                    confidence=0.7,
-                    success=True,
-                    message=f"Établi {len(similar_tracks)} relations de similarité"
-                ))
-        
-        except Exception as e:
-            self.logger.warning(f"Erreur établissement similarités pour '{track.title}': {e}")
-        
-        return results
-    
-    def _validate_and_correct_track_data(self, track: Track) -> List[EnrichmentResult]:
-        """Valide et corrige les données d'un track"""
-        results = []
-        
-        # Validation et correction du BPM
-        if track.bpm and track.bpm < 60:
-            # Probable erreur de division par 2
-            corrected_bpm = track.bpm * 2
-            if corrected_bpm <= 200:
-                track.bpm = corrected_bpm
-                
-                results.append(EnrichmentResult(
-                    entity_id=track.id,
-                    entity_type="track",
-                    enrichment_type=EnrichmentType.VALIDATION,
-                    source=EnrichmentSource.INFERENCE,
                     field="bpm",
-                    old_value=track.bpm // 2,
-                    new_value=corrected_bpm,
-                    confidence=0.8,
-                    success=True,
-                    message="BPM corrigé (doublé car trop bas)"
-                ))
-        
-        # Validation des durées
-        if track.duration_seconds and track.duration_seconds > 1800:  # >30min
-            # Probable erreur d'unité (millisecondes au lieu de secondes)
-            if track.duration_seconds > 10000:  # Très probablement en ms
-                corrected_duration = track.duration_seconds // 1000
-                track.duration_seconds = corrected_duration
-                
-                results.append(EnrichmentResult(
-                    entity_id=track.id,
-                    entity_type="track",
-                    enrichment_type=EnrichmentType.VALIDATION,
+                    original_value=None,
+                    enriched_value=inferred_bpm['value'],
+                    enrichment_type=EnrichmentType.TECHNICAL,
                     source=EnrichmentSource.INFERENCE,
-                    field="duration_seconds",
-                    old_value=corrected_duration * 1000,
-                    new_value=corrected_duration,
-                    confidence=0.9,
+                    confidence=inferred_bpm['confidence'],
                     success=True,
-                    message="Durée corrigée (conversion ms vers s)"
+                    message=inferred_bpm['message']
                 ))
         
         return results
     
-    def _enhance_track_data(self, track: Track) -> List[EnrichmentResult]:
-        """Améliore la qualité des données d'un track"""
+    def _enrich_by_inference(self, track: Track) -> List[EnrichmentResult]:
+        """Enrichit par inférence depuis le contexte"""
         results = []
         
-        # Améliorer la qualité du titre
-        if track.title:
-            enhanced_title = self._enhance_title_quality(track.title)
-            if enhanced_title != track.title:
+        if not self.config['enable_inference']:
+            return results
+        
+        # Inférer le genre si manquant
+        if not track.genres:
+            inferred_genres = self._infer_genres(track)
+            if inferred_genres:
                 results.append(EnrichmentResult(
                     entity_id=track.id,
                     entity_type="track",
-                    enrichment_type=EnrichmentType.ENHANCEMENT,
+                    field="genres",
+                    original_value=[],
+                    enriched_value=inferred_genres['genres'],
+                    enrichment_type=EnrichmentType.INFERENCE,
                     source=EnrichmentSource.INFERENCE,
-                    field="title",
-                    old_value=track.title,
-                    new_value=enhanced_title,
-                    confidence=0.8,
+                    confidence=inferred_genres['confidence'],
                     success=True,
-                    message="Titre amélioré (formatage et nettoyage)"
+                    message="Genres inférés depuis l'artiste et le contexte"
                 ))
-                track.title = enhanced_title
         
         return results
     
-    def _enhance_title_quality(self, title: str) -> str:
-        """Améliore la qualité d'un titre"""
-        enhanced = title.strip()
+    def _infer_bpm_from_context(self, track: Track) -> Optional[Dict[str, Any]]:
+        """Infère le BPM depuis le contexte"""
+        # Logique simplifiée - à améliorer
+        genre_bpm_ranges = {
+            'hip-hop': (80, 100),
+            'rap': (80, 100),
+            'trap': (130, 150),
+            'drill': (140, 145),
+            'boom bap': (85, 95)
+        }
         
-        # Corriger la capitalisation
-        words = enhanced.split()
-        enhanced_words = []
+        for genre in track.genres:
+            genre_lower = genre.lower()
+            for key, (min_bpm, max_bpm) in genre_bpm_ranges.items():
+                if key in genre_lower:
+                    avg_bpm = (min_bpm + max_bpm) // 2
+                    return {
+                        'value': avg_bpm,
+                        'confidence': 0.6,
+                        'message': f"BPM estimé depuis le genre {genre}"
+                    }
         
-        for i, word in enumerate(words):
-            # Mots qui restent en minuscules (sauf en début de titre)
-            if i > 0 and word.lower() in ['and', 'or', 'but', 'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'of', 'with']:
-                enhanced_words.append(word.lower())
-            # Mots entre parenthèses
-            elif word.startswith('(') and word.endswith(')'):
-                enhanced_words.append(f"({word[1:-1].title()})")
-            else:
-                enhanced_words.append(word.title())
-        
-        return ' '.join(enhanced_words)
+        return None
     
-    def enrich_artist_data(self, artist_id: int) -> List[EnrichmentResult]:
+    def _infer_genres(self, track: Track) -> Optional[Dict[str, Any]]:
+        """Infère les genres depuis le contexte"""
+        # Obtenir les genres de l'artiste
+        artist = self.database.get_artist_by_id(track.artist_id)
+        if artist and artist.genres:
+            return {
+                'genres': artist.genres,
+                'confidence': 0.8
+            }
+        
+        return None
+    
+    def _update_stats(self, results: List[EnrichmentResult]):
+        """Met à jour les statistiques"""
+        for result in results:
+            self.stats['total_enrichments'] += 1
+            
+            if result.success:
+                self.stats['successful_enrichments'] += 1
+                self.stats['fields_enriched'][result.field] += 1
+                self.stats['sources_used'][result.source.value] += 1
+            else:
+                self.stats['failed_enrichments'] += 1
+    
+    def enrich_artist_data(self, artist_id: int) -> Dict[str, Any]:
         """
-        Enrichit les données d'un artiste et de tous ses tracks.
+        Enrichit toutes les données d'un artiste.
         
         Args:
-            artist_id: ID de l'artiste à enrichir
+            artist_id: ID de l'artiste
             
         Returns:
-            Liste des résultats d'enrichissement
+            Résumé de l'enrichissement
         """
-        results = []
-        
         try:
-            self.logger.info(f"Enrichissement des données pour l'artiste {artist_id}")
-            
-            # Enrichir tous les tracks de l'artiste
+            # Obtenir tous les tracks de l'artiste
             tracks = self.database.get_tracks_by_artist_id(artist_id)
             
+            all_results = []
+            enriched_tracks = 0
+            
             for track in tracks:
-                track_results = self.enrich_track(track)
-                results.extend(track_results)
+                results = self.enrich_track(track)
+                if any(r.success for r in results):
+                    enriched_tracks += 1
+                all_results.extend(results)
             
-            # Enrichissement au niveau artiste
-            artist_results = self._enrich_artist_metadata(artist_id, tracks)
-            results.extend(artist_results)
+            # Générer le résumé
+            successful = [r for r in all_results if r.success]
+            failed = [r for r in all_results if not r.success]
             
-            self.logger.info(f"Enrichissement artiste {artist_id} terminé: {len(results)} améliorations")
-            return results
+            return {
+                'artist_id': artist_id,
+                'total_tracks': len(tracks),
+                'enriched_tracks': enriched_tracks,
+                'total_enrichments': len(all_results),
+                'successful_enrichments': len(successful),
+                'failed_enrichments': len(failed),
+                'success_rate': len(successful) / len(all_results) * 100 if all_results else 0,
+                'enrichments_by_type': self._group_by_type(successful),
+                'enrichments_by_source': self._group_by_source(successful),
+                'timestamp': datetime.now().isoformat()
+            }
             
         except Exception as e:
             self.logger.error(f"Erreur enrichissement artiste {artist_id}: {e}")
-            return []
+            return {'error': str(e)}
     
-    def _enrich_artist_metadata(self, artist_id: int, tracks: List[Track]) -> List[EnrichmentResult]:
-        """Enrichit les métadonnées d'un artiste"""
-        results = []
-        
-        try:
-            # Calculer des statistiques
-            total_tracks = len(tracks)
-            
-            # Analyser les collaborations fréquentes
-            collaborator_counts = {}
-            for track in tracks:
-                for credit in track.credits:
-                    if credit.person_name != track.artist_name:
-                        collaborator_counts[credit.person_name] = collaborator_counts.get(credit.person_name, 0) + 1
-                
-                for featuring in (track.featuring_artists or []):
-                    if featuring != track.artist_name:
-                        collaborator_counts[featuring] = collaborator_counts.get(featuring, 0) + 1
-            
-            # Identifier les collaborateurs récurrents
-            frequent_collaborators = [
-                name for name, count in collaborator_counts.items() 
-                if count >= total_tracks * 0.3  # 30% des tracks
-            ]
-            
-            if frequent_collaborators:
-                results.append(EnrichmentResult(
-                    entity_id=artist_id,
-                    entity_type="artist",
-                    enrichment_type=EnrichmentType.METADATA,
-                    source=EnrichmentSource.INFERENCE,
-                    field="frequent_collaborators",
-                    old_value=None,
-                    new_value=frequent_collaborators,
-                    confidence=0.8,
-                    success=True,
-                    message=f"Identifié {len(frequent_collaborators)} collaborateurs fréquents"
-                ))
-            
-            # Analyser la période d'activité
-            years = [track.release_year for track in tracks if track.release_year]
-            if years:
-                min_year = min(years)
-                max_year = max(years)
-                activity_period = f"{min_year}-{max_year}" if min_year != max_year else str(min_year)
-                
-                results.append(EnrichmentResult(
-                    entity_id=artist_id,
-                    entity_type="artist",
-                    enrichment_type=EnrichmentType.METADATA,
-                    source=EnrichmentSource.INFERENCE,
-                    field="active_years",
-                    old_value=None,
-                    new_value=activity_period,
-                    confidence=0.9,
-                    success=True,
-                    message=f"Période d'activité calculée: {activity_period}"
-                ))
-        
-        except Exception as e:
-            self.logger.warning(f"Erreur enrichissement métadonnées artiste {artist_id}: {e}")
-        
-        return results
+    def _group_by_type(self, results: List[EnrichmentResult]) -> Dict[str, int]:
+        """Groupe les résultats par type"""
+        grouped = defaultdict(int)
+        for result in results:
+            grouped[result.enrichment_type.value] += 1
+        return dict(grouped)
     
-    def batch_enrich(self, entity_type: str, entity_ids: List[int], enrich_types: Optional[List[EnrichmentType]] = None) -> EnrichmentStats:
-        """
-        Enrichit plusieurs entités en lot.
-        
-        Args:
-            entity_type: Type d'entité ('track', 'artist')
-            entity_ids: Liste des IDs à enrichir
-            enrich_types: Types d'enrichissement
-            
-        Returns:
-            Statistiques d'enrichissement
-        """
-        stats = EnrichmentStats()
-        stats.total_processed = len(entity_ids)
-        
-        try:
-            self.logger.info(f"Enrichissement en lot: {len(entity_ids)} {entity_type}s")
-            
-            for entity_id in entity_ids:
-                try:
-                    if entity_type == 'track':
-                        # Récupérer le track
-                        with self.database.get_connection() as conn:
-                            cursor = conn.execute("SELECT * FROM tracks WHERE id = ?", (entity_id,))
-                            row = cursor.fetchone()
-                            if row:
-                                track = self.database._row_to_track(row)
-                                track.credits = self.database.get_credits_by_track_id(track.id)
-                                track.featuring_artists = self.database.get_features_by_track_id(track.id)
-                                
-                                results = self.enrich_track(track, enrich_types)
-                                
-                                # Compter les succès
-                                successful = [r for r in results if r.success]
-                                stats.successful_enrichments += len(successful)
-                                stats.failed_enrichments += len(results) - len(successful)
-                                
-                                # Compter par champ
-                                for result in successful:
-                                    field = result.field
-                                    stats.fields_enriched[field] = stats.fields_enriched.get(field, 0) + 1
-                                    
-                                    source = result.source.value
-                                    stats.sources_used[source] = stats.sources_used.get(source, 0) + 1
-                    
-                    elif entity_type == 'artist':
-                        results = self.enrich_artist_data(entity_id)
-                        
-                        successful = [r for r in results if r.success]
-                        stats.successful_enrichments += len(successful)
-                        stats.failed_enrichments += len(results) - len(successful)
-                        
-                        for result in successful:
-                            field = result.field
-                            stats.fields_enriched[field] = stats.fields_enriched.get(field, 0) + 1
-                            
-                            source = result.source.value
-                            stats.sources_used[source] = stats.sources_used.get(source, 0) + 1
-                
-                except Exception as e:
-                    self.logger.error(f"Erreur enrichissement {entity_type} {entity_id}: {e}")
-                    stats.failed_enrichments += 1
-            
-            self.logger.info(f"Enrichissement en lot terminé: {stats.successful_enrichments} succès, {stats.failed_enrichments} échecs")
-            return stats
-            
-        except Exception as e:
-            self.logger.error(f"Erreur enrichissement en lot: {e}")
-            return stats
-    
-    # Méthodes utilitaires
-    
-    def _find_similar_tracks(self, track: Track, limit: int = 5) -> List[Track]:
-        """Trouve des tracks similaires"""
-        try:
-            artist_tracks = self.database.get_tracks_by_artist_id(track.artist_id)
-            similar_tracks = []
-            
-            for other_track in artist_tracks:
-                if other_track.id != track.id:
-                    similarity = similarity_ratio(track.title, other_track.title)
-                    if similarity > 0.3:  # Seuil de similarité
-                        similar_tracks.append((other_track, similarity))
-            
-            # Trier par similarité décroissante
-            similar_tracks.sort(key=lambda x: x[1], reverse=True)
-            
-            return [track for track, _ in similar_tracks[:limit]]
-        
-        except Exception as e:
-            self.logger.warning(f"Erreur recherche tracks similaires: {e}")
-            return []
-    
-    def _get_tracks_from_album(self, album_title: str, artist_id: int) -> List[Track]:
-        """Récupère tous les tracks d'un album"""
-        try:
-            with self.database.get_connection() as conn:
-                cursor = conn.execute("""
-                    SELECT * FROM tracks 
-                    WHERE album_title = ? AND artist_id = ?
-                """, (album_title, artist_id))
-                
-                tracks = []
-                for row in cursor.fetchall():
-                    track = self.database._row_to_track(row)
-                    track.credits = self.database.get_credits_by_track_id(track.id)
-                    track.featuring_artists = self.database.get_features_by_track_id(track.id)
-                    tracks.append(track)
-                
-                return tracks
-        
-        except Exception as e:
-            self.logger.warning(f"Erreur récupération tracks album '{album_title}': {e}")
-            return []
-    
-    def _get_category_for_type(self, credit_type: CreditType) -> CreditCategory:
-        """Détermine la catégorie pour un type de crédit"""
-        type_to_category = {
-            CreditType.PRODUCER: CreditCategory.PRODUCER,
-            CreditType.EXECUTIVE_PRODUCER: CreditCategory.PRODUCER,
-            CreditType.CO_PRODUCER: CreditCategory.PRODUCER,
-            CreditType.MIXING: CreditCategory.TECHNICAL,
-            CreditType.MASTERING: CreditCategory.TECHNICAL,
-            CreditType.RECORDING: CreditCategory.TECHNICAL,
-            CreditType.FEATURING: CreditCategory.FEATURING,
-            CreditType.LEAD_VOCALS: CreditCategory.VOCAL,
-            CreditType.BACKING_VOCALS: CreditCategory.VOCAL,
-            CreditType.RAP: CreditCategory.VOCAL,
-            CreditType.SONGWRITER: CreditCategory.COMPOSER,
-            CreditType.COMPOSER: CreditCategory.COMPOSER,
-            CreditType.GUITAR: CreditCategory.INSTRUMENT,
-            CreditType.PIANO: CreditCategory.INSTRUMENT,
-            CreditType.DRUMS: CreditCategory.INSTRUMENT,
-            CreditType.BASS: CreditCategory.INSTRUMENT,
-            CreditType.SAXOPHONE: CreditCategory.INSTRUMENT,
-            CreditType.SAMPLE: CreditCategory.SAMPLE,
-            CreditType.INTERPOLATION: CreditCategory.SAMPLE
-        }
-        return type_to_category.get(credit_type, CreditCategory.OTHER)
+    def _group_by_source(self, results: List[EnrichmentResult]) -> Dict[str, int]:
+        """Groupe les résultats par source"""
+        grouped = defaultdict(int)
+        for result in results:
+            grouped[result.source.value] += 1
+        return dict(grouped)
     
     def generate_enrichment_report(self, results: List[EnrichmentResult]) -> Dict[str, Any]:
         """
-        Génère un rapport d'enrichissement.
+        Génère un rapport détaillé sur les enrichissements.
         
         Args:
-            results: Résultats d'enrichissement
+            results: Liste des résultats d'enrichissement
             
         Returns:
             Rapport détaillé
         """
         try:
-            # Statistiques globales
-            total_results = len(results)
+            if not results:
+                return {'message': 'Aucun enrichissement à rapporter'}
+            
+            # Séparer succès et échecs
             successful = [r for r in results if r.success]
             failed = [r for r in results if not r.success]
             
-            success_rate = (len(successful) / total_results * 100) if total_results > 0 else 0
+            # Statistiques globales
+            total_results = len(results)
+            success_rate = len(successful) / total_results * 100 if total_results else 0
             
-            # Analyse par type d'enrichissement
-            by_enrichment_type = {}
+            # Grouper par différents critères
+            by_enrichment_type = defaultdict(list)
+            by_source = defaultdict(list)
+            by_field = defaultdict(list)
+            
             for result in results:
-                etype = result.enrichment_type.value
-                if etype not in by_enrichment_type:
-                    by_enrichment_type[etype] = {'total': 0, 'success': 0, 'failed': 0}
-                
-                by_enrichment_type[etype]['total'] += 1
-                if result.success:
-                    by_enrichment_type[etype]['success'] += 1
-                else:
-                    by_enrichment_type[etype]['failed'] += 1
+                by_enrichment_type[result.enrichment_type.value].append(result)
+                by_source[result.source.value].append(result)
+                by_field[result.field].append(result)
             
-            # Analyse par source
-            by_source = {}
-            for result in successful:
-                source = result.source.value
-                by_source[source] = by_source.get(source, 0) + 1
-            
-            # Analyse par champ
-            by_field = {}
-            for result in successful:
-                field = result.field
-                by_field[field] = by_field.get(field, 0) + 1
-            
-            # Top améliorations par confiance
-            top_improvements = sorted(
-                successful, 
-                key=lambda x: x.confidence, 
-                reverse=True
-            )[:10]
+            # Top améliorations (par confiance)
+            top_improvements = sorted(successful, key=lambda r: r.confidence, reverse=True)[:10]
             
             # Analyse des échecs
             failure_reasons = {}
@@ -1128,9 +436,9 @@ class DataEnricher:
                     'success_rate': round(success_rate, 1),
                     'average_confidence': round(avg_confidence, 2)
                 },
-                'by_enrichment_type': by_enrichment_type,
-                'by_source': by_source,
-                'by_field': by_field,
+                'by_enrichment_type': {k: len(v) for k, v in by_enrichment_type.items()},
+                'by_source': {k: len(v) for k, v in by_source.items()},
+                'by_field': {k: len(v) for k, v in by_field.items()},
                 'top_improvements': [
                     {
                         'entity_id': r.entity_id,
@@ -1149,39 +457,18 @@ class DataEnricher:
             }
             
         except Exception as e:
-            self.logger.error(f"Erreur génération rapport enrichissement: {e}")
-            return {'error': f'Erreur lors de la génération: {e}'}
+            self.logger.error(f"Erreur génération rapport: {e}")
+            return {'error': f'Erreur lors de la génération du rapport: {e}'}
     
     def _generate_enrichment_recommendations(self, results: List[EnrichmentResult]) -> List[str]:
-        """Génère des recommandations d'enrichissement"""
+        """Génère des recommandations basées sur les résultats"""
         recommendations = []
         
         try:
             successful = [r for r in results if r.success]
             failed = [r for r in results if not r.success]
             
-            # Recommandations basées sur les succès
-            if successful:
-                # Analyser les sources les plus efficaces
-                source_success = {}
-                for result in successful:
-                    source = result.source.value
-                    source_success[source] = source_success.get(source, 0) + 1
-                
-                if source_success:
-                    best_source = max(source_success.items(), key=lambda x: x[1])
-                    recommendations.append(f"Source la plus efficace: {best_source[0]} ({best_source[1]} succès)")
-                
-                # Analyser les champs les plus enrichis
-                field_counts = {}
-                for result in successful:
-                    field = result.field
-                    field_counts[field] = field_counts.get(field, 0) + 1
-                
-                top_fields = sorted(field_counts.items(), key=lambda x: x[1], reverse=True)[:3]
-                recommendations.append(f"Champs le plus enrichis: {', '.join([f[0] for f in top_fields])}")
-            
-            # Recommandations basées sur les échecs
+            # Analyser les échecs
             if failed:
                 failure_rate = len(failed) / len(results) * 100
                 if failure_rate > 20:
@@ -1218,77 +505,84 @@ class DataEnricher:
         Suggère des priorités d'enrichissement.
         
         Args:
-            artist_id: ID de l'artiste (None pour analyse globale)
+            artist_id: ID de l'artiste (optionnel)
             
         Returns:
             Suggestions de priorités
         """
         try:
-            # Récupérer les tracks à analyser
             if artist_id:
                 tracks = self.database.get_tracks_by_artist_id(artist_id)
-                scope = f"artiste {artist_id}"
+                scope = f"Artiste {artist_id}"
             else:
-                # Échantillon pour performance
+                # Analyser un échantillon global
                 with self.database.get_connection() as conn:
-                    cursor = conn.execute("SELECT * FROM tracks LIMIT 100")
-                    tracks = []
-                    for row in cursor.fetchall():
-                        track = self.database._row_to_track(row)
-                        track.credits = self.database.get_credits_by_track_id(track.id)
-                        tracks.append(track)
-                scope = "global"
+                    cursor = conn.execute("""
+                        SELECT * FROM tracks 
+                        ORDER BY RANDOM() 
+                        LIMIT 1000
+                    """)
+                    tracks = [self.database._row_to_track(row) for row in cursor.fetchall()]
+                scope = "Échantillon global"
             
             if not tracks:
-                return {'error': 'Aucun track trouvé'}
+                return {'error': 'Aucun track à analyser'}
             
             # Analyser les données manquantes
             missing_data = {
-                'duration': sum(1 for t in tracks if not t.duration_seconds),
-                'bpm': sum(1 for t in tracks if not t.bpm),
-                'album': sum(1 for t in tracks if not t.album_title),
-                'producer': sum(1 for t in tracks if not any(c.credit_category == CreditCategory.PRODUCER for c in t.credits)),
-                'release_year': sum(1 for t in tracks if not t.release_year),
-                'key': sum(1 for t in tracks if not t.key),
-                'lyrics': sum(1 for t in tracks if not t.has_lyrics)
+                'album': 0,
+                'release_date': 0,
+                'duration': 0,
+                'bpm': 0,
+                'key': 0,
+                'genres': 0,
+                'producer': 0,
+                'lyrics': 0
             }
+            
+            for track in tracks:
+                if not track.album_title:
+                    missing_data['album'] += 1
+                if not track.release_date:
+                    missing_data['release_date'] += 1
+                if not track.duration_seconds:
+                    missing_data['duration'] += 1
+                if not track.bpm:
+                    missing_data['bpm'] += 1
+                if not track.key:
+                    missing_data['key'] += 1
+                if not track.genres:
+                    missing_data['genres'] += 1
+                if not track.has_lyrics:
+                    missing_data['lyrics'] += 1
+                
+                # Vérifier le producteur
+                has_producer = any(
+                    credit.credit_type == CreditType.PRODUCER 
+                    for credit in track.credits
+                )
+                if not has_producer:
+                    missing_data['producer'] += 1
             
             total_tracks = len(tracks)
             
-            # Calculer les pourcentages et priorités
+            # Calculer les priorités
             priorities = []
-            for field, missing_count in missing_data.items():
-                if missing_count > 0:
-                    percentage = (missing_count / total_tracks) * 100
-                    
-                    # Déterminer la priorité
-                    if field in ['duration', 'producer'] and percentage > 20:
-                        priority = 'High'
-                    elif field in ['bpm', 'album', 'release_year'] and percentage > 30:
-                        priority = 'Medium'
-                    elif percentage > 50:
-                        priority = 'Low'
-                    else:
-                        priority = 'Optional'
-                    
-                    # Estimer l'effort d'enrichissement
-                    if field in ['duration', 'bpm']:
-                        effort = 'High'  # Nécessite sources externes
-                    elif field in ['producer', 'release_year']:
-                        effort = 'Medium'  # Inférence possible
-                    else:
-                        effort = 'Low'  # Inférence facile
+            for field, count in missing_data.items():
+                if count > 0:
+                    percentage = (count / total_tracks) * 100
+                    priority = self._calculate_priority(field, percentage)
                     
                     priorities.append({
                         'field': field,
-                        'missing_count': missing_count,
+                        'missing_count': count,
                         'percentage': round(percentage, 1),
                         'priority': priority,
-                        'effort': effort,
-                        'potential_sources': self._suggest_sources_for_field(field)
+                        'effort': self._estimate_effort(field),
+                        'potential_sources': self._get_potential_sources(field)
                     })
             
-            # Trier par priorité et pourcentage
+            # Trier par priorité
             priority_order = {'High': 0, 'Medium': 1, 'Low': 2, 'Optional': 3}
             priorities.sort(key=lambda x: (priority_order.get(x['priority'], 4), -x['percentage']))
             
@@ -1323,35 +617,65 @@ class DataEnricher:
                 'missing_data_analysis': missing_data,
                 'enrichment_priorities': priorities,
                 'action_plan': action_plan,
-                'estimated_effort': {
-                    'high_effort_fields': len([p for p in priorities if p['effort'] == 'High']),
-                    'medium_effort_fields': len([p for p in priorities if p['effort'] == 'Medium']),
-                    'low_effort_fields': len([p for p in priorities if p['effort'] == 'Low'])
-                },
+                'recommendations': [
+                    "Commencer par les champs à haute priorité",
+                    "Utiliser des sources multiples pour améliorer la confiance",
+                    "Valider les enrichissements avant sauvegarde"
+                ],
                 'generated_at': datetime.now().isoformat()
             }
             
         except Exception as e:
-            self.logger.error(f"Erreur suggestion priorités enrichissement: {e}")
+            self.logger.error(f"Erreur analyse priorités: {e}")
             return {'error': f'Erreur lors de l\'analyse: {e}'}
     
-    def _suggest_sources_for_field(self, field: str) -> List[str]:
-        """Suggère des sources d'enrichissement pour un champ"""
-        source_mapping = {
-            'duration': ['Spotify API', 'Last.fm API', 'Discogs API'],
-            'bpm': ['Spotify API', 'External BPM databases', 'Audio analysis'],
-            'album': ['Spotify API', 'Discogs API', 'Cross-reference'],
-            'producer': ['Genius API', 'Discogs API', 'Cross-reference'],
-            'release_year': ['Spotify API', 'Discogs API', 'Album inference'],
-            'key': ['Spotify API', 'Audio analysis', 'Album inference'],
-            'lyrics': ['Genius API', 'LyricFind API', 'Web scraping']
-        }
+    def _calculate_priority(self, field: str, missing_percentage: float) -> str:
+        """Calcule la priorité d'un champ"""
+        # Champs critiques
+        critical_fields = ['producer', 'album', 'duration']
         
-        return source_mapping.get(field, ['Cross-reference', 'Manual input'])
+        if field in critical_fields and missing_percentage > 20:
+            return 'High'
+        elif missing_percentage > 50:
+            return 'High'
+        elif missing_percentage > 30:
+            return 'Medium'
+        elif missing_percentage > 10:
+            return 'Low'
+        else:
+            return 'Optional'
+    
+    def _estimate_effort(self, field: str) -> str:
+        """Estime l'effort nécessaire pour enrichir un champ"""
+        effort_map = {
+            'album': 'Low',
+            'release_date': 'Low',
+            'duration': 'Low',
+            'bpm': 'Medium',
+            'key': 'Medium',
+            'genres': 'Low',
+            'producer': 'High',
+            'lyrics': 'High'
+        }
+        return effort_map.get(field, 'Medium')
+    
+    def _get_potential_sources(self, field: str) -> List[str]:
+        """Retourne les sources potentielles pour un champ"""
+        sources_map = {
+            'album': ['Database', 'Spotify', 'Discogs'],
+            'release_date': ['Database', 'Spotify', 'Discogs'],
+            'duration': ['Spotify', 'YouTube'],
+            'bpm': ['Spotify', 'Essentia', 'Inference'],
+            'key': ['Spotify', 'Essentia'],
+            'genres': ['Database', 'Spotify', 'LastFM', 'Inference'],
+            'producer': ['Genius', 'Discogs', 'Database'],
+            'lyrics': ['Genius', 'Musixmatch']
+        }
+        return sources_map.get(field, ['External API'])
     
     def create_enrichment_plan(self, artist_id: int, target_completeness: float = 80.0) -> Dict[str, Any]:
         """
-        Crée un plan d'enrichissement pour atteindre un niveau de complétude cible.
+        Crée un plan d'enrichissement détaillé pour atteindre un niveau de complétude cible.
         
         Args:
             artist_id: ID de l'artiste
@@ -1434,37 +758,69 @@ class DataEnricher:
     def _get_field_weight(self, field: str) -> float:
         """Retourne le poids d'un champ dans le calcul de complétude"""
         weights = {
-            'duration': 0.20,
-            'producer': 0.20,
-            'bpm': 0.15,
-            'album': 0.15,
-            'release_year': 0.10,
-            'key': 0.10,
-            'lyrics': 0.10
+            'producer': 20.0,
+            'album': 15.0,
+            'duration': 10.0,
+            'genres': 10.0,
+            'release_date': 10.0,
+            'bpm': 10.0,
+            'key': 5.0,
+            'lyrics': 20.0
         }
-        return weights.get(field, 0.05)
+        return weights.get(field, 10.0)
     
-    def _estimate_enrichment_time(self, field: str, track_count: int) -> float:
+    def _estimate_enrichment_time(self, field: str, count: int) -> float:
         """Estime le temps nécessaire pour enrichir un champ (en heures)"""
-        time_per_track = {
-            'duration': 0.1,      # API rapide
-            'bpm': 0.1,          # API rapide
-            'album': 0.05,       # Inférence
-            'producer': 0.2,     # Analyse complexe
-            'release_year': 0.02, # Inférence simple
-            'key': 0.1,          # API
-            'lyrics': 0.15       # Scraping
+        # Temps moyen par item (en secondes)
+        time_per_item = {
+            'album': 0.5,
+            'release_date': 0.5,
+            'duration': 1.0,
+            'bpm': 2.0,
+            'key': 2.0,
+            'genres': 1.0,
+            'producer': 3.0,
+            'lyrics': 5.0
         }
         
-        return track_count * time_per_track.get(field, 0.1)
+        seconds = time_per_item.get(field, 2.0) * count
+        return seconds / 3600  # Convertir en heures
     
-    def _estimate_api_calls(self, enrichment_tasks: List[Dict[str, Any]]) -> int:
+    def _estimate_api_calls(self, tasks: List[Dict]) -> int:
         """Estime le nombre d'appels API nécessaires"""
-        api_intensive_fields = ['duration', 'bpm', 'key', 'lyrics']
-        
         total_calls = 0
-        for task in enrichment_tasks:
-            if task['field'] in api_intensive_fields:
-                total_calls += task['tracks_to_enrich']
         
-        return total_calls# processors/data_enricher.py
+        for task in tasks:
+            # Estimer selon les sources
+            if 'Spotify' in task['sources']:
+                total_calls += task['tracks_to_enrich']
+            if 'Genius' in task['sources']:
+                total_calls += task['tracks_to_enrich']
+            if 'Discogs' in task['sources']:
+                total_calls += task['tracks_to_enrich'] // 10  # Batch possible
+        
+        return total_calls
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Retourne les statistiques d'enrichissement"""
+        return {
+            'total_enrichments': self.stats['total_enrichments'],
+            'successful_enrichments': self.stats['successful_enrichments'],
+            'failed_enrichments': self.stats['failed_enrichments'],
+            'success_rate': round(
+                self.stats['successful_enrichments'] / max(self.stats['total_enrichments'], 1) * 100, 
+                2
+            ),
+            'fields_enriched': dict(self.stats['fields_enriched']),
+            'sources_used': dict(self.stats['sources_used'])
+        }
+    
+    def reset_stats(self):
+        """Réinitialise les statistiques"""
+        self.stats = {
+            'total_enrichments': 0,
+            'successful_enrichments': 0,
+            'failed_enrichments': 0,
+            'fields_enriched': defaultdict(int),
+            'sources_used': defaultdict(int)
+        }

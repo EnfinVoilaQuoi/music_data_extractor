@@ -17,25 +17,12 @@ from config.settings import settings
 from utils.text_utils import normalize_text, clean_artist_name, calculate_similarity
 from models.enums import DataSource, CreditType, CreditCategory
 
-
 class CreditParser:
     """
     Parseur spécialisé pour l'analyse des crédits musicaux.
-    
-    Fonctionnalités optimisées :
-    - Parsing intelligent des textes de crédits bruts
-    - Normalisation des rôles et fonctions
-    - Détection des patterns de crédits complexes
-    - Extraction des noms d'artistes et collaborateurs
-    - Catégorisation automatique des types de crédits
-    - Déduplication et validation des données
-    - Cache intelligent pour éviter les retraitements
     """
-    
     def __init__(self):
         self.logger = logging.getLogger(__name__)
-        
-        # Configuration optimisée
         self.config = {
             'normalize_roles': settings.get('credits.normalize_roles', True),
             'detect_collaborations': settings.get('credits.detect_collaborations', True),
@@ -45,18 +32,10 @@ class CreditParser:
             'max_credits_per_role': settings.get('credits.max_credits_per_role', 50),
             'enable_fuzzy_matching': settings.get('credits.fuzzy_matching', True)
         }
-        
-        # Cache manager
         self.cache_manager = CacheManager(namespace='credits') if CacheManager else None
-        
-        # Patterns pré-compilés pour optimisation
         self.patterns = self._compile_patterns()
-        
-        # Dictionnaires de mapping pour normalisation
         self.role_mappings = self._load_role_mappings()
         self.instrument_keywords = self._load_instrument_keywords()
-        
-        # Statistiques de traitement
         self.stats = {
             'credits_parsed': 0,
             'roles_normalized': 0,
@@ -65,47 +44,34 @@ class CreditParser:
             'cache_hits': 0,
             'total_processing_time': 0.0
         }
-        
         self.logger.info("✅ CreditParser optimisé initialisé")
-    
+
     @lru_cache(maxsize=1)
     def _compile_patterns(self) -> Dict[str, re.Pattern]:
         """Compile les patterns regex avec cache"""
         return {
-            # Patterns de séparation des crédits
             'credit_separators': re.compile(r'[,;|&\n]\s*', re.IGNORECASE),
             'role_separators': re.compile(r'[:]\s*', re.IGNORECASE),
             'name_separators': re.compile(r'\s*[,&]\s*|\s+and\s+|\s+et\s+', re.IGNORECASE),
-            
-            # Patterns de rôles
             'producer_patterns': re.compile(r'\b(produc\w*|beat\w*|instrumental)\b', re.IGNORECASE),
             'writer_patterns': re.compile(r'\b(writ\w*|compos\w*|lyric\w*|author\w*)\b', re.IGNORECASE),
             'performer_patterns': re.compile(r'\b(vocal\w*|rap\w*|sing\w*|perform\w*)\b', re.IGNORECASE),
             'engineer_patterns': re.compile(r'\b(mix\w*|master\w*|engineer\w*|record\w*)\b', re.IGNORECASE),
-            
-            # Patterns d'instruments
             'instrument_patterns': re.compile(r'\b(guitar\w*|bass\w*|drum\w*|piano\w*|keyboard\w*|synth\w*)\b', re.IGNORECASE),
             'featuring_patterns': re.compile(r'\b(feat\w*|featuring)\b', re.IGNORECASE),
-            
-            # Patterns de nettoyage
             'parentheses_content': re.compile(r'\([^)]*\)'),
             'bracket_content': re.compile(r'\[[^\]]*\]'),
             'extra_whitespace': re.compile(r'\s+'),
             'by_prefix': re.compile(r'^(by|par)\s+', re.IGNORECASE),
-            
-            # Patterns pour extraction de noms
             'name_patterns': re.compile(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b'),
             'stage_name_patterns': re.compile(r'\b[A-Z][a-z]*(?:[A-Z][a-z]*)*\b'),
-            
-            # Patterns de validation
-            'valid_name': re.compile(r'^[A-Za-z][A-Za-z\s\-\'\.]{1,50}),
-            'valid_role': re.compile(r'^[A-Za-z][A-Za-z\s\-]{1,30}),
-            
-            # Patterns spéciaux pour le rap français
+            # Correction ici : il manquait un guillemet fermant à la regex ci-dessous
+            'valid_name': re.compile(r'^[A-Za-z][A-Za-z\s\-\'\.]{1,50}$'),
+            'valid_role': re.compile(r'^[A-Za-z][A-Za-z\s\-]{1,30}$'),
             'french_features': re.compile(r'\b(feat\.?\s*|avec\s+|ft\.?\s*)\s*([^,\n]+)', re.IGNORECASE),
             'french_roles': re.compile(r'\b(prod\.?\s*par|réalisé\s*par|mixé\s*par|écrit\s*par)\s+([^,\n]+)', re.IGNORECASE)
         }
-    
+
     @lru_cache(maxsize=1)
     def _load_role_mappings(self) -> Dict[str, str]:
         """Charge les mappings de rôles avec cache"""
@@ -118,7 +84,6 @@ class CreditParser:
             'executive producer': 'Executive Producer',
             'co-producer': 'Co-Producer',
             'additional producer': 'Additional Producer',
-            
             # Engineering
             'mixing engineer': 'Mixing Engineer',
             'mix engineer': 'Mixing Engineer',
@@ -131,7 +96,6 @@ class CreditParser:
             'recorded by': 'Recording Engineer',
             'enregistré par': 'Recording Engineer',
             'sound engineer': 'Sound Engineer',
-            
             # Writing
             'songwriter': 'Songwriter',
             'writer': 'Songwriter',
@@ -144,7 +108,6 @@ class CreditParser:
             'arranger': 'Arranger',
             'arranged by': 'Arranger',
             'arrangé par': 'Arranger',
-            
             # Performance
             'vocalist': 'Vocalist',
             'vocals': 'Vocalist',
@@ -157,7 +120,6 @@ class CreditParser:
             'feat': 'Featured Artist',
             'ft': 'Featured Artist',
             'avec': 'Featured Artist',
-            
             # Instruments
             'guitarist': 'Guitarist',
             'guitar': 'Guitarist',
@@ -175,7 +137,6 @@ class CreditParser:
             'keyboards': 'Keyboardist',
             'synthesizer': 'Synthesizer Player',
             'synth': 'Synthesizer Player',
-            
             # Autres
             'sampled': 'Sample Source',
             'sample': 'Sample Source',
@@ -185,7 +146,7 @@ class CreditParser:
             'photography': 'Photographer',
             'photo': 'Photographer'
         }
-    
+
     @lru_cache(maxsize=1)
     def _load_instrument_keywords(self) -> Set[str]:
         """Charge les mots-clés d'instruments avec cache"""
